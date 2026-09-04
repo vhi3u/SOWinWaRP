@@ -1,0 +1,10 @@
+.DS_Store
+*~
+*.nc
+*.jld2
+*.png
+*.gif
+*.sh
+*.pbs
+*.fig
+data/
