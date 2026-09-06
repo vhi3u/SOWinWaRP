@@ -75,10 +75,10 @@ surf_V = lift(t -> data_V_surf[:, :, t], t_idx)
 slice_V = lift(t -> data_V_slice[:, :, t], t_idx)
 
 date_str = lift(t -> begin
-    t_val = time_vals[t]
-    formatted = t_val isa Dates.AbstractTime ? Dates.format(t_val, "yyyy-mm") : string(t_val)
-    "BSOSE Velocity Fields: $formatted"
-end, t_idx)
+        t_val = time_vals[t]
+        formatted = t_val isa Dates.AbstractTime ? Dates.format(t_val, "yyyy-mm") : string(t_val)
+        "BSOSE Velocity Fields: $formatted"
+    end, t_idx)
 Label(fig[0, 1:4], date_str, fontsize=24, font=:bold)
 
 # Top row: Regional Surface Fields
