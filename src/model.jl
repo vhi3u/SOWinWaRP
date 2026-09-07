@@ -163,7 +163,7 @@ stop_iteration = haskey(ENV, "STOP_ITERATION") ? parse(Int, ENV["STOP_ITERATION"
 simulation = Simulation(ocean.model, Δt=2minutes, stop_time=stop_time, stop_iteration=stop_iteration)
 
 # adaptive timestep wizard based on CFL
-wizard = TimeStepWizard(cfl=0.2, max_change=1.1, max_Δt=1hours)
+wizard = TimeStepWizard(cfl=0.7, max_Δt=1hours)
 simulation.callbacks[:wizard] = Callback(wizard, IterationInterval(10))
 
 # progress logger
@@ -178,7 +178,7 @@ function progress(sim)
         minimum(T), maximum(T),
         minimum(S), maximum(S))
 end
-simulation.callbacks[:progress] = Callback(progress, TimeInterval(1days))
+simulation.callbacks[:progress] = Callback(progress, TimeInterval(1hours))
 
 # output writers
 
