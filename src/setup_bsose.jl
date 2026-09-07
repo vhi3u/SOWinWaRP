@@ -16,6 +16,7 @@
 using Oceananigans
 using Oceananigans.Units
 using Oceananigans.Grids
+using Oceananigans.Grids: topology
 using Oceananigans.BoundaryConditions
 using Oceananigans.BoundaryConditions: PerturbationAdvection
 using Oceananigans.OutputReaders: FieldTimeSeries, Cyclical
@@ -27,6 +28,7 @@ using NCDatasets
 using Dates
 using CFTime
 using Downloads
+using NumericalEarth.DataWrangling: JLD2
 
 import NumericalEarth.DataWrangling:
     default_download_directory,
@@ -46,7 +48,8 @@ import NumericalEarth.DataWrangling:
     retrieve_data,
     available_variables,
     default_inpainting,
-    centers_to_interfaces
+    centers_to_interfaces,
+    metadata_path
 
 import Downloads: download
 
@@ -242,6 +245,11 @@ function DataWrangling.metadata_filename(dataset::BSOSEMonthly, name, date, regi
     return resolve_bsose_filename(dataset.dir, name, dataset.iteration)
 end
 
+# BSOSE has valid, complete ocean coverage within Southern Ocean domains.
+# Disabling inpainting prevents NumericalEarth from generating dozens of separate per-slice JLD2 files.
+DataWrangling.default_inpainting(::BSOSEMetadata) = nothing
+DataWrangling.default_inpainting(::BSOSEMetadatum) = nothing
+
 function DataWrangling.all_dates(dataset::BSOSEMonthly, var)
     fn = resolve_bsose_filename(dataset.dir, var, dataset.iteration)
     fp = joinpath(dataset.dir, fn)
@@ -327,6 +335,68 @@ function find_bsose_time_index(ds::Dataset, target_date)
     return argmin(diffs)
 end
 
+"""
+    extrapolate_bsose_3d!(data::Array{Float32, 3}, var_name::AbstractString)
+
+In BSOSE NetCDF data, cells below bathymetry and dry land columns are masked with 0.0 (or NaN).
+When regridded onto an Oceananigans grid with deeper or higher-resolution bathymetry, these
+zero values cause massive unphysical density shocks (e.g., freshwater S = 0 PSU beneath 34.5 PSU seawater),
+triggering catastrophic convective velocities and DomainErrors in TEOS-10.
+
+This function vertically extrapolates each ocean column downwards by extending the bottom-most
+valid ocean value down to the deepest level (k = Nz in BSOSE coordinates).
+For completely dry columns (such as continental Antarctica), it fills with physically realistic
+Southern Ocean background values (S = 34.6 PSU, T = 0.0°C, u = 0.0, v = 0.0).
+"""
+function extrapolate_bsose_3d!(data::Array{Float32, 3}, var_name::AbstractString)
+    Nx, Ny, Nz = size(data)
+    is_salt = uppercase(var_name) in ("SALT", "SALINITY", "S")
+    is_theta = uppercase(var_name) in ("THETA", "TEMPERATURE", "T")
+    default_bg = is_salt ? 34.6f0 : (is_theta ? 0.0f0 : 0.0f0)
+
+    @inbounds for j in 1:Ny, i in 1:Nx
+        first_valid = 0
+        last_valid = 0
+
+        if is_salt
+            for k in 1:Nz
+                val = data[i, j, k]
+                if val > 10.0f0 && !isnan(val)
+                    first_valid == 0 && (first_valid = k)
+                    last_valid = k
+                end
+            end
+        else # theta, u, v
+            for k in 1:Nz
+                val = data[i, j, k]
+                if val != 0.0f0 && !isnan(val)
+                    first_valid == 0 && (first_valid = k)
+                    last_valid = k
+                end
+            end
+        end
+
+        if last_valid == 0
+            # Entire column is dry/land: fill with default background
+            for k in 1:Nz
+                data[i, j, k] = default_bg
+            end
+        else
+            # Fill upward if surface cells were unpopulated
+            top_val = data[i, j, first_valid]
+            for k in 1:(first_valid - 1)
+                data[i, j, k] = top_val
+            end
+            # Fill downward below bathymetry with bottom-most ocean value
+            bot_val = data[i, j, last_valid]
+            for k in (last_valid + 1):Nz
+                data[i, j, k] = bot_val
+            end
+        end
+    end
+    return data
+end
+
 function DataWrangling.retrieve_data(metadatum::BSOSEMetadatum)
     path = metadata_path(metadatum)
     name = dataset_variable_name(metadatum)
@@ -343,8 +413,10 @@ function DataWrangling.retrieve_data(metadatum::BSOSEMetadatum)
         data = Array{Float32}(undef, size(raw))
         @inbounds for i in eachindex(raw)
             val = raw[i]
-            data[i] = (ismissing(val) || isnan(val)) ? NaN32 : Float32(val)
+            data[i] = (ismissing(val) || isnan(val)) ? 0.0f0 : Float32(val)
         end
+        # Vertically extrapolate ocean columns downwards to eliminate 0.0 below bathymetry
+        extrapolate_bsose_3d!(data, name)
         if reversed_vertical_axis(metadatum.dataset)
             data = reverse(data, dims=3)
         end
@@ -428,12 +500,53 @@ function boundary_slice_time_series(fts::FieldTimeSeries, side::Symbol)
     end
 end
 
+# ==============================================================================
+# 3. Surface Wind Stress Helper (Standalone)
+# ==============================================================================
+
+"""
+    bsose_surface_wind_stress(grid;
+                              dataset = BSOSEMonthly(),
+                              dates = all_dates(dataset, :temperature)[1:12],
+                              ρ₀ = 1026.0)
+
+Load BSOSE surface wind stress (`oceTAUX` and `oceTAUY`), convert to kinematic
+momentum flux (`τ / ρ₀`), and return a `NamedTuple` of top `FluxBoundaryCondition`s:
+`(; u = FluxBoundaryCondition(top_u), v = FluxBoundaryCondition(top_v))`.
+
+Can be used standalone or passed to `bsose_open_boundary_conditions`.
+"""
+function bsose_surface_wind_stress(grid;
+                                  dataset = BSOSEMonthly(),
+                                  dates = all_dates(dataset, :temperature)[1:12],
+                                  ρ₀ = 1026.0)
+    @info "Loading BSOSE surface wind stress (oceTAUX, oceTAUY)..."
+    taux_fts = FieldTimeSeries(Metadata(:zonal_wind_stress; dataset, dates), grid)
+    tauy_fts = FieldTimeSeries(Metadata(:meridional_wind_stress; dataset, dates), grid)
+
+    # Convert stress (N/m²) to kinematic momentum flux (m²/s²): divide by ρ₀
+    for t in 1:length(dates)
+        interior(taux_fts[t]) ./= ρ₀
+        interior(tauy_fts[t]) ./= ρ₀
+    end
+
+    top_u_slice = boundary_slice_time_series(taux_fts, :top)
+    top_v_slice = boundary_slice_time_series(tauy_fts, :top)
+
+    return (u = FluxBoundaryCondition(top_u_slice),
+            v = FluxBoundaryCondition(top_v_slice))
+end
+
+# ==============================================================================
+# 4. Open Boundary Conditions (OBCs)
+# ==============================================================================
+
 """
     bsose_open_boundary_conditions(grid;
                                    dataset = BSOSEMonthly(),
                                    dates = all_dates(dataset, :temperature)[1:12],
                                    scheme = nothing,
-                                   surface_winds = false,
+                                   winds = nothing,
                                    ρ₀ = 1026.0)
 
 Construct a `NamedTuple` of `FieldBoundaryConditions` `(; u, v, T, S)` configured with
@@ -442,87 +555,182 @@ open boundary conditions from BSOSE.
 # Arguments
 - `grid`: The simulation `LatitudeLongitudeGrid`.
 - `dataset`: `BSOSEMonthly()` instance.
-- `dates`: Range or collection of `DateTime` dates to load.
-- `scheme`: Radiation/matching scheme for open boundaries. Can be `nothing` (clamped Dirichlet)
-            or an instance of `Oceananigans.BoundaryConditions.PerturbationAdvection`.
-- `surface_winds`: If `true`, loads BSOSE `oceTAUX` and `oceTAUY` and sets top `FluxBoundaryCondition`
-                   with kinematic stress `τ / ρ₀`.
+- `dates`: Range or collection of dates for open boundary forcing.
+- `scheme`: Radiation/matching scheme for open boundary normal flows.
+            Defaults to `Oceananigans.BoundaryConditions.PerturbationAdvection()`.
+- `winds`: Surface wind forcing. Options:
+           - `nothing` or `false` (default): Disables surface wind forcing (no-flux top boundary).
+           - `true`: Automatically calls `bsose_surface_wind_stress` and applies top flux.
+           - A `NamedTuple` `(; u, v)` returned from `bsose_surface_wind_stress(grid; ...)`.
 - `ρ₀`: Seawater density for wind stress conversion (kg/m³). Default: 1026.0.
+- `cache`: If `true`, saves and loads all boundary conditions to/from a SINGLE unified dataset file.
+- `cache_file`: Optional custom file path for the unified dataset file.
 """
 function bsose_open_boundary_conditions(grid;
                                        dataset = BSOSEMonthly(),
                                        dates = all_dates(dataset, :temperature)[1:12],
-                                       scheme = nothing,
-                                       surface_winds = false,
-                                       ρ₀ = 1026.0)
+                                       scheme = PerturbationAdvection(),
+                                       winds = nothing,
+                                       ρ₀ = 1026.0,
+                                       cache = true,
+                                       cache_file = nothing)
     @info "Setting up BSOSE Open Boundary Conditions..."
-    
-    # 1. Load 3D FieldTimeSeries for state variables
-    @info " -> Loading BSOSE u_velocity..."
-    u_fts = FieldTimeSeries(Metadata(:u_velocity; dataset, dates), grid)
-    @info " -> Loading BSOSE v_velocity..."
-    v_fts = FieldTimeSeries(Metadata(:v_velocity; dataset, dates), grid)
-    @info " -> Loading BSOSE temperature..."
-    T_fts = FieldTimeSeries(Metadata(:temperature; dataset, dates), grid)
-    @info " -> Loading BSOSE salinity..."
-    S_fts = FieldTimeSeries(Metadata(:salinity; dataset, dates), grid)
 
-    # 2. Extract 2D boundary slices
-    @info " -> Extracting boundary slices (West, East, South, North)..."
-    u_west  = boundary_slice_time_series(u_fts, :west)
-    u_east  = boundary_slice_time_series(u_fts, :east)
-    u_south = boundary_slice_time_series(u_fts, :south)
-    u_north = boundary_slice_time_series(u_fts, :north)
+    # Determine simulation start and end dates
+    start_d = dates isa Tuple ? dates[1] : first(dates)
+    end_d   = dates isa Tuple ? dates[2] : last(dates)
+    start_str = Dates.format(start_d, "yyyymmdd")
+    end_str   = Dates.format(end_d, "yyyymmdd")
 
-    v_west  = boundary_slice_time_series(v_fts, :west)
-    v_east  = boundary_slice_time_series(v_fts, :east)
-    v_south = boundary_slice_time_series(v_fts, :south)
-    v_north = boundary_slice_time_series(v_fts, :north)
+    underlying = grid isa ImmersedBoundaryGrid ? grid.underlying_grid : grid
+    Nx, Ny, Nz = size(underlying)
+    is_x_periodic = topology(underlying, 1) === Periodic
 
-    T_west  = boundary_slice_time_series(T_fts, :west)
-    T_east  = boundary_slice_time_series(T_fts, :east)
-    T_south = boundary_slice_time_series(T_fts, :south)
-    T_north = boundary_slice_time_series(T_fts, :north)
+    # Unified dataset filename
+    default_dataset_name = "bsose_dataset_$(dataset.iteration)_$(start_str)_to_$(end_str)_$(Nx)x$(Ny)x$(Nz).jld2"
+    dataset_path = cache_file !== nothing ? cache_file : joinpath(dataset.dir, default_dataset_name)
 
-    S_west  = boundary_slice_time_series(S_fts, :west)
-    S_east  = boundary_slice_time_series(S_fts, :east)
-    S_south = boundary_slice_time_series(S_fts, :south)
-    S_north = boundary_slice_time_series(S_fts, :north)
+    # 1. Attempt loading from single unified dataset
+    if cache && isfile(dataset_path)
+        @info "Loading all BSOSE boundary conditions from single unified dataset: $dataset_path"
+        cached = JLD2.jldopen(dataset_path, "r") do f
+            (
+                u_west  = haskey(f, "u_west")  ? f["u_west"]  : nothing,
+                u_east  = haskey(f, "u_east")  ? f["u_east"]  : nothing,
+                u_south = haskey(f, "u_south") ? f["u_south"] : nothing,
+                u_north = haskey(f, "u_north") ? f["u_north"] : nothing,
+                v_west  = haskey(f, "v_west")  ? f["v_west"]  : nothing,
+                v_east  = haskey(f, "v_east")  ? f["v_east"]  : nothing,
+                v_south = haskey(f, "v_south") ? f["v_south"] : nothing,
+                v_north = haskey(f, "v_north") ? f["v_north"] : nothing,
+                T_west  = haskey(f, "T_west")  ? f["T_west"]  : nothing,
+                T_east  = haskey(f, "T_east")  ? f["T_east"]  : nothing,
+                T_south = haskey(f, "T_south") ? f["T_south"] : nothing,
+                T_north = haskey(f, "T_north") ? f["T_north"] : nothing,
+                S_west  = haskey(f, "S_west")  ? f["S_west"]  : nothing,
+                S_east  = haskey(f, "S_east")  ? f["S_east"]  : nothing,
+                S_south = haskey(f, "S_south") ? f["S_south"] : nothing,
+                S_north = haskey(f, "S_north") ? f["S_north"] : nothing,
+                wind_u  = haskey(f, "wind_u")  ? f["wind_u"]  : nothing,
+                wind_v  = haskey(f, "wind_v")  ? f["wind_v"]  : nothing,
+            )
+        end
+        u_west, u_east, u_south, u_north = cached.u_west, cached.u_east, cached.u_south, cached.u_north
+        v_west, v_east, v_south, v_north = cached.v_west, cached.v_east, cached.v_south, cached.v_north
+        T_west, T_east, T_south, T_north = cached.T_west, cached.T_east, cached.T_south, cached.T_north
+        S_west, S_east, S_south, S_north = cached.S_west, cached.S_east, cached.S_south, cached.S_north
+        top_u_cached, top_v_cached = cached.wind_u, cached.wind_v
+    else
+        # 1. Load 3D FieldTimeSeries for state variables
+        @info "Extracting BSOSE fields for simulation window ($start_d to $end_d)..."
+        @info " -> Loading BSOSE u_velocity..."
+        u_fts = FieldTimeSeries(Metadata(:u_velocity; dataset, dates), grid)
+        @info " -> Loading BSOSE v_velocity..."
+        v_fts = FieldTimeSeries(Metadata(:v_velocity; dataset, dates), grid)
+        @info " -> Loading BSOSE temperature..."
+        T_fts = FieldTimeSeries(Metadata(:temperature; dataset, dates), grid)
+        @info " -> Loading BSOSE salinity..."
+        S_fts = FieldTimeSeries(Metadata(:salinity; dataset, dates), grid)
+
+        # 2. Extract 2D boundary slices
+        @info " -> Extracting boundary slices (West, East, South, North)..."
+        u_west  = boundary_slice_time_series(u_fts, :west)
+        u_east  = boundary_slice_time_series(u_fts, :east)
+        u_south = boundary_slice_time_series(u_fts, :south)
+        u_north = boundary_slice_time_series(u_fts, :north)
+
+        v_west  = boundary_slice_time_series(v_fts, :west)
+        v_east  = boundary_slice_time_series(v_fts, :east)
+        v_south = boundary_slice_time_series(v_fts, :south)
+        v_north = boundary_slice_time_series(v_fts, :north)
+
+        T_west  = boundary_slice_time_series(T_fts, :west)
+        T_east  = boundary_slice_time_series(T_fts, :east)
+        T_south = boundary_slice_time_series(T_fts, :south)
+        T_north = boundary_slice_time_series(T_fts, :north)
+
+        S_west  = boundary_slice_time_series(S_fts, :west)
+        S_east  = boundary_slice_time_series(S_fts, :east)
+        S_south = boundary_slice_time_series(S_fts, :south)
+        S_north = boundary_slice_time_series(S_fts, :north)
+
+        top_u_cached = nothing
+        top_v_cached = nothing
+
+        # Compute winds if enabled so they can be saved into the single dataset
+        if winds === true
+            wind_bcs = bsose_surface_wind_stress(grid; dataset, dates, ρ₀)
+            top_u_cached = wind_bcs.u
+            top_v_cached = wind_bcs.v
+        end
+
+        # Save all boundary conditions together into ONE single dataset
+        if cache
+            @info "Saving all boundary conditions together into single dataset: $dataset_path"
+            JLD2.jldopen(dataset_path, "w") do f
+                f["start_date"] = string(start_d)
+                f["end_date"]   = string(end_d)
+                f["u_west"]  = u_west;  f["u_east"]  = u_east;  f["u_south"]  = u_south;  f["u_north"]  = u_north
+                f["v_west"]  = v_west;  f["v_east"]  = v_east;  f["v_south"]  = v_south;  f["v_north"]  = v_north
+                f["T_west"]  = T_west;  f["T_east"]  = T_east;  f["T_south"]  = T_south;  f["T_north"]  = T_north
+                f["S_west"]  = S_west;  f["S_east"]  = S_east;  f["S_south"]  = S_south;  f["S_north"]  = S_north
+                if top_u_cached !== nothing && top_v_cached !== nothing
+                    f["wind_u"] = top_u_cached
+                    f["wind_v"] = top_v_cached
+                end
+            end
+        end
+    end
+
+    # Ensure all boundary slices have valid ocean tracer ranges (no 0.0 salinity or extreme T)
+    for s_slice in (S_west, S_east, S_south, S_north)
+        if s_slice !== nothing
+            for t in 1:length(s_slice.times)
+                arr = interior(s_slice[t])
+                @. arr = ifelse(arr < 25.0f0, 34.6f0, arr)
+                fill_halo_regions!(s_slice[t])
+            end
+        end
+    end
+    for t_slice in (T_west, T_east, T_south, T_north)
+        if t_slice !== nothing
+            for t in 1:length(t_slice.times)
+                arr = interior(t_slice[t])
+                @. arr = ifelse(arr < -3.0f0, -1.8f0, arr)
+                fill_halo_regions!(t_slice[t])
+            end
+        end
+    end
 
     # 3. Top boundary condition (surface wind stress)
     top_u_bc = FluxBoundaryCondition(nothing)
     top_v_bc = FluxBoundaryCondition(nothing)
 
-    if surface_winds
-        @info " -> Loading BSOSE surface wind stress (oceTAUX, oceTAUY)..."
-        taux_fts = FieldTimeSeries(Metadata(:zonal_wind_stress; dataset, dates), grid)
-        tauy_fts = FieldTimeSeries(Metadata(:meridional_wind_stress; dataset, dates), grid)
-        
-        # Scale by 1 / ρ₀ to get kinematic momentum flux
-        for t in 1:length(dates)
-            interior(taux_fts[t]) ./= ρ₀
-            interior(tauy_fts[t]) ./= ρ₀
+    if winds === true
+        if top_u_cached !== nothing && top_v_cached !== nothing
+            top_u_bc = top_u_cached
+            top_v_bc = top_v_cached
+        else
+            wind_bcs = bsose_surface_wind_stress(grid; dataset, dates, ρ₀)
+            top_u_bc = wind_bcs.u
+            top_v_bc = wind_bcs.v
         end
-
-        top_u_slice = boundary_slice_time_series(taux_fts, :top)
-        top_v_slice = boundary_slice_time_series(tauy_fts, :top)
-
-        top_u_bc = FluxBoundaryCondition(top_u_slice)
-        top_v_bc = FluxBoundaryCondition(top_v_slice)
+    elseif winds isa NamedTuple
+        top_u_bc = get(winds, :u, FluxBoundaryCondition(nothing))
+        top_v_bc = get(winds, :v, FluxBoundaryCondition(nothing))
+    else
+        @info " -> Surface wind stress is DISABLED (top boundary is no-flux)."
     end
 
     # 4. Construct FieldBoundaryConditions
     # Note: On East/West boundaries, normal velocity is u (NormalFlow), tangential is v (Value).
     #       On South/North boundaries, normal velocity is v (NormalFlow), tangential is u (Value).
     # If the domain is longitudinally periodic (e.g. Circumpolar), only South and North BCs are applied.
-    underlying = grid isa ImmersedBoundaryGrid ? grid.underlying_grid : grid
-    is_x_periodic = underlying.topology[1] === Periodic
-
     if is_x_periodic
         @info " -> Longitude is Periodic (circumpolar): applying South & North boundary conditions."
         u_bcs = FieldBoundaryConditions(
-            south = ValueBoundaryCondition(u_south; scheme),
-            north = ValueBoundaryCondition(u_north; scheme),
+            south = ValueBoundaryCondition(u_south),
+            north = ValueBoundaryCondition(u_north),
             top   = top_u_bc
         )
 
@@ -533,44 +741,44 @@ function bsose_open_boundary_conditions(grid;
         )
 
         T_bcs = FieldBoundaryConditions(
-            south = ValueBoundaryCondition(T_south; scheme),
-            north = ValueBoundaryCondition(T_north; scheme)
+            south = ValueBoundaryCondition(T_south),
+            north = ValueBoundaryCondition(T_north)
         )
 
         S_bcs = FieldBoundaryConditions(
-            south = ValueBoundaryCondition(S_south; scheme),
-            north = ValueBoundaryCondition(S_north; scheme)
+            south = ValueBoundaryCondition(S_south),
+            north = ValueBoundaryCondition(S_north)
         )
     else
         @info " -> Longitude is Bounded (regional): applying West, East, South, and North boundary conditions."
         u_bcs = FieldBoundaryConditions(
             west  = NormalFlowBoundaryCondition(u_west; scheme),
             east  = NormalFlowBoundaryCondition(u_east; scheme),
-            south = ValueBoundaryCondition(u_south; scheme),
-            north = ValueBoundaryCondition(u_north; scheme),
+            south = ValueBoundaryCondition(u_south),
+            north = ValueBoundaryCondition(u_north),
             top   = top_u_bc
         )
 
         v_bcs = FieldBoundaryConditions(
-            west  = ValueBoundaryCondition(v_west; scheme),
-            east  = ValueBoundaryCondition(v_east; scheme),
+            west  = ValueBoundaryCondition(v_west),
+            east  = ValueBoundaryCondition(v_east),
             south = NormalFlowBoundaryCondition(v_south; scheme),
             north = NormalFlowBoundaryCondition(v_north; scheme),
             top   = top_v_bc
         )
 
         T_bcs = FieldBoundaryConditions(
-            west  = ValueBoundaryCondition(T_west; scheme),
-            east  = ValueBoundaryCondition(T_east; scheme),
-            south = ValueBoundaryCondition(T_south; scheme),
-            north = ValueBoundaryCondition(T_north; scheme)
+            west  = ValueBoundaryCondition(T_west),
+            east  = ValueBoundaryCondition(T_east),
+            south = ValueBoundaryCondition(T_south),
+            north = ValueBoundaryCondition(T_north)
         )
 
         S_bcs = FieldBoundaryConditions(
-            west  = ValueBoundaryCondition(S_west; scheme),
-            east  = ValueBoundaryCondition(S_east; scheme),
-            south = ValueBoundaryCondition(S_south; scheme),
-            north = ValueBoundaryCondition(S_north; scheme)
+            west  = ValueBoundaryCondition(S_west),
+            east  = ValueBoundaryCondition(S_east),
+            south = ValueBoundaryCondition(S_south),
+            north = ValueBoundaryCondition(S_north)
         )
     end
 
@@ -579,34 +787,149 @@ function bsose_open_boundary_conditions(grid;
 end
 
 # ==============================================================================
-# 4. Initial Conditions Helper
+# 5. Initial Conditions Helper
 # ==============================================================================
 
 """
     bsose_initial_conditions!(model;
-                              dataset = BSOSEMonthly(),
-                              date = first_date(dataset, :temperature))
+                               dataset = BSOSEMonthly(),
+                               date = nothing,
+                               dates = nothing)
 
 Initialize `model` tracers (`T`, `S`) and velocities (`u`, `v`) from BSOSE at `date`.
+If `dates` is passed, initializes at the start of the simulation window.
 """
 function bsose_initial_conditions!(model;
                                    dataset = BSOSEMonthly(),
-                                   date = first_date(dataset, :temperature))
-    @info "Initializing model state from BSOSE at date: $date..."
+                                   date = nothing,
+                                   dates = nothing)
+    init_date = date !== nothing ? date :
+                dates !== nothing ? (dates isa Tuple ? dates[1] : first(dates)) :
+                first_date(dataset, :temperature)
+
+    @info "Initializing model state from BSOSE at date: $init_date..."
     grid = model.grid
-    
-    T_init = Field(Metadatum(:temperature; dataset, date), grid)
-    S_init = Field(Metadatum(:salinity; dataset, date), grid)
-    u_init = Field(Metadatum(:u_velocity; dataset, date), grid)
-    v_init = Field(Metadatum(:v_velocity; dataset, date), grid)
+
+    T_init = Field(Metadatum(:temperature; dataset, date=init_date), grid)
+    S_init = Field(Metadatum(:salinity; dataset, date=init_date), grid)
+    u_init = Field(Metadatum(:u_velocity; dataset, date=init_date), grid)
+    v_init = Field(Metadatum(:v_velocity; dataset, date=init_date), grid)
 
     set!(model; u=u_init, v=v_init, T=T_init, S=S_init)
+
+    # Sanitize initial tracer fields to guarantee no unphysical values exist in open or immersed cells
+    S_int = interior(model.tracers.S)
+    T_int = interior(model.tracers.T)
+    @. S_int = ifelse(S_int < 25.0f0, 34.6f0, S_int)
+    @. T_int = ifelse(T_int < -3.0f0, -1.8f0, T_int)
+    fill_halo_regions!(model.tracers)
+    fill_halo_regions!(model.velocities)
+
     @info "Model successfully initialized with BSOSE fields."
     return nothing
 end
 
 # ==============================================================================
-# 5. Sponge Layer Relaxation Forcing Helper (Alternative or complement to OBCs)
+# 6. Single NetCDF Simulation Dataset Creation Helper
+# ==============================================================================
+
+"""
+    create_bsose_netcdf_dataset(grid;
+                                dataset = BSOSEMonthly(),
+                                dates = (DateTime(2008, 1, 1), DateTime(2008, 12, 31)),
+                                output_path = nothing,
+                                buffer = 2.0)
+
+Extract all raw BSOSE variables (`UVEL`, `VVEL`, `THETA`, `SALT`, `oceTAUX`, `oceTAUY`) for the
+simulation's spatial domain and time window into a SINGLE unified NetCDF file.
+"""
+function create_bsose_netcdf_dataset(grid;
+                                     dataset = BSOSEMonthly(),
+                                     dates = (DateTime(2008, 1, 1), DateTime(2008, 12, 31)),
+                                     output_path = nothing,
+                                     buffer = 2.0)
+    start_d = dates isa Tuple ? dates[1] : first(dates)
+    end_d   = dates isa Tuple ? dates[2] : last(dates)
+    start_str = Dates.format(start_d, "yyyymmdd")
+    end_str   = Dates.format(end_d, "yyyymmdd")
+
+    if output_path === nothing
+        output_path = joinpath(dataset.dir, "bsose_subset_$(dataset.iteration)_$(start_str)_to_$(end_str).nc")
+    end
+
+    @info "Creating unified BSOSE NetCDF dataset for $start_d to $end_d at: $output_path"
+
+    underlying = grid isa ImmersedBoundaryGrid ? grid.underlying_grid : grid
+    λ_min = minimum(underlying.λᶠᵃᵃ) - buffer
+    λ_max = maximum(underlying.λᶠᵃᵃ) + buffer
+    φ_min = minimum(underlying.φᵃᶠᵃ) - buffer
+    φ_max = maximum(underlying.φᵃᶠᵃ) + buffer
+
+    # Reference dimensions from Theta file
+    theta_fp = joinpath(dataset.dir, resolve_bsose_filename(dataset.dir, :temperature, dataset.iteration))
+    ds_ref = NCDataset(theta_fp)
+    times = ds_ref["time"][:]
+    t_idx = findall(t -> (start_d - Month(1)) <= t <= (end_d + Month(1)), times)
+    if isempty(t_idx)
+        t_idx = 1:min(12, length(times))
+    end
+    lon_c = ds_ref["XC"][:]
+    lat_c = ds_ref["YC"][:]
+    z_c   = ds_ref["Z"][:]
+
+    ilon_c = findall(x -> λ_min <= x <= λ_max, lon_c)
+    ilat_c = findall(y -> φ_min <= y <= φ_max, lat_c)
+    close(ds_ref)
+
+    NCDataset(output_path, "c") do ds_out
+        defDim(ds_out, "XC", length(ilon_c))
+        defDim(ds_out, "YC", length(ilat_c))
+        defDim(ds_out, "Z", length(z_c))
+        defDim(ds_out, "time", length(t_idx))
+
+        defVar(ds_out, "XC", lon_c[ilon_c], ("XC",))
+        defVar(ds_out, "YC", lat_c[ilat_c], ("YC",))
+        defVar(ds_out, "Z", z_c, ("Z",))
+        defVar(ds_out, "time", times[t_idx], ("time",))
+
+        var_files = [
+            (:THETA, :temperature, ("XC", "YC", "Z", "time")),
+            (:SALT,  :salinity,    ("XC", "YC", "Z", "time")),
+            (:UVEL,  :u_velocity,  ("XC", "YC", "Z", "time")),
+            (:VVEL,  :v_velocity,  ("XC", "YC", "Z", "time")),
+        ]
+
+        for (vname_nc, sym, dims) in var_files
+            fp = joinpath(dataset.dir, resolve_bsose_filename(dataset.dir, sym, dataset.iteration))
+            if isfile(fp)
+                @info " -> Extracting $vname_nc..."
+                NCDataset(fp) do ds_in
+                    v = ds_in[string(vname_nc)][ilon_c, ilat_c, :, t_idx]
+                    v_out = defVar(ds_out, string(vname_nc), eltype(v), dims)
+                    v_out[:, :, :, :] = v
+                end
+            end
+        end
+
+        for (vname_nc, sym) in [(:oceTAUX, :u_wind_stress), (:oceTAUY, :v_wind_stress)]
+            fp = joinpath(dataset.dir, resolve_bsose_filename(dataset.dir, sym, dataset.iteration))
+            if isfile(fp)
+                @info " -> Extracting $vname_nc..."
+                NCDataset(fp) do ds_in
+                    v = ds_in[string(vname_nc)][ilon_c, ilat_c, t_idx]
+                    v_out = defVar(ds_out, string(vname_nc), eltype(v), ("XC", "YC", "time"))
+                    v_out[:, :, :] = v
+                end
+            end
+        end
+    end
+
+    @info "Unified BSOSE NetCDF dataset successfully created: $output_path"
+    return output_path
+end
+
+# ==============================================================================
+# 6. Sponge Layer Relaxation Forcing Helper (Alternative or complement to OBCs)
 # ==============================================================================
 
 """
