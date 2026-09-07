@@ -25,7 +25,7 @@ end
 
 # flags
 
-const OBCS = true # open boundary conditions; if false, we will use sponge layers instead? 
+const OBCS = false # open boundary conditions; if false, we will use whole-region DatasetRestoring nudging
 const WINDS = false # time-varying surface wind forcing from BSOSE data (oceTAUX and oceTAUY)
 const TEOS = true # use TEOS because the nonlinearity from the full equation of state allows for AAIW formation ; if false uses linear equation of state
 const CHECKPOINTS = false # save state and restart if the model crashes. If false, the model will start from scratch. 
@@ -116,11 +116,18 @@ if OBCS && DATASET == "BSOSE"
     @info "Configuring BSOSE Open Boundary Conditions..."
     boundary_conditions = bsose_open_boundary_conditions(grid; dataset=dataset, dates=dates, winds=WINDS)
     forcings = NamedTuple()
-elseif !OBCS && DATASET == "BSOSE"
-    @info "Configuring BSOSE Sponge Layer Relaxation..."
-    wind_bcs = WINDS ? bsose_surface_wind_stress(grid; dataset=dataset, dates=dates) : nothing
-    boundary_conditions = WINDS ? (u=FieldBoundaryConditions(top=wind_bcs.u), v=FieldBoundaryConditions(top=wind_bcs.v)) : NamedTuple()
-    forcings = bsose_sponge_forcing(grid; dataset=dataset, dates=dates, rate=1 / 30days, sponge_distance=2.0)
+elseif !OBCS
+    @info "Configuring whole-region DatasetRestoring (30-day restoring for T and S from $DATASET)..."
+    wind_bcs = (WINDS && DATASET == "BSOSE") ? bsose_surface_wind_stress(grid; dataset=dataset, dates=dates) : nothing
+    boundary_conditions = wind_bcs !== nothing ? (u=FieldBoundaryConditions(top=wind_bcs.u), v=FieldBoundaryConditions(top=wind_bcs.v)) : NamedTuple()
+
+    temperature_metadata = Metadata(:temperature; dataset, start_date, end_date)
+    salinity_metadata = Metadata(:salinity; dataset, start_date, end_date)
+
+    FT = DatasetRestoring(temperature_metadata, grid; rate=1 / 30days)
+    FS = DatasetRestoring(salinity_metadata, grid; rate=1 / 30days)
+
+    forcings = (T=FT, S=FS)
 else
     boundary_conditions = NamedTuple()
     forcings = NamedTuple()
@@ -170,13 +177,16 @@ simulation.callbacks[:wizard] = Callback(wizard, IterationInterval(10))
 function progress(sim)
     u, v, w = sim.model.velocities
     T, S = sim.model.tracers
-    @info @sprintf("Time: %s, Iter: %d, Δt: %s, max(|u|,|v|,|w|): (%.2e, %.2e, %.2e), T range: (%.2f, %.2f), S range: (%.2f, %.2f)",
+    η = sim.model.free_surface.displacement
+    @info @sprintf("Time: %s, Iter: %d, Δt: %s, max(|u|,|v|,|w|): (%.2e, %.2e, %.2e), max(|η|): %.2e, T range: (%.2f, %.2f), S range: (%.2f, %.2f)",
         prettytime(sim.model.clock.time),
         sim.model.clock.iteration,
         prettytime(sim.Δt),
         maximum(abs, u), maximum(abs, v), maximum(abs, w),
+        maximum(abs, η),
         minimum(T), maximum(T),
         minimum(S), maximum(S))
+    flush(stdout)
 end
 simulation.callbacks[:progress] = Callback(progress, TimeInterval(1hours))
 

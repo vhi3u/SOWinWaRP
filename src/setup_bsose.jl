@@ -18,7 +18,7 @@ using Oceananigans.Units
 using Oceananigans.Grids
 using Oceananigans.Grids: topology
 using Oceananigans.BoundaryConditions
-using Oceananigans.BoundaryConditions: PerturbationAdvection
+using Oceananigans.BoundaryConditions: PerturbationAdvection, GravityWaveRadiationBoundaryCondition
 using Oceananigans.OutputReaders: FieldTimeSeries, Cyclical
 using Oceananigans.Architectures: architecture, CPU, GPU, on_architecture
 using Oceananigans.Fields: interior, location, fill_halo_regions!
@@ -249,6 +249,19 @@ end
 # Disabling inpainting prevents NumericalEarth from generating dozens of separate per-slice JLD2 files.
 DataWrangling.default_inpainting(::BSOSEMetadata) = nothing
 DataWrangling.default_inpainting(::BSOSEMetadatum) = nothing
+
+function DataWrangling.inpainted_metadata_path(metadata::BSOSEMetadatum)
+    dstr = metadata.dates isa Dates.AbstractDateTime ? Dates.format(metadata.dates, "yyyymmdd") : "all"
+    return joinpath(metadata.dir, "bsose_inpainted_$(metadata.name)_$(dstr).jld2")
+end
+
+function DataWrangling.inpainted_metadata_path(metadata::BSOSEMetadata)
+    start_d = first(metadata.dates)
+    end_d = last(metadata.dates)
+    start_str = Dates.format(start_d, "yyyymmdd")
+    end_str = Dates.format(end_d, "yyyymmdd")
+    return joinpath(metadata.dir, "bsose_inpainted_$(metadata.name)_$(start_str)_to_$(end_str).jld2")
+end
 
 function DataWrangling.all_dates(dataset::BSOSEMonthly, var)
     fn = resolve_bsose_filename(dataset.dir, var, dataset.iteration)
@@ -694,25 +707,6 @@ function bsose_open_boundary_conditions(grid;
         end
     end
 
-    # Ensure all boundary slices have valid ocean tracer ranges (no 0.0 salinity or extreme T)
-    for s_slice in (S_west, S_east, S_south, S_north)
-        if s_slice !== nothing
-            for t in 1:length(s_slice.times)
-                arr = interior(s_slice[t])
-                @. arr = ifelse(arr < 25.0f0, 34.6f0, arr)
-                fill_halo_regions!(s_slice[t])
-            end
-        end
-    end
-    for t_slice in (T_west, T_east, T_south, T_north)
-        if t_slice !== nothing
-            for t in 1:length(t_slice.times)
-                arr = interior(t_slice[t])
-                @. arr = ifelse(arr < -3.0f0, -1.8f0, arr)
-                fill_halo_regions!(t_slice[t])
-            end
-        end
-    end
 
     # 3. Top boundary condition (surface wind stress)
     top_u_bc = FluxBoundaryCondition(nothing)
@@ -741,8 +735,8 @@ function bsose_open_boundary_conditions(grid;
     if is_x_periodic
         @info " -> Longitude is Periodic (circumpolar): applying South & North boundary conditions."
         u_bcs = FieldBoundaryConditions(
-            south=ValueBoundaryCondition(u_south),
-            north=ValueBoundaryCondition(u_north),
+            south=ValueBoundaryCondition(u_south; scheme),
+            north=ValueBoundaryCondition(u_north; scheme),
             top=top_u_bc
         )
 
@@ -753,49 +747,67 @@ function bsose_open_boundary_conditions(grid;
         )
 
         T_bcs = FieldBoundaryConditions(
-            south=ValueBoundaryCondition(T_south),
-            north=ValueBoundaryCondition(T_north)
+            south=ValueBoundaryCondition(T_south; scheme),
+            north=ValueBoundaryCondition(T_north; scheme)
         )
 
         S_bcs = FieldBoundaryConditions(
-            south=ValueBoundaryCondition(S_south),
-            north=ValueBoundaryCondition(S_north)
+            south=ValueBoundaryCondition(S_south; scheme),
+            north=ValueBoundaryCondition(S_north; scheme)
+        )
+
+        U_bcs = FieldBoundaryConditions()
+        V_bcs = FieldBoundaryConditions(grid, (Center(), Face(), nothing);
+            south=GravityWaveRadiationBoundaryCondition((0.0, 0.0)),
+            north=GravityWaveRadiationBoundaryCondition((0.0, 0.0))
         )
     else
         @info " -> Longitude is Bounded (regional): applying West, East, South, and North boundary conditions."
         u_bcs = FieldBoundaryConditions(
             west=NormalFlowBoundaryCondition(u_west; scheme),
             east=NormalFlowBoundaryCondition(u_east; scheme),
-            south=ValueBoundaryCondition(u_south),
-            north=ValueBoundaryCondition(u_north),
+            south=ValueBoundaryCondition(u_south; scheme),
+            north=ValueBoundaryCondition(u_north; scheme),
             top=top_u_bc
         )
 
         v_bcs = FieldBoundaryConditions(
-            west=ValueBoundaryCondition(v_west),
-            east=ValueBoundaryCondition(v_east),
+            west=ValueBoundaryCondition(v_west; scheme),
+            east=ValueBoundaryCondition(v_east; scheme),
             south=NormalFlowBoundaryCondition(v_south; scheme),
             north=NormalFlowBoundaryCondition(v_north; scheme),
             top=top_v_bc
         )
 
         T_bcs = FieldBoundaryConditions(
-            west=ValueBoundaryCondition(T_west),
-            east=ValueBoundaryCondition(T_east),
-            south=ValueBoundaryCondition(T_south),
-            north=ValueBoundaryCondition(T_north)
+            west=ValueBoundaryCondition(T_west; scheme),
+            east=ValueBoundaryCondition(T_east; scheme),
+            south=ValueBoundaryCondition(T_south; scheme),
+            north=ValueBoundaryCondition(T_north; scheme)
         )
 
         S_bcs = FieldBoundaryConditions(
-            west=ValueBoundaryCondition(S_west),
-            east=ValueBoundaryCondition(S_east),
-            south=ValueBoundaryCondition(S_south),
-            north=ValueBoundaryCondition(S_north)
+            west=ValueBoundaryCondition(S_west; scheme),
+            east=ValueBoundaryCondition(S_east; scheme),
+            south=ValueBoundaryCondition(S_south; scheme),
+            north=ValueBoundaryCondition(S_north; scheme)
+        )
+
+        # Barotropic transport boundary conditions for SplitExplicitFreeSurface
+        # Ensures normal barotropic transport U and V radiate surface gravity waves freely
+        # rather than enforcing rigid no-normal-flow (U=0, V=0) walls against 3D inflow/outflow.
+        U_bcs = FieldBoundaryConditions(grid, (Face(), Center(), nothing);
+            west=GravityWaveRadiationBoundaryCondition((0.0, 0.0)),
+            east=GravityWaveRadiationBoundaryCondition((0.0, 0.0))
+        )
+        V_bcs = FieldBoundaryConditions(grid, (Center(), Face(), nothing);
+            south=GravityWaveRadiationBoundaryCondition((0.0, 0.0)),
+            north=GravityWaveRadiationBoundaryCondition((0.0, 0.0))
         )
     end
 
     @info "BSOSE Open Boundary Conditions setup complete."
-    return (u=u_bcs, v=v_bcs, T=T_bcs, S=S_bcs)
+    return (u=u_bcs, v=v_bcs, T=T_bcs, S=S_bcs, U=U_bcs, V=V_bcs)
 end
 
 # ==============================================================================
