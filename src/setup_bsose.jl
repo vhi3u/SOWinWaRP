@@ -827,12 +827,6 @@ function bsose_initial_conditions!(model;
     u_init = Field(Metadatum(:u_velocity; dataset, date=init_date), grid)
     v_init = Field(Metadatum(:v_velocity; dataset, date=init_date), grid)
 
-    # Sanitize initial tracer fields to guarantee no unphysical values exist in open or immersed cells
-    S_int = interior(S_init)
-    T_int = interior(T_init)
-    @. S_int = ifelse(S_int < 25.0, 34.6, S_int)
-    @. T_int = ifelse(T_int < -3.0, -1.8, T_int)
-
     set!(model; u=u_init, v=v_init, T=T_init, S=S_init)
 
     @info "Model successfully initialized with BSOSE fields."
