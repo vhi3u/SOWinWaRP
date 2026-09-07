@@ -4,8 +4,13 @@
 *.jld2
 *.png
 *.gif
-*.sh
 *.pbs
 *.fig
 data/
 scratch/
+logs/
+out/
+*.out
+*.err
+slurm_*.sh
+*.sh
