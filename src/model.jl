@@ -98,9 +98,14 @@ end
 
 @info "Selected dataset: $(summary(dataset))"
 
-# Simulation time window (1 year of forcing)
-start_date = DateTime(2009, 1, 1)
-end_date = DateTime(2009, 12, 31)
+# Simulation time window (1 year of forcing): local device has a different dataset than HPC GPU.
+if arch isa CPU
+    start_date = DateTime(2009, 1, 1)
+    end_date = DateTime(2009, 12, 31)
+else
+    start_date = DateTime(2014, 1, 1)
+    end_date = DateTime(2014, 12, 31)
+end
 dates = (start_date, end_date)
 
 # ==============================================================================
