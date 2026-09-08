@@ -219,8 +219,8 @@ function clamp_tracers!(model)
 end
 
 clamp_tracers!(ocean.model)
-fill_halo_regions!(ocean.model.tracers.T)
-fill_halo_regions!(ocean.model.tracers.S)
+fill_halo_regions!(ocean.model.tracers.T, ocean.model.clock, fields(ocean.model))
+fill_halo_regions!(ocean.model.tracers.S, ocean.model.clock, fields(ocean.model))
 clamp_tracers!(ocean.model)
 
 # ── TEOS10 sqrt guard ─────────────────────────────────────────────────────────
