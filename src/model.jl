@@ -10,9 +10,10 @@ using CUDA: has_cuda_gpu, allowscalar
 using NCDatasets
 using Dates
 using Printf
+using Statistics: mean
 using SeawaterPolynomials
-using SeawaterPolynomials.TEOS10: TEOS10EquationOfState
 using Oceananigans.TurbulenceClosures
+using Oceanostics.ProgressMessengers: TimedMessenger
 
 # Include our BSOSE helper module
 include("setup_bsose.jl")
@@ -25,13 +26,13 @@ end
 
 # flags
 
-const OBCS = false # open boundary conditions; if false, we will use whole-region DatasetRestoring nudging
+const OBCS = true # open boundary conditions (NormalFlow with PerturbationAdvection)
+const SPONGE_LAYERS = true # sponge layer restoring (DatasetRestoring) near open boundary edges
 const WINDS = false # time-varying surface wind forcing from BSOSE data (oceTAUX and oceTAUY)
-const TEOS = true # use TEOS because the nonlinearity from the full equation of state allows for AAIW formation ; if false uses linear equation of state
 const CHECKPOINTS = false # save state and restart if the model crashes. If false, the model will start from scratch. 
 
 # domain related parameters
-const SCALING = 6 # horizontal resolution = 1 / SCALING degrees. 1/6 = ~15km, 1/2 = 50km
+const SCALING = 3 # horizontal resolution = 1 / SCALING degrees. 1/6 = ~15km, 1/2 = 50km
 const DZ_SURFACE = 2 # m 
 const DZ_BOTTOM = 200 # m
 const CIRCUMPOLAR = false # if true, we will use a circumpolar domain
@@ -49,12 +50,20 @@ else
     φ₁, φ₂ = (-70, -40)
 end
 
-# z stretching so that the upper 500 meters of the ocean has dz = 2 meters, and the deeper ocean will gradually stretch to 200 m vertical resolution.  
-z = ReferenceToStretchedDiscretization(; extent=5000,
-    constant_spacing=DZ_SURFACE,
-    maximum_spacing=DZ_BOTTOM,
-    constant_spacing_extent=500,
-    stretching=PowerLawStretching(1.15))
+# z stretching so that the upper 500 meters of the ocean has dz = 2 meters, and the deeper ocean will gradually stretch to 200 m vertical resolution. 
+if arch isa CPU
+    z = ReferenceToStretchedDiscretization(; extent=5000,
+        constant_spacing=10,
+        maximum_spacing=1000,
+        constant_spacing_extent=500,
+        stretching=PowerLawStretching(1.15))
+else
+    z = ReferenceToStretchedDiscretization(; extent=5000,
+        constant_spacing=DZ_SURFACE,
+        maximum_spacing=DZ_BOTTOM,
+        constant_spacing_extent=500,
+        stretching=PowerLawStretching(1.15))
+end
 
 # grid
 # if running on CPU, do a 1 degree horizontal resolution run:
@@ -115,14 +124,21 @@ dates = (start_date, end_date)
 if OBCS && DATASET == "BSOSE"
     @info "Configuring BSOSE Open Boundary Conditions..."
     boundary_conditions = bsose_open_boundary_conditions(grid; dataset=dataset, dates=dates, winds=WINDS)
-    forcings = NamedTuple()
+
+    if SPONGE_LAYERS
+        @info "Configuring boundary edge sponge layers (3.0° width, 5-day restoring timescale)..."
+        forcings = bsose_sponge_layer_forcing(grid; dataset=dataset, dates=dates, sponge_width=3.0, timescale=5days, restore_velocities=true)
+    else
+        forcings = NamedTuple()
+    end
 elseif !OBCS
     @info "Configuring whole-region DatasetRestoring (30-day restoring for T and S from $DATASET)..."
     wind_bcs = (WINDS && DATASET == "BSOSE") ? bsose_surface_wind_stress(grid; dataset=dataset, dates=dates) : nothing
     boundary_conditions = wind_bcs !== nothing ? (u=FieldBoundaryConditions(top=wind_bcs.u), v=FieldBoundaryConditions(top=wind_bcs.v)) : NamedTuple()
 
-    temperature_metadata = Metadata(:temperature; dataset, start_date, end_date)
-    salinity_metadata = Metadata(:salinity; dataset, start_date, end_date)
+    restoring_region = DATASET == "BSOSE" ? bsose_region(grid) : nothing
+    temperature_metadata = Metadata(:temperature; dataset, start_date, end_date, region=restoring_region)
+    salinity_metadata = Metadata(:salinity; dataset, start_date, end_date, region=restoring_region)
 
     FT = DatasetRestoring(temperature_metadata, grid; rate=1 / 30days)
     FS = DatasetRestoring(salinity_metadata, grid; rate=1 / 30days)
@@ -132,9 +148,6 @@ else
     boundary_conditions = NamedTuple()
     forcings = NamedTuple()
 end
-
-# equation of state: choosing between TEOS or linear equation of state
-equation_of_state = TEOS ? TEOS10EquationOfState() : LinearEquationOfState()
 
 vertical_closure = NumericalEarth.Oceans.default_ocean_closure()
 # Note: IsopycnalSkewSymmetricDiffusivity does not support ImmersedBoundaryGrid and causes
@@ -148,14 +161,41 @@ closures = vertical_closure
 ocean = ocean_simulation(grid;
     boundary_conditions=boundary_conditions,
     forcing=forcings,
-    closure=closures,
-    equation_of_state=equation_of_state
+    closure=closures
 )
+
+# ── Sanitize OBC boundary time series ────────────────────────────────────────
+# NumericalEarth's regridding onto the model grid can produce physically
+# impossible values (e.g. S ≈ -65 PSU, T ≈ -999°C) at cells where the BSOSE
+# bathymetry is shallower than the model grid. These are stored in the boundary
+# FieldTimeSeries objects and injected into ghost cells by fill_halo_regions!
+# at the START of every time step — long after any pre-run tracer clamp.
+# Cleaning the FieldTimeSeries here prevents bad ghost-cell values from creating
+# artificial buoyancy gradients that blow up velocities.
+if OBCS && DATASET == "BSOSE"
+    # Boundary conditions live on the tracer/velocity fields themselves,
+    # not on a top-level model.boundary_conditions field.
+    for (field, lo, hi) in ((ocean.model.tracers.S, 0.5, 42.0),
+        (ocean.model.tracers.T, -2.5, 40.0))
+        for side in (:west, :east, :south, :north)
+            bc = getproperty(field.boundary_conditions, side)
+            if !isnothing(bc) && hasproperty(bc, :condition)
+                fts = bc.condition
+                if fts isa FieldTimeSeries
+                    for t in 1:length(fts.times)
+                        clamp!(parent(fts[t]), lo, hi)
+                    end
+                end
+            end
+        end
+    end
+    @info "OBC boundary time series sanitized (S ∈ [0.5, 42], T ∈ [-2.5, 40])."
+end
 
 # initial conditions based on either BSOSE or the other datasets
 
 if DATASET == "BSOSE"
-    bsose_initial_conditions!(ocean.model; dataset=dataset, date=start_date)
+    bsose_initial_conditions!(ocean.model; dataset=dataset, date=start_date, velocities=true)
 else
     set!(ocean.model,
         MetadataSet(:temperature; dataset=dataset, date=start_date),
@@ -163,42 +203,82 @@ else
     )
 end
 
+# Post-initialization sanity enforcement for TEOS10 compatibility.
+# NumericalEarth's regridding interpolation can produce negative or near-zero salinity
+# at cells where the BSOSE grid bathymetry is shallower than the model grid (overshoot
+# at steep slopes). We must clamp BEFORE update_state! is called by initialize!.
+#
+# Strategy:
+#   1. Clamp parent arrays (interior + halo + immersed) to valid physical ranges.
+#   2. Call update_state! manually to flush fill_halo_regions! with clean values,
+#      so the OBC injection uses clamped interior data as reference.
+#   3. Clamp again after the halo fill in case OBC injection wrote bad halo values.
+function clamp_tracers!(model)
+    clamp!(parent(model.tracers.S), 0.5, 42.0)
+    clamp!(parent(model.tracers.T), -2.5, 40.0)
+end
+
+clamp_tracers!(ocean.model)
+fill_halo_regions!(ocean.model.tracers.T)
+fill_halo_regions!(ocean.model.tracers.S)
+clamp_tracers!(ocean.model)
+
+# ── TEOS10 sqrt guard ─────────────────────────────────────────────────────────
+# The TEOS10 coordinate s(Sᴬ) = √((Sᴬ + ΔS) / Sₐᵤ) crashes for Sᴬ < -32.
+# Guard with max(..., 0) so that any residual bad values from immersed/halo cells
+# don't crash the run — they will return zero (freshwater) density rather than NaN.
+import SeawaterPolynomials.TEOS10 as TEOS10_mod
+@eval SeawaterPolynomials.TEOS10 begin
+    @inline s(Sᴬ::FT) where FT = √(max((Sᴬ + FT(ΔS)) / FT(Sₐᵤ), zero(FT)))
+end
+
 # some housekeeping to set up the simulation (progress checks and adaptive timestep)
 
 stop_time = haskey(ENV, "STOP_TIME") ? parse(Float64, ENV["STOP_TIME"]) : 365days
 stop_iteration = haskey(ENV, "STOP_ITERATION") ? parse(Int, ENV["STOP_ITERATION"]) : Inf
-simulation = Simulation(ocean.model, Δt=2minutes, stop_time=stop_time, stop_iteration=stop_iteration)
+# Start with a very small Δt so the first CATKE evaluation is numerically gentle;
+# the wizard will ramp this up within a few iterations.
+simulation = Simulation(ocean.model, Δt=1seconds, stop_time=stop_time, stop_iteration=stop_iteration)
 
-# adaptive timestep wizard based on CFL
-wizard = TimeStepWizard(cfl=0.7, max_Δt=1hours)
+# adaptive timestep wizard based on CFL (following mediterranean.jl: cfl=0.2, max_change=1.1)
+wizard = TimeStepWizard(cfl=0.7, max_Δt=1hours, max_change=1.1, min_Δt=0.1)
 simulation.callbacks[:wizard] = Callback(wizard, IterationInterval(10))
 
-# progress logger
-function progress(sim)
-    u, v, w = sim.model.velocities
-    T, S = sim.model.tracers
-    η = sim.model.free_surface.displacement
-    @info @sprintf("Time: %s, Iter: %d, Δt: %s, max(|u|,|v|,|w|): (%.2e, %.2e, %.2e), max(|η|): %.2e, T range: (%.2f, %.2f), S range: (%.2f, %.2f)",
-        prettytime(sim.model.clock.time),
-        sim.model.clock.iteration,
-        prettytime(sim.Δt),
-        maximum(abs, u), maximum(abs, v), maximum(abs, w),
-        maximum(abs, η),
-        minimum(T), maximum(T),
-        minimum(S), maximum(S))
+# Safety callback: clamp salinity/temperature to physically valid ranges before each time step.
+# Operates on parent() to cover all cells including halos and immersed cells.
+# Prevents DomainError in TEOS10's sqrt(S) from any numerical noise that accumulates
+# in boundary-adjacent or immersed cells during time stepping.
+function clamp_salinity!(sim)
+    clamp!(parent(sim.model.tracers.S), 0.5, 42.0)
+    clamp!(parent(sim.model.tracers.T), -2.5, 40.0)
+end
+simulation.callbacks[:clamp_S] = Callback(clamp_salinity!, IterationInterval(1))
+
+# progress logger: Oceanostics TimedMessenger reports wall-clock timing,
+# max velocities and CFL/diffusive stability numbers each interval.
+callback_interval = haskey(ENV, "CALLBACK_INTERVAL") ? parse(Float64, ENV["CALLBACK_INTERVAL"]) : 1hours
+progress = TimedMessenger()
+simulation.callbacks[:progress] = Callback(progress, TimeInterval(callback_interval))
+
+# With Dirichlet open boundaries there is no wave radiation, so any net
+# volume-flux imbalance across the four faces accumulates in the free surface.
+# TimedMessenger does not report it, so track it separately.
+function log_free_surface(sim)
+    eta = sim.model.free_surface.displacement
+    @info @sprintf("        max|eta| = %.4f m, mean(eta) = %+.4f m",
+        maximum(abs, eta), mean(interior(eta)))
     flush(stdout)
 end
-simulation.callbacks[:progress] = Callback(progress, TimeInterval(1hours))
+simulation.callbacks[:free_surface] = Callback(log_free_surface, TimeInterval(callback_interval))
 
 # output writers
 
 u, v, w = ocean.model.velocities
 T, S = ocean.model.tracers
-
 simulation.output_writers[:surface] = NetCDFWriter(
     ocean.model,
     (; u, v, T, S),
-    filename="bsose_surface_fields.nc",
+    filename="model_surface_fields.nc",
     schedule=TimeInterval(1days),
     indices=(:, :, grid.Nz),
     overwrite_existing=true
@@ -208,7 +288,7 @@ mid_lon_idx = div(grid.Nx, 2)
 simulation.output_writers[:mid_lon] = NetCDFWriter(
     ocean.model,
     (; u, v, T, S),
-    filename="bsose_mid_lon.nc",
+    filename="model_mid_lon.nc",
     schedule=TimeInterval(1days),
     indices=(mid_lon_idx, :, :),
     overwrite_existing=true
@@ -227,7 +307,7 @@ end
 
 @info "--- Model Setup Complete ---"
 @info "Grid Resolution: Nx=$(grid.Nx), Ny=$(grid.Ny), Nz=$(grid.Nz)"
-@info "OBCS: $OBCS | WINDS: $WINDS | TEOS: $TEOS | DATASET: $DATASET"
+@info "OBCS: $OBCS | WINDS: $WINDS | DATASET: $DATASET"
 
 # red button 
 

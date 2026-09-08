@@ -18,7 +18,7 @@ using Oceananigans.Units
 using Oceananigans.Grids
 using Oceananigans.Grids: topology
 using Oceananigans.BoundaryConditions
-using Oceananigans.BoundaryConditions: PerturbationAdvection, GravityWaveRadiationBoundaryCondition
+using Oceananigans.BoundaryConditions: PerturbationAdvection
 using Oceananigans.OutputReaders: FieldTimeSeries, Cyclical
 using Oceananigans.Architectures: architecture, CPU, GPU, on_architecture
 using Oceananigans.Fields: interior, location, fill_halo_regions!
@@ -155,6 +155,17 @@ const BSOSE_LOCATIONS = Dict(
     :v => (Center, Face, Center)
 )
 
+bsose_iteration_tokens(iteration::Int) = ("i$(iteration)", "$(iteration)")
+
+"""
+    bsose_names_iteration(filename, iteration)
+
+Whether `filename` identifies itself as belonging to `iteration`. Used to avoid
+trusting a file that was only matched by its variable name.
+"""
+bsose_names_iteration(filename, iteration::Int) =
+    any(t -> occursin(t, lowercase(filename)), bsose_iteration_tokens(iteration))
+
 function resolve_bsose_filename(dir::String, var_name::Symbol, iteration::Int)
     shortname = get(BSOSE_VARIABLE_NAMES, var_name, string(var_name))
 
@@ -185,16 +196,23 @@ function resolve_bsose_filename(dir::String, var_name::Symbol, iteration::Int)
         end
     end
 
-    # Fallback directory search matching target token
+    # Fallback directory search matching the variable token, preferring files that
+    # also name this iteration. Without the iteration preference, a directory
+    # holding both iterations would silently serve iteration 105 data to an
+    # iteration 156 run.
     if isdir(dir)
-        files = readdir(dir)
         t_low = lowercase(shortname)
-        for f in files
-            endswith(f, ".nc") || continue
-            if occursin(t_low, lowercase(f))
-                return f
+        matches = filter(readdir(dir)) do f
+            endswith(f, ".nc") && occursin(t_low, lowercase(f))
+        end
+
+        for token in bsose_iteration_tokens(iteration)
+            for f in matches
+                occursin(token, lowercase(f)) && return f
             end
         end
+
+        isempty(matches) || return first(matches)
     end
 
     return iteration == 156 ? "$(titlecase(shortname))_bsoseI156_2013to2024_monthly.nc" : "bsose_i105_2008to2012_monthly_$(titlecase(shortname)).nc"
@@ -202,6 +220,14 @@ end
 
 # ==============================================================================
 # 2. NumericalEarth.DataWrangling Interface Extensions
+#
+# BSOSE is an MITgcm product on a lat-lon grid that is uniform in longitude and
+# variably spaced (Mercator-like) in latitude. We mirror the ECCO pipeline in
+# NumericalEarth: build a Field on the NATIVE BSOSE grid, mark land with NaN
+# using the model's own hFac masks, let NumericalEarth inpaint on that native
+# grid, and only then interpolate onto the Oceananigans target grid. Inpainting
+# before interpolation is what keeps the bilinear stencil from ever mixing a
+# land value into an ocean cell.
 # ==============================================================================
 
 const BSOSEMetadata{D} = Metadata{<:BSOSEDataset,D}
@@ -224,12 +250,9 @@ function DataWrangling.is_three_dimensional(metadata::BSOSEMetadata)
     return loc[3] !== Nothing
 end
 
-# BSOSE stores vertical dimension surface-to-bottom (Z[1] = -2.1m, Z[Nz] = -5800m).
-# Oceananigans uses bottom-to-surface indexing (k=1 at bottom, k=Nz at surface).
+# BSOSE stores the vertical dimension surface-to-bottom (Z[1] = -2.1 m).
+# Oceananigans indexes bottom-to-surface, so `retrieve_data` reverses dim 3.
 DataWrangling.reversed_vertical_axis(::BSOSEDataset) = true
-
-DataWrangling.longitude_interfaces(::BSOSEMetadata) = (0.0, 360.0)
-DataWrangling.latitude_interfaces(::BSOSEMetadata) = (-78.0, -29.7)
 
 function DataWrangling.longitude_name(metadata::BSOSEMetadata)
     loc = dataset_location(metadata.dataset, metadata.name)
@@ -245,22 +268,383 @@ function DataWrangling.metadata_filename(dataset::BSOSEMonthly, name, date, regi
     return resolve_bsose_filename(dataset.dir, name, dataset.iteration)
 end
 
-# BSOSE has valid, complete ocean coverage within Southern Ocean domains.
-# Disabling inpainting prevents NumericalEarth from generating dozens of separate per-slice JLD2 files.
-DataWrangling.default_inpainting(::BSOSEMetadata) = nothing
-DataWrangling.default_inpainting(::BSOSEMetadatum) = nothing
+# ------------------------------------------------------------------------------
+# 2a. Native grid geometry
+#
+# Each iteration ships an MITgcm grid file holding 2D coordinate arrays and the
+# hFac masks, and is used when present. Iteration 105 additionally carries 1D
+# coordinates and its matching hFac inside every data file, which serves as a
+# fallback. `BSOSEGeometry` normalizes either source into 1D node vectors plus
+# the interface vectors Oceananigans needs.
+# ------------------------------------------------------------------------------
+
+struct BSOSEGeometry
+    λc::Vector{Float64}   # Nx    longitude cell centers   (XC)
+    λf::Vector{Float64}   # Nx    longitude western faces  (XG)
+    φc::Vector{Float64}   # Ny    latitude cell centers    (YC)
+    φf::Vector{Float64}   # Ny    latitude southern faces  (YG)
+    λi::Vector{Float64}   # Nx+1  longitude interfaces
+    φi::Vector{Float64}   # Ny+1  latitude interfaces
+    zi::Vector{Float64}   # Nz+1  z interfaces, bottom-first
+    Nx::Int
+    Ny::Int
+    Nz::Int
+end
+
+const BSOSE_GEOMETRY_CACHE = Dict{Tuple{String,Int},BSOSEGeometry}()
+const BSOSE_HFAC_CACHE = Dict{Tuple{String,Int,String},BitArray{3}}()
+
+"""
+    bsose_grid_file(dataset)
+
+Path to the MITgcm grid file matching `dataset`, or `nothing` when none is present.
+
+Each BSOSE iteration ships its own grid file at its own resolution (iteration 156
+is 1/6°, iteration 105 is 1/3°), and they routinely sit in the same directory.
+Candidates are therefore checked against the dimensions the data files advertise,
+so a grid file is never paired with data at a different resolution.
+"""
+function bsose_grid_file(dataset::BSOSEDataset)
+    candidates = dataset.iteration == 156 ?
+                 ["grid.nc", "grid156.nc", "grid_i156.nc"] :
+                 ["grid$(dataset.iteration).nc", "grid_i$(dataset.iteration).nc", "grid.nc"]
+
+    expected = bsose_data_file_size(dataset)
+
+    for name in candidates
+        path = joinpath(dataset.dir, name)
+        isfile(path) || continue
+        actual = bsose_grid_file_size(path)
+        isnothing(actual) && continue
+        (isnothing(expected) || actual == expected) && return path
+    end
+
+    return nothing
+end
+
+# Horizontal dimensions advertised by a BSOSE data file, or `nothing` when it
+# carries no coordinate variables. Handles both the 1D and 2D coordinate layouts.
+function bsose_data_file_size(dataset::BSOSEDataset)
+    filename = resolve_bsose_filename(dataset.dir, :temperature, dataset.iteration)
+
+    # A file matched only on its variable name may belong to another iteration, in
+    # which case its dimensions say nothing about this one.
+    bsose_names_iteration(filename, dataset.iteration) || return nothing
+
+    path = joinpath(dataset.dir, filename)
+    isfile(path) || return nothing
+    ds = Dataset(path)
+    try
+        (haskey(ds, "XC") && haskey(ds, "YC")) || return nothing
+        xc, yc = ds["XC"], ds["YC"]
+        return (size(xc, 1), ndims(yc) == 1 ? length(yc) : size(yc, 2))
+    catch
+        return nothing
+    finally
+        close(ds)
+    end
+end
+
+function bsose_grid_file_size(path::AbstractString)
+    ds = Dataset(path)
+    try
+        haskey(ds, "XC") || return nothing
+        return (size(ds["XC"], 1), size(ds["YC"], 2))
+    catch
+        return nothing
+    finally
+        close(ds)
+    end
+end
+
+"""
+    strictly_increasing(v)
+
+Whether every step of `v` is positive. Used to reject the zero-padded rows and
+columns that BSOSE's iteration 156 `grid.nc` carries in its `XG`/`YG` arrays.
+"""
+strictly_increasing(v) = all(>(0), diff(v))
+
+"""
+    separable_slice(A, dim, label)
+
+Reduce the 2D coordinate array `A` from `grid.nc` to the 1D vector that varies
+along `dim`, taking the first slice that is strictly increasing.
+
+`XC`/`YC` are perfectly separable, but `XG`/`YG` in the iteration 156 `grid.nc`
+are zero-padded across most of their rows/columns, so a naive `A[:, 1]` silently
+yields a broken axis. Scanning for a monotonic slice and erroring when none
+exists turns that into a loud failure at setup instead of a blowup at runtime.
+"""
+function separable_slice(A::AbstractMatrix, dim::Int, label::AbstractString)
+    n = dim == 1 ? size(A, 2) : size(A, 1)
+    for s in 1:n
+        v = Float64.(dim == 1 ? A[:, s] : A[s, :])
+        strictly_increasing(v) && return v
+    end
+    error("No strictly increasing slice found for $label in the BSOSE grid file; it may be corrupt.")
+end
+
+function bsose_geometry(dataset::BSOSEDataset)
+    key = (dataset.dir, dataset.iteration)
+    haskey(BSOSE_GEOMETRY_CACHE, key) && return BSOSE_GEOMETRY_CACHE[key]
+
+    grid_file = bsose_grid_file(dataset)
+
+    if !isnothing(grid_file)
+        geom = bsose_geometry_from_grid_file(grid_file)
+    elseif dataset.iteration == 156
+        error("""
+              BSOSE iteration 156 requires an MITgcm grid file in $(dataset.dir).
+              It supplies the native coordinates and the hFacC/hFacW/hFacS land masks,
+              neither of which is present in the iteration 156 data files.
+              Expected one of: grid.nc, grid156.nc, grid_i156.nc.
+              """)
+    else
+        geom = bsose_geometry_from_data_files(dataset)
+    end
+
+    BSOSE_GEOMETRY_CACHE[key] = geom
+    return geom
+end
+
+function bsose_geometry_from_grid_file(grid_file::AbstractString)
+    ds = Dataset(grid_file)
+    try
+        λc = load_coord(ds, "XC", 1)
+        φc = load_coord(ds, "YC", 2)
+        φf = load_coord(ds, "YG", 2)
+
+        Nx = length(λc)
+        Ny = length(φc)
+
+        # `XG` is zero-padded in grid.nc, so rebuild the longitude faces from the
+        # uniform lattice BSOSE actually uses and check them against XC.
+        λf = bsose_reconstructed_longitude_faces(λc)
+
+        zi = bsose_z_interfaces_from(ds)
+
+        return bsose_build_geometry(λc, λf, φc, φf, zi, Nx, Ny)
+    finally
+        close(ds)
+    end
+end
+
+# Coordinate arrays appear as 1D vectors in BSOSE data files and as 2D arrays in
+# the grid files; read either as the 1D axis varying along `dim`.
+function load_coord(ds, name::AbstractString, dim::Int)
+    v = ds[name]
+    ndims(v) == 1 && return Float64.(v[:])
+    return separable_slice(v[:, :], dim, name)
+end
+
+function bsose_geometry_from_data_files(dataset::BSOSEDataset)
+    dir = dataset.dir
+    center_path = joinpath(dir, resolve_bsose_filename(dir, :temperature, dataset.iteration))
+    isfile(center_path) || error("Cannot resolve BSOSE geometry: $center_path not found.")
+
+    ds = Dataset(center_path)
+    local λc, φc, zi
+    try
+        λc = load_coord(ds, "XC", 1)
+        φc = load_coord(ds, "YC", 2)
+        zi = bsose_z_interfaces_from(ds)
+    finally
+        close(ds)
+    end
+
+    Nx = length(λc)
+    Ny = length(φc)
+
+    λf = bsose_reconstructed_longitude_faces(λc)
+    φf = bsose_latitude_faces_from_data_files(dir, dataset.iteration, φc)
+
+    return bsose_build_geometry(λc, λf, φc, φf, zi, Nx, Ny)
+end
+
+# Read `YG` from the v-velocity file, which is the only iteration 105 file that
+# carries it. Fall back to midpoints between centers when that file is absent.
+function bsose_latitude_faces_from_data_files(dir, iteration, φc)
+    v_path = joinpath(dir, resolve_bsose_filename(dir, :v_velocity, iteration))
+    if isfile(v_path)
+        ds = Dataset(v_path)
+        try
+            if haskey(ds, "YG")
+                φf = load_coord(ds, "YG", 2)
+                if length(φf) == length(φc) && strictly_increasing(φf)
+                    return φf
+                end
+            end
+        finally
+            close(ds)
+        end
+    end
+
+    @warn "Falling back to center-derived BSOSE latitude faces; YG was unavailable."
+    interfaces = centers_to_interfaces(φc)
+    return Float64.(interfaces[1:end-1])
+end
+
+# BSOSE is uniform in longitude, so the western faces are an exact lattice.
+function bsose_reconstructed_longitude_faces(λc)
+    Nx = length(λc)
+    Δλ = 360 / Nx
+    λf = collect(range(0.0, step=Δλ, length=Nx))
+
+    # The reconstruction must place every center at its cell midpoint. BSOSE stores
+    # coordinates at Float32 precision and accumulates rounding along the axis, so
+    # compare in fractions of a cell rather than in absolute degrees.
+    deviation = maximum(abs, λc .- (λf .+ Δλ / 2)) / Δλ
+    deviation < 0.05 || error("BSOSE longitude centers are not on a uniform $(Δλ)° lattice " *
+                              "(max deviation $(round(100 * deviation, digits=2))% of a cell); " *
+                              "cannot reconstruct faces.")
+    return λf
+end
+
+function bsose_z_interfaces_from(ds)
+    if haskey(ds, "RF")
+        rf = Float64.(ds["RF"][:])          # 0 at the surface, descending
+        return reverse(rf)                   # bottom-first for Oceananigans
+    elseif haskey(ds, "drF")
+        drf = Float64.(ds["drF"][:])
+        return reverse([0.0; -cumsum(drf)])
+    elseif haskey(ds, "DRF")
+        drf = Float64.(ds["DRF"][:])
+        return reverse([0.0; -cumsum(drf)])
+    else
+        error("BSOSE file provides neither RF nor drF; cannot build z interfaces.")
+    end
+end
+
+function bsose_build_geometry(λc, λf, φc, φf, zi, Nx, Ny)
+    length(φf) == Ny || error("BSOSE latitude faces have length $(length(φf)), expected $Ny.")
+    strictly_increasing(φf) || error("BSOSE latitude faces are not strictly increasing.")
+    strictly_increasing(zi) || error("BSOSE z interfaces are not strictly increasing.")
+
+    Δλ = 360 / Nx
+    λi = [λf; λf[end] + Δλ]
+
+    # `φf[j]` is the southern face of cell j, so the northern face of the last
+    # cell has to be extrapolated from its center.
+    φi = [φf; φf[end] + 2 * (φc[end] - φf[end])]
+    strictly_increasing(φi) || error("BSOSE latitude interfaces are not strictly increasing.")
+
+    return BSOSEGeometry(λc, λf, φc, φf, λi, φi, zi, Nx, Ny, length(zi) - 1)
+end
+
+DataWrangling.longitude_interfaces(metadata::BSOSEMetadata) = bsose_geometry(metadata.dataset).λi
+DataWrangling.latitude_interfaces(metadata::BSOSEMetadata) = bsose_geometry(metadata.dataset).φi
+DataWrangling.z_interfaces(metadata::BSOSEMetadata) = bsose_geometry(metadata.dataset).zi
+
+function Base.size(metadata::Metadata{<:BSOSEDataset})
+    geom = bsose_geometry(metadata.dataset)
+    Nz = is_three_dimensional(metadata) ? geom.Nz : 1
+    Nt = metadata.dates isa AbstractArray ? length(metadata.dates) : 1
+    return (geom.Nx, geom.Ny, Nz, Nt)
+end
+
+# Node coordinates at the variable's own C-grid location, matching how
+# `set_region_data!` aligns the raw file array against the native field.
+function DataWrangling.read_file_coords(metadatum::BSOSEMetadatum)
+    geom = bsose_geometry(metadatum.dataset)
+    loc = dataset_location(metadatum.dataset, metadatum.name)
+    λ = loc[1] === Face ? geom.λf : geom.λc
+    φ = loc[2] === Face ? geom.φf : geom.φc
+    return copy(λ), copy(φ)
+end
+
+# ------------------------------------------------------------------------------
+# 2b. Land masks from hFac
+#
+# MITgcm's hFac is the wet fraction of a cell: 0 is land, and anything above 0 is
+# ocean (BSOSE uses partial cells extensively, so testing `> 0` rather than `== 1`
+# matters). Masking on hFac instead of on the value itself is what lets a genuine
+# zero velocity survive as data rather than being mistaken for land.
+# ------------------------------------------------------------------------------
+
+function bsose_hfac_name(metadatum::BSOSEMetadatum)
+    loc = dataset_location(metadatum.dataset, metadatum.name)
+    loc[1] === Face && return "hFacW"
+    loc[2] === Face && return "hFacS"
+    return "hFacC"
+end
+
+function bsose_hfac_candidate_paths(dataset::BSOSEDataset, hfac_name)
+    dir = dataset.dir
+    var = hfac_name == "hFacW" ? :u_velocity :
+          hfac_name == "hFacS" ? :v_velocity : :temperature
+    data_file = joinpath(dir, resolve_bsose_filename(dir, var, dataset.iteration))
+    grid_file = bsose_grid_file(dataset)
+
+    # Prefer the grid file, which holds all three hFac arrays; iteration 105 data
+    # files each carry their own as a fallback.
+    return isnothing(grid_file) ? [data_file] : [grid_file, data_file]
+end
+
+"""
+    bsose_wet_mask(dataset, hfac_name)
+
+Boolean array over the native BSOSE grid, `true` where the cell is ocean.
+Cached per dataset because the underlying hFac arrays are hundreds of megabytes.
+"""
+function bsose_wet_mask(dataset::BSOSEDataset, hfac_name::AbstractString)
+    key = (dataset.dir, dataset.iteration, hfac_name)
+    haskey(BSOSE_HFAC_CACHE, key) && return BSOSE_HFAC_CACHE[key]
+
+    for path in bsose_hfac_candidate_paths(dataset, hfac_name)
+        isfile(path) || continue
+        ds = Dataset(path)
+        try
+            haskey(ds, hfac_name) || continue
+            raw = ds[hfac_name][:, :, :]
+            mask = BitArray(undef, size(raw))
+            @inbounds for i in eachindex(raw)
+                val = raw[i]
+                mask[i] = !ismissing(val) && !isnan(val) && val > 0
+            end
+            BSOSE_HFAC_CACHE[key] = mask
+            return mask
+        finally
+            close(ds)
+        end
+    end
+
+    error("Could not find $hfac_name for $(summary(dataset)). Expected it in grid.nc " *
+          "or in the corresponding BSOSE data file under $(dataset.dir).")
+end
+
+# ------------------------------------------------------------------------------
+# 2c. Data retrieval and inpainting
+# ------------------------------------------------------------------------------
+
+# NaN is what `compute_mask` already treats as missing, so writing NaN into land
+# cells is all it takes for NumericalEarth to inpaint them.
+DataWrangling.default_mask_value(::BSOSEDataset) = NaN
+
+DataWrangling.default_inpainting(::BSOSEMetadata) = DataWrangling.NearestNeighborInpainting(Inf)
+DataWrangling.default_inpainting(::BSOSEMetadatum) = DataWrangling.NearestNeighborInpainting(Inf)
+
+# Inpainted native fields are large intermediates, so keep them out of the data
+# directory proper.
+function bsose_temp_directory(dataset::BSOSEDataset)
+    dir = joinpath(dataset.dir, "temp")
+    isdir(dir) || mkpath(dir)
+    return dir
+end
 
 function DataWrangling.inpainted_metadata_path(metadata::BSOSEMetadatum)
+    geom = bsose_geometry(metadata.dataset)
     dstr = metadata.dates isa Dates.AbstractDateTime ? Dates.format(metadata.dates, "yyyymmdd") : "all"
-    return joinpath(metadata.dir, "bsose_inpainted_$(metadata.name)_$(dstr).jld2")
+    name = "bsose_inpainted_i$(metadata.dataset.iteration)_$(metadata.name)_$(dstr)_$(geom.Nx)x$(geom.Ny).jld2"
+    return joinpath(bsose_temp_directory(metadata.dataset), name)
 end
 
 function DataWrangling.inpainted_metadata_path(metadata::BSOSEMetadata)
-    start_d = first(metadata.dates)
-    end_d = last(metadata.dates)
-    start_str = Dates.format(start_d, "yyyymmdd")
-    end_str = Dates.format(end_d, "yyyymmdd")
-    return joinpath(metadata.dir, "bsose_inpainted_$(metadata.name)_$(start_str)_to_$(end_str).jld2")
+    geom = bsose_geometry(metadata.dataset)
+    start_str = Dates.format(first(metadata.dates), "yyyymmdd")
+    end_str = Dates.format(last(metadata.dates), "yyyymmdd")
+    name = "bsose_inpainted_i$(metadata.dataset.iteration)_$(metadata.name)_$(start_str)_to_$(end_str)_$(geom.Nx)x$(geom.Ny).jld2"
+    return joinpath(bsose_temp_directory(metadata.dataset), name)
 end
 
 function DataWrangling.all_dates(dataset::BSOSEMonthly, var)
@@ -275,39 +659,11 @@ function DataWrangling.all_dates(dataset::BSOSEMonthly, var)
         catch
         end
     end
-    # Fallback based on iteration
     if dataset.iteration == 156
         return collect(DateTime(2013, 1, 1):Month(1):DateTime(2024, 12, 1))
     else
         return collect(DateTime(2008, 1, 1):Month(1):DateTime(2012, 12, 1))
     end
-end
-
-function DataWrangling.z_interfaces(metadata::BSOSEMetadata)
-    fn = resolve_bsose_filename(metadata.dataset.dir, metadata.name, metadata.dataset.iteration)
-    fp = joinpath(metadata.dataset.dir, fn)
-    if isfile(fp)
-        ds = Dataset(fp)
-        zc = Float64.(reverse(ds["Z"][:])) # bottom-first
-        close(ds)
-        return centers_to_interfaces(zc)
-    else
-        # Standard BSOSE 52-level centers reversed
-        zc_default = [-5800.0, -5400.0, -5000.0, -4600.0, -4200.0, -3800.0, -3400.0, -3000.0, -2610.0, -2270.0, -2010.0,
-            -1800.0, -1600.0, -1400.0, -1225.0, -1100.0, -1000.0, -900.0, -800.0, -700.0, -614.0, -551.5,
-            -500.0, -450.0, -402.5, -361.0, -327.0, -301.0, -280.0, -260.0, -240.0, -220.0, -200.0, -180.0,
-            -161.5, -146.5, -135.0, -125.0, -115.0, -105.0, -95.0, -85.0, -75.0, -65.0, -55.0, -45.0,
-            -35.25, -26.25, -18.55, -12.15, -6.7, -2.1]
-        return centers_to_interfaces(zc_default)
-    end
-end
-
-function Base.size(metadata::Metadata{<:BSOSEDataset})
-    Nx = 1080
-    Ny = 294
-    Nz = is_three_dimensional(metadata) ? 52 : 1
-    Nt = metadata.dates isa AbstractArray ? length(metadata.dates) : 1
-    return (Nx, Ny, Nz, Nt)
 end
 
 function Downloads.download(metadata::Metadata{<:BSOSEDataset})
@@ -335,7 +691,6 @@ function find_bsose_time_index(ds::Dataset, target_date)
     target_y = Dates.year(target_dt)
     target_m = Dates.month(target_dt)
 
-    # 1. Match year and month
     for (i, t) in enumerate(time_raw)
         dt = DateTime(t)
         if Dates.year(dt) == target_y && Dates.month(dt) == target_m
@@ -343,71 +698,8 @@ function find_bsose_time_index(ds::Dataset, target_date)
         end
     end
 
-    # 2. Match closest timestamp
     diffs = [abs((DateTime(t) - target_dt).value) for t in time_raw]
     return argmin(diffs)
-end
-
-"""
-    extrapolate_bsose_3d!(data::Array{Float32, 3}, var_name::AbstractString)
-
-In BSOSE NetCDF data, cells below bathymetry and dry land columns are masked with 0.0 (or NaN).
-When regridded onto an Oceananigans grid with deeper or higher-resolution bathymetry, these
-zero values cause massive unphysical density shocks (e.g., freshwater S = 0 PSU beneath 34.5 PSU seawater),
-triggering catastrophic convective velocities and DomainErrors in TEOS-10.
-
-This function vertically extrapolates each ocean column downwards by extending the bottom-most
-valid ocean value down to the deepest level (k = Nz in BSOSE coordinates).
-For completely dry columns (such as continental Antarctica), it fills with physically realistic
-Southern Ocean background values (S = 34.6 PSU, T = 0.0°C, u = 0.0, v = 0.0).
-"""
-function extrapolate_bsose_3d!(data::Array{Float32,3}, var_name::AbstractString)
-    Nx, Ny, Nz = size(data)
-    is_salt = uppercase(var_name) in ("SALT", "SALINITY", "S")
-    is_theta = uppercase(var_name) in ("THETA", "TEMPERATURE", "T")
-    default_bg = is_salt ? 34.6f0 : (is_theta ? 0.0f0 : 0.0f0)
-
-    @inbounds for j in 1:Ny, i in 1:Nx
-        first_valid = 0
-        last_valid = 0
-
-        if is_salt
-            for k in 1:Nz
-                val = data[i, j, k]
-                if val > 10.0f0 && !isnan(val)
-                    first_valid == 0 && (first_valid = k)
-                    last_valid = k
-                end
-            end
-        else # theta, u, v
-            for k in 1:Nz
-                val = data[i, j, k]
-                if val != 0.0f0 && !isnan(val)
-                    first_valid == 0 && (first_valid = k)
-                    last_valid = k
-                end
-            end
-        end
-
-        if last_valid == 0
-            # Entire column is dry/land: fill with default background
-            for k in 1:Nz
-                data[i, j, k] = default_bg
-            end
-        else
-            # Fill upward if surface cells were unpopulated
-            top_val = data[i, j, first_valid]
-            for k in 1:(first_valid-1)
-                data[i, j, k] = top_val
-            end
-            # Fill downward below bathymetry with bottom-most ocean value
-            bot_val = data[i, j, last_valid]
-            for k in (last_valid+1):Nz
-                data[i, j, k] = bot_val
-            end
-        end
-    end
-    return data
 end
 
 function DataWrangling.retrieve_data(metadatum::BSOSEMetadatum)
@@ -415,35 +707,55 @@ function DataWrangling.retrieve_data(metadatum::BSOSEMetadatum)
     name = dataset_variable_name(metadatum)
 
     ds = Dataset(path)
+    local raw, time_idx
+    try
+        var_key = haskey(ds, name) ? name :
+                  haskey(ds, uppercase(name)) ? uppercase(name) :
+                  haskey(ds, titlecase(name)) ? titlecase(name) : name
+        haskey(ds, var_key) || error("Variable $name not found in $path.")
 
-    # In BSOSE files, if variable name casing differs (e.g. SALT vs Salt)
-    var_key = haskey(ds, name) ? name : (haskey(ds, uppercase(name)) ? uppercase(name) : (haskey(ds, titlecase(name)) ? titlecase(name) : name))
-
-    time_idx = find_bsose_time_index(ds, metadatum.dates)
-
-    if is_three_dimensional(metadatum)
-        raw = ds[var_key][:, :, :, time_idx]
-        data = Array{Float32}(undef, size(raw))
-        @inbounds for i in eachindex(raw)
-            val = raw[i]
-            data[i] = (ismissing(val) || isnan(val)) ? 0.0f0 : Float32(val)
-        end
-        # Vertically extrapolate ocean columns downwards to eliminate 0.0 below bathymetry
-        extrapolate_bsose_3d!(data, name)
-        if reversed_vertical_axis(metadatum.dataset)
-            data = reverse(data, dims=3)
-        end
-    else
-        raw = ds[var_key][:, :, time_idx]
-        data = Array{Float32}(undef, size(raw))
-        @inbounds for i in eachindex(raw)
-            val = raw[i]
-            data[i] = (ismissing(val) || isnan(val)) ? NaN32 : Float32(val)
-        end
+        time_idx = find_bsose_time_index(ds, metadatum.dates)
+        raw = is_three_dimensional(metadatum) ? ds[var_key][:, :, :, time_idx] :
+              ds[var_key][:, :, time_idx]
+    finally
+        close(ds)
     end
 
-    close(ds)
-    return data
+    wet = bsose_wet_mask(metadatum.dataset, bsose_hfac_name(metadatum))
+
+    if is_three_dimensional(metadatum)
+        size(raw) == size(wet) || error("BSOSE $name has size $(size(raw)) but its hFac mask " *
+                                        "has size $(size(wet)); grid.nc does not match the data files.")
+        data = Array{Float32}(undef, size(raw))
+        @inbounds for i in eachindex(raw)
+            val = raw[i]
+            data[i] = (!wet[i] || ismissing(val) || isnan(val)) ? NaN32 : Float32(val)
+        end
+        return reverse(data, dims=3)
+    else
+        # Surface forcing lives on the top model level, so mask it with k = 1 of hFac.
+        surface = view(wet, :, :, 1)
+        size(raw) == size(surface) || error("BSOSE $name has size $(size(raw)) but its surface hFac " *
+                                            "mask has size $(size(surface)).")
+        data = Array{Float32}(undef, size(raw))
+        @inbounds for i in eachindex(raw)
+            val = raw[i]
+            data[i] = (!surface[i] || ismissing(val) || isnan(val)) ? NaN32 : Float32(val)
+        end
+        return data
+    end
+end
+
+"""
+    bsose_region(grid; padding = 1.0)
+
+`BoundingBox` covering `grid` widened by `padding` degrees, for restricting BSOSE
+reads to the model domain. Without it every read materializes and inpaints the
+full circumpolar native grid, which at iteration 156 is 2160×588×52.
+"""
+function bsose_region(grid; padding=1.0)
+    underlying = grid isa ImmersedBoundaryGrid ? grid.underlying_grid : grid
+    return DataWrangling.BoundingBox(underlying; padding)
 end
 
 # ==============================================================================
@@ -534,8 +846,9 @@ function bsose_surface_wind_stress(grid;
     dates=all_dates(dataset, :temperature)[1:12],
     ρ₀=1026.0)
     @info "Loading BSOSE surface wind stress (oceTAUX, oceTAUY)..."
-    taux_fts = FieldTimeSeries(Metadata(:zonal_wind_stress; dataset, dates), grid)
-    tauy_fts = FieldTimeSeries(Metadata(:meridional_wind_stress; dataset, dates), grid)
+    region = bsose_region(grid)
+    taux_fts = FieldTimeSeries(Metadata(:zonal_wind_stress; dataset, dates, region), grid)
+    tauy_fts = FieldTimeSeries(Metadata(:meridional_wind_stress; dataset, dates, region), grid)
 
     # Convert stress (N/m²) to kinematic momentum flux (m²/s²): divide by ρ₀
     for t in 1:length(dates)
@@ -569,8 +882,10 @@ open boundary conditions from BSOSE.
 - `grid`: The simulation `LatitudeLongitudeGrid`.
 - `dataset`: `BSOSEMonthly()` instance.
 - `dates`: Range or collection of dates for open boundary forcing.
-- `scheme`: Radiation/matching scheme for open boundary normal flows.
-            Defaults to `Oceananigans.BoundaryConditions.PerturbationAdvection()`.
+- `scheme`: Matching scheme for the open boundaries. Defaults to `nothing`, which
+            imposes the prescribed BSOSE values directly. `PerturbationAdvection()`
+            is NOT usable here: it drives the boundary faces to several times the
+            prescribed velocity and the run goes to NaN within four time steps.
 - `winds`: Surface wind forcing. Options:
            - `nothing` or `false` (default): Disables surface wind forcing (no-flux top boundary).
            - `true`: Automatically calls `bsose_surface_wind_stress` and applies top flux.
@@ -582,7 +897,7 @@ open boundary conditions from BSOSE.
 function bsose_open_boundary_conditions(grid;
     dataset=BSOSEMonthly(),
     dates=all_dates(dataset, :temperature)[1:12],
-    scheme=PerturbationAdvection(),
+    scheme=nothing,
     winds=nothing,
     ρ₀=1026.0,
     cache=true,
@@ -636,14 +951,15 @@ function bsose_open_boundary_conditions(grid;
     else
         # 1. Load 3D FieldTimeSeries for state variables
         @info "Extracting BSOSE fields for simulation window ($start_d to $end_d)..."
+        region = bsose_region(grid)
         @info " -> Loading BSOSE u_velocity..."
-        u_fts = FieldTimeSeries(Metadata(:u_velocity; dataset, dates), grid)
+        u_fts = FieldTimeSeries(Metadata(:u_velocity; dataset, dates, region), grid)
         @info " -> Loading BSOSE v_velocity..."
-        v_fts = FieldTimeSeries(Metadata(:v_velocity; dataset, dates), grid)
+        v_fts = FieldTimeSeries(Metadata(:v_velocity; dataset, dates, region), grid)
         @info " -> Loading BSOSE temperature..."
-        T_fts = FieldTimeSeries(Metadata(:temperature; dataset, dates), grid)
+        T_fts = FieldTimeSeries(Metadata(:temperature; dataset, dates, region), grid)
         @info " -> Loading BSOSE salinity..."
-        S_fts = FieldTimeSeries(Metadata(:salinity; dataset, dates), grid)
+        S_fts = FieldTimeSeries(Metadata(:salinity; dataset, dates, region), grid)
 
         # 2. Extract 2D boundary slices
         @info " -> Extracting boundary slices (West, East, South, North)..."
@@ -756,11 +1072,6 @@ function bsose_open_boundary_conditions(grid;
             north=ValueBoundaryCondition(S_north; scheme)
         )
 
-        U_bcs = FieldBoundaryConditions()
-        V_bcs = FieldBoundaryConditions(grid, (Center(), Face(), nothing);
-            south=GravityWaveRadiationBoundaryCondition((0.0, 0.0)),
-            north=GravityWaveRadiationBoundaryCondition((0.0, 0.0))
-        )
     else
         @info " -> Longitude is Bounded (regional): applying West, East, South, and North boundary conditions."
         u_bcs = FieldBoundaryConditions(
@@ -792,22 +1103,90 @@ function bsose_open_boundary_conditions(grid;
             south=ValueBoundaryCondition(S_south; scheme),
             north=ValueBoundaryCondition(S_north; scheme)
         )
-
-        # Barotropic transport boundary conditions for SplitExplicitFreeSurface
-        # Ensures normal barotropic transport U and V radiate surface gravity waves freely
-        # rather than enforcing rigid no-normal-flow (U=0, V=0) walls against 3D inflow/outflow.
-        U_bcs = FieldBoundaryConditions(grid, (Face(), Center(), nothing);
-            west=GravityWaveRadiationBoundaryCondition((0.0, 0.0)),
-            east=GravityWaveRadiationBoundaryCondition((0.0, 0.0))
-        )
-        V_bcs = FieldBoundaryConditions(grid, (Center(), Face(), nothing);
-            south=GravityWaveRadiationBoundaryCondition((0.0, 0.0)),
-            north=GravityWaveRadiationBoundaryCondition((0.0, 0.0))
-        )
     end
 
     @info "BSOSE Open Boundary Conditions setup complete."
-    return (u=u_bcs, v=v_bcs, T=T_bcs, S=S_bcs, U=U_bcs, V=V_bcs)
+    return (u=u_bcs, v=v_bcs, T=T_bcs, S=S_bcs)
+end
+
+# ==============================================================================
+# 4b. Sponge Layer Boundary Restoring Helper
+# ==============================================================================
+
+"""
+    bsose_sponge_layer_forcing(grid;
+                               dataset = BSOSEMonthly(),
+                               dates = nothing,
+                               sponge_width = 3.0,
+                               timescale = 5days,
+                               restore_velocities = true)
+
+Construct sponge layer forcing using `DatasetRestoring` for all open boundaries.
+A smooth cosine taper relaxes variables toward BSOSE values within `sponge_width`
+degrees of the boundary edges on a timescale of `timescale`, dropping to zero
+relaxation in the interior domain.
+"""
+function bsose_sponge_layer_forcing(grid;
+    dataset=BSOSEMonthly(),
+    dates=nothing,
+    sponge_width=3.0, # degrees
+    timescale=5days,
+    restore_velocities=true)
+
+    underlying = grid isa ImmersedBoundaryGrid ? grid.underlying_grid : grid
+    is_x_periodic = topology(underlying, 1) === Periodic
+
+    λ_min = underlying.λᶠᵃᵃ[1]
+    λ_max = underlying.λᶠᵃᵃ[underlying.Nx+1]
+    φ_min = underlying.φᵃᶠᵃ[1]
+    φ_max = underlying.φᵃᶠᵃ[underlying.Ny+1]
+
+    # Sponge mask: 1 at boundary edge, smoothly tapering to 0 at distance >= sponge_width.
+    # Oceananigans forcing kernels call mask functions as either mask(λ, φ, z, t) or mask(λ, φ, z).
+    compute_sponge = (λ, φ, z) -> begin
+        dist_s = φ - φ_min
+        dist_n = φ_max - φ
+        d_edge = min(dist_s, dist_n)
+        if !is_x_periodic
+            dist_w = λ - λ_min
+            dist_e = λ_max - λ
+            d_edge = min(d_edge, dist_w, dist_e)
+        end
+
+        if d_edge >= sponge_width
+            return 0.0
+        elseif d_edge <= 0.0
+            return 1.0
+        else
+            return 0.5 * (1.0 + cos(π * d_edge / sponge_width))
+        end
+    end
+
+    sponge_mask = (λ, φ, z, args...) -> compute_sponge(λ, φ, z)
+
+    start_date = dates isa Tuple ? dates[1] : (dates !== nothing ? first(dates) : first_date(dataset, :temperature))
+    end_date = dates isa Tuple ? dates[2] : (dates !== nothing ? last(dates) : last_date(dataset, :temperature))
+
+    region = bsose_region(grid)
+    rate = 1 / timescale
+
+    @info "Configuring BSOSE Sponge Layers (width=$(sponge_width)°, timescale=$(timescale/86400) days)..."
+    T_meta = Metadata(:temperature; dataset, start_date, end_date, region)
+    S_meta = Metadata(:salinity; dataset, start_date, end_date, region)
+
+    FT = DatasetRestoring(T_meta, grid; rate=rate, mask=sponge_mask)
+    FS = DatasetRestoring(S_meta, grid; rate=rate, mask=sponge_mask)
+
+    if restore_velocities
+        @info " -> Restoring u and v velocities in boundary sponge layers to damp accelerations."
+        u_meta = Metadata(:u_velocity; dataset, start_date, end_date, region)
+        v_meta = Metadata(:v_velocity; dataset, start_date, end_date, region)
+        Fu = DatasetRestoring(u_meta, grid; rate=rate, mask=sponge_mask)
+        Fv = DatasetRestoring(v_meta, grid; rate=rate, mask=sponge_mask)
+        return (u=Fu, v=Fv, T=FT, S=FS)
+    else
+        return (T=FT, S=FS)
+    end
 end
 
 # ==============================================================================
@@ -818,28 +1197,40 @@ end
     bsose_initial_conditions!(model;
                                dataset = BSOSEMonthly(),
                                date = nothing,
-                               dates = nothing)
+                               dates = nothing,
+                               velocities = true)
 
-Initialize `model` tracers (`T`, `S`) and velocities (`u`, `v`) from BSOSE at `date`.
-If `dates` is passed, initializes at the start of the simulation window.
+Initialize `model` tracers (`T`, `S`) from BSOSE at `date`, and by default its
+velocities (`u`, `v`) as well.
+
+The ACC carries ~100-150 Sv of zonal transport through this domain, so starting
+from rest while the open boundaries inject that transport at t = 0 drives an
+artificial divergence spike and barotropic wave pile-up. Initializing `u` and `v`
+from the same BSOSE snapshot keeps the interior consistent with the inflow.
 """
 function bsose_initial_conditions!(model;
     dataset=BSOSEMonthly(),
     date=nothing,
-    dates=nothing)
+    dates=nothing,
+    velocities=true)
     init_date = date !== nothing ? date :
                 dates !== nothing ? (dates isa Tuple ? dates[1] : first(dates)) :
                 first_date(dataset, :temperature)
 
-    @info "Initializing model state from BSOSE at date: $init_date..."
+    @info "Initializing model state from BSOSE at date: $init_date (velocities: $velocities)..."
     grid = model.grid
+    region = bsose_region(grid)
 
-    T_init = Field(Metadatum(:temperature; dataset, date=init_date), grid)
-    S_init = Field(Metadatum(:salinity; dataset, date=init_date), grid)
-    u_init = Field(Metadatum(:u_velocity; dataset, date=init_date), grid)
-    v_init = Field(Metadatum(:v_velocity; dataset, date=init_date), grid)
+    T_init = Field(Metadatum(:temperature; dataset, date=init_date, region), grid)
+    S_init = Field(Metadatum(:salinity; dataset, date=init_date, region), grid)
 
-    set!(model; u=u_init, v=v_init, T=T_init, S=S_init)
+    if velocities
+        u_init = Field(Metadatum(:u_velocity; dataset, date=init_date, region), grid)
+        v_init = Field(Metadatum(:v_velocity; dataset, date=init_date, region), grid)
+        set!(model; u=u_init, v=v_init, T=T_init, S=S_init)
+    else
+        set!(model; T=T_init, S=S_init)
+    end
 
     @info "Model successfully initialized with BSOSE fields."
     return nothing
@@ -965,10 +1356,11 @@ function bsose_sponge_forcing(grid;
     sponge_distance=2.0)
     @info "Setting up BSOSE sponge layer nudging (timescale = $(prettytime(1/rate)), width = $(sponge_distance)°)..."
 
-    u_target = FieldTimeSeries(Metadata(:u_velocity; dataset, dates), grid)
-    v_target = FieldTimeSeries(Metadata(:v_velocity; dataset, dates), grid)
-    T_target = FieldTimeSeries(Metadata(:temperature; dataset, dates), grid)
-    S_target = FieldTimeSeries(Metadata(:salinity; dataset, dates), grid)
+    region = bsose_region(grid)
+    u_target = FieldTimeSeries(Metadata(:u_velocity; dataset, dates, region), grid)
+    v_target = FieldTimeSeries(Metadata(:v_velocity; dataset, dates, region), grid)
+    T_target = FieldTimeSeries(Metadata(:temperature; dataset, dates, region), grid)
+    S_target = FieldTimeSeries(Metadata(:salinity; dataset, dates, region), grid)
 
     g = grid isa ImmersedBoundaryGrid ? grid.underlying_grid : grid
     λ₁, λ₂ = extrema(λnodes(g, Face(), Center(), Center()))
