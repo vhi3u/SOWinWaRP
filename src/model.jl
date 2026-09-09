@@ -18,10 +18,18 @@ using Oceanostics.ProgressMessengers: TimedMessenger
 # Include our BSOSE helper module
 include("setup_bsose.jl")
 
-if has_cuda_gpu()
+import CUDA
+
+if CUDA.functional()
     arch = GPU()
-else
+    @info "Running on GPU: $(CUDA.name(CUDA.device()))"
+elseif haskey(ENV, "FORCE_CPU")
     arch = CPU()
+    @warn "Running on CPU (forced by FORCE_CPU environment variable)"
+else
+    # Call functional(true) to output the exact reason why CUDA failed to initialize
+    CUDA.functional(true)
+    error("CUDA is not functional on this node! If you are running via sbatch, check your GPU allocation or logs. To force CPU testing, export FORCE_CPU=1.")
 end
 
 # flags
