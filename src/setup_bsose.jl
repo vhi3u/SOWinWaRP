@@ -1087,21 +1087,21 @@ function bsose_open_boundary_conditions(grid;
 
         # Sanitize boundary velocity and tracer slices so bathymetric gaps are filled with nearby valid ocean values
         for (bts, lo, hi) in ((u_west, -5.0, 5.0),
-                              (u_east, -5.0, 5.0),
-                              (u_south, -5.0, 5.0),
-                              (u_north, -5.0, 5.0),
-                              (v_west, -5.0, 5.0),
-                              (v_east, -5.0, 5.0),
-                              (v_south, -5.0, 5.0),
-                              (v_north, -5.0, 5.0),
-                              (T_west, T_MIN_PHYSICAL, T_MAX_PHYSICAL),
-                              (T_east, T_MIN_PHYSICAL, T_MAX_PHYSICAL),
-                              (T_south, T_MIN_PHYSICAL, T_MAX_PHYSICAL),
-                              (T_north, T_MIN_PHYSICAL, T_MAX_PHYSICAL),
-                              (S_west, S_MIN_PHYSICAL, S_MAX_PHYSICAL),
-                              (S_east, S_MIN_PHYSICAL, S_MAX_PHYSICAL),
-                              (S_south, S_MIN_PHYSICAL, S_MAX_PHYSICAL),
-                              (S_north, S_MIN_PHYSICAL, S_MAX_PHYSICAL))
+            (u_east, -5.0, 5.0),
+            (u_south, -5.0, 5.0),
+            (u_north, -5.0, 5.0),
+            (v_west, -5.0, 5.0),
+            (v_east, -5.0, 5.0),
+            (v_south, -5.0, 5.0),
+            (v_north, -5.0, 5.0),
+            (T_west, T_MIN_PHYSICAL, T_MAX_PHYSICAL),
+            (T_east, T_MIN_PHYSICAL, T_MAX_PHYSICAL),
+            (T_south, T_MIN_PHYSICAL, T_MAX_PHYSICAL),
+            (T_north, T_MIN_PHYSICAL, T_MAX_PHYSICAL),
+            (S_west, S_MIN_PHYSICAL, S_MAX_PHYSICAL),
+            (S_east, S_MIN_PHYSICAL, S_MAX_PHYSICAL),
+            (S_south, S_MIN_PHYSICAL, S_MAX_PHYSICAL),
+            (S_north, S_MIN_PHYSICAL, S_MAX_PHYSICAL))
             if bts isa FieldTimeSeries
                 for t in 1:length(bts.times)
                     fill_bathymetry_gaps!(parent(bts[t]), lo, hi)
@@ -1138,6 +1138,28 @@ function bsose_open_boundary_conditions(grid;
             end
         end
     end
+
+    # Ensure all boundary slices match the grid architecture (e.g., GPU/CuArray)
+    arch = architecture(grid)
+    u_west = u_west isa FieldTimeSeries ? on_architecture(arch, u_west) : u_west
+    u_east = u_east isa FieldTimeSeries ? on_architecture(arch, u_east) : u_east
+    u_south = u_south isa FieldTimeSeries ? on_architecture(arch, u_south) : u_south
+    u_north = u_north isa FieldTimeSeries ? on_architecture(arch, u_north) : u_north
+
+    v_west = v_west isa FieldTimeSeries ? on_architecture(arch, v_west) : v_west
+    v_east = v_east isa FieldTimeSeries ? on_architecture(arch, v_east) : v_east
+    v_south = v_south isa FieldTimeSeries ? on_architecture(arch, v_south) : v_south
+    v_north = v_north isa FieldTimeSeries ? on_architecture(arch, v_north) : v_north
+
+    T_west = T_west isa FieldTimeSeries ? on_architecture(arch, T_west) : T_west
+    T_east = T_east isa FieldTimeSeries ? on_architecture(arch, T_east) : T_east
+    T_south = T_south isa FieldTimeSeries ? on_architecture(arch, T_south) : T_south
+    T_north = T_north isa FieldTimeSeries ? on_architecture(arch, T_north) : T_north
+
+    S_west = S_west isa FieldTimeSeries ? on_architecture(arch, S_west) : S_west
+    S_east = S_east isa FieldTimeSeries ? on_architecture(arch, S_east) : S_east
+    S_south = S_south isa FieldTimeSeries ? on_architecture(arch, S_south) : S_south
+    S_north = S_north isa FieldTimeSeries ? on_architecture(arch, S_north) : S_north
 
     # 3. Top boundary condition (surface wind stress)
     top_u_bc = FluxBoundaryCondition(nothing)
