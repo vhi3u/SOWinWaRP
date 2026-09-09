@@ -241,7 +241,7 @@ stop_iteration = haskey(ENV, "STOP_ITERATION") ? parse(Int, ENV["STOP_ITERATION"
 simulation = Simulation(ocean.model, Δt=1seconds, stop_time=stop_time, stop_iteration=stop_iteration)
 
 # adaptive timestep wizard based on CFL (following mediterranean.jl: cfl=0.2, max_change=1.1)
-wizard = TimeStepWizard(cfl=0.7, max_Δt=1hours, max_change=1.1, min_Δt=0.1)
+wizard = TimeStepWizard(cfl=0.4, max_Δt=1hours, max_change=1.1, min_Δt=0.1)
 simulation.callbacks[:wizard] = Callback(wizard, IterationInterval(10))
 
 # Safety callback: clamp salinity/temperature to physically valid ranges before each time step.
@@ -266,7 +266,7 @@ simulation.callbacks[:progress] = Callback(progress, TimeInterval(callback_inter
 function log_free_surface(sim)
     eta = sim.model.free_surface.displacement
     @info @sprintf("        max|eta| = %.4f m, mean(eta) = %+.4f m",
-        maximum(abs, eta), mean(interior(eta)))
+        maximum(abs, eta), mean(eta))
     flush(stdout)
 end
 simulation.callbacks[:free_surface] = Callback(log_free_surface, TimeInterval(callback_interval))
