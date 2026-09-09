@@ -229,9 +229,9 @@ end
 println("-"^85)
 
 # ------------------------------------------------------------------------------
-# 5. One-Step Numerical Stability & Timestep Check
+# 5. 2-Day Model Spinup Simulation
 # ------------------------------------------------------------------------------
-println("\n[4/4] Executing Single Test Timestep (1.0 s)...")
+println("\n[4/4] Executing 2-Day Model Spinup Simulation...")
 
 # Guard TEOS10 as in model.jl
 import SeawaterPolynomials.TEOS10 as TEOS10_mod
@@ -239,30 +239,62 @@ import SeawaterPolynomials.TEOS10 as TEOS10_mod
     @inline s(Sᴬ::FT) where FT = √(max((Sᴬ + FT(ΔS)) / FT(Sₐᵤ), zero(FT)))
 end
 
-simulation = Simulation(ocean.model, Δt=1seconds, stop_iteration=1)
+SPINUP_TIME = 2days
+simulation = Simulation(ocean.model, Δt=1seconds, stop_time=SPINUP_TIME)
+
+# Adaptive timestep wizard matching model.jl
 wizard = TimeStepWizard(cfl=0.4, max_Δt=1hours, max_change=1.1, min_Δt=0.1)
+simulation.callbacks[:wizard] = Callback(wizard, IterationInterval(10))
 
-# Verify advective timescale
-u_max = maximum(abs, interior(ocean.model.velocities.u))
-v_max = maximum(abs, interior(ocean.model.velocities.v))
-@printf("  - Initial max |u| = %.4f m/s, max |v| = %.4f m/s\n", u_max, v_max)
+# Periodic progress logging
+function log_progress(sim)
+    u_curr = maximum(abs, interior(sim.model.velocities.u))
+    v_curr = maximum(abs, interior(sim.model.velocities.v))
+    w_curr = maximum(abs, interior(sim.model.velocities.w))
+    t_days = sim.model.clock.time / 86400
+    @printf("  [Spinup] Iter: %6d | Time: %6.2f days / %.1f days | Δt: %7.2f s | max|u|: %.4f | max|v|: %.4f | max|w|: %.2e m/s\n",
+            sim.model.clock.iteration, t_days, SPINUP_TIME / 86400, sim.Δt, u_curr, v_curr, w_curr)
+    flush(stdout)
+end
+simulation.callbacks[:progress] = Callback(log_progress, IterationInterval(50))
 
-step_ok = true
+spinup_ok = true
+t_spinup_start = time()
+
 try
-    time_step!(simulation)
-    println("  ✓ Step 1 completed successfully! Δt = $(simulation.Δt) s")
+    run!(simulation)
+    t_spinup_elapsed = round(time() - t_spinup_start, digits=2)
+    println("\n  ✓ 2-day spinup completed successfully in $(t_spinup_elapsed) s! Final simulated time: $(simulation.model.clock.time / 86400) days")
 catch err
-    global step_ok = false
+    global spinup_ok = false
     global all_passed = false
-    println("  ❌ ERROR during test time step: $err")
+    println("\n  ❌ ERROR during 2-day spinup: $err")
     Base.show_backtrace(stdout, catch_backtrace())
     println()
 end
 
-# Check post-step fields
+# Post-spinup diagnostic checks
 u_max_post = maximum(abs, interior(ocean.model.velocities.u))
 v_max_post = maximum(abs, interior(ocean.model.velocities.v))
-@printf("  - Post-step max |u| = %.4f m/s, max |v| = %.4f m/s\n", u_max_post, v_max_post)
+w_max_post = maximum(abs, interior(ocean.model.velocities.w))
+T_min_post = minimum(interior(ocean.model.tracers.T))
+T_max_post = maximum(interior(ocean.model.tracers.T))
+S_min_post = minimum(interior(ocean.model.tracers.S))
+S_max_post = maximum(interior(ocean.model.tracers.S))
+nan_post = count(isnan, Array(parent(ocean.model.velocities.u))) +
+           count(isnan, Array(parent(ocean.model.velocities.v))) +
+           count(isnan, Array(parent(ocean.model.tracers.T))) +
+           count(isnan, Array(parent(ocean.model.tracers.S)))
+
+println("\nPost-Spinup Diagnostic State:")
+@printf("  - Velocities : max|u| = %.4f m/s, max|v| = %.4f m/s, max|w| = %.2e m/s\n", u_max_post, v_max_post, w_max_post)
+@printf("  - Tracers    : T ∈ [%.2f, %.2f] °C, S ∈ [%.2f, %.2f] psu\n", T_min_post, T_max_post, S_min_post, S_max_post)
+@printf("  - Total NaNs : %d\n", nan_post)
+
+if nan_post > 0
+    spinup_ok = false
+    all_passed = false
+end
 
 # ------------------------------------------------------------------------------
 # 6. Final Summary
@@ -271,13 +303,15 @@ println("\n" * "="^85)
 println(" VERIFICATION SUMMARY REPORT")
 println("="^85)
 @printf("  1. Boundary Conditions Structure      : %s\n", "PASS")
-@printf("  2. Model State NaN Count               : %s (Total: %d)\n", total_nans == 0 ? "PASSED" : "FAILED", total_nans)
-@printf("  3. Architecture / GPU Array Storage   : %s (Incompatible: %d)\n", incompatible_arrays == 0 ? "PASSED" : "FAILED", incompatible_arrays)
-@printf("  4. First Numerical Step Stability     : %s\n", step_ok ? "PASSED" : "FAILED")
+@printf("  2. Model State NaN Count               : %s (Initial: %d, Post-Spinup: %d)\n",
+        (total_nans == 0 && nan_post == 0) ? "PASSED" : "FAILED", total_nans, nan_post)
+@printf("  3. Architecture / GPU Array Storage   : %s (Incompatible: %d)\n",
+        incompatible_arrays == 0 ? "PASSED" : "FAILED", incompatible_arrays)
+@printf("  4. 2-Day Model Spinup Run             : %s\n", spinup_ok ? "PASSED (2.0 Days Completed)" : "FAILED")
 println("="^85)
 
-if all_passed && step_ok
-    println("🎉 ALL CHECKS PASSED: Model, boundary conditions, forcings, and initial conditions are 100% verified!")
+if all_passed && spinup_ok
+    println("🎉 ALL CHECKS PASSED: Model, boundary conditions, forcings, and 2-day spinup are 100% stable!")
 else
     println("⚠️  VERIFICATION FAILED: Review the diagnostics above.")
 end
