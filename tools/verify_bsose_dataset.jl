@@ -25,10 +25,7 @@ using NumericalEarth.DataWrangling
 using NumericalEarth.DataWrangling: JLD2
 using NCDatasets
 
-try
-    using CUDA
-catch
-end
+import CUDA
 
 # Load our BSOSE interface definitions
 include(joinpath(@__DIR__, "..", "src", "setup_bsose.jl"))
@@ -148,15 +145,20 @@ println("\n[3/4] Constructing Target Grid & Executing setup_bsose Pipeline...")
 λ₁, λ₂ = (90.0, 150.0)
 φ₁, φ₂ = (-70.0, -40.0)
 
-# Check if running under GPU or CPU
-has_gpu = false
-try
-    if @isdefined(CUDA) && CUDA.functional()
-        has_gpu = true
-    end
-catch
+# Check if running under GPU or CPU (matching model.jl logic)
+if CUDA.functional()
+    arch = GPU()
+    @info "Running on GPU: $(CUDA.name(CUDA.device()))"
+elseif haskey(ENV, "FORCE_CPU")
+    arch = CPU()
+    @warn "Running on CPU (forced by FORCE_CPU environment variable)"
+else
+    # Output why CUDA is not functional to assist debugging
+    @warn "CUDA is not functional on this node! Reason:"
+    CUDA.functional(true)
+    @warn "Defaulting to CPU mode for verification."
+    arch = CPU()
 end
-arch = has_gpu ? GPU() : CPU()
 println("  - Architecture : $(arch)")
 
 # Choose resolution and stretching (if GPU is available vs local CPU test)
