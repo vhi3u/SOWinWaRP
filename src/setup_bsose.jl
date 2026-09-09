@@ -762,6 +762,98 @@ end
 # 3. Boundary Slice Extraction & Open Boundary Conditions (OBCs)
 # ==============================================================================
 
+# Southern Ocean physical parameter bounds
+const S_MIN_PHYSICAL = 30.0
+const S_MAX_PHYSICAL = 36.5
+const T_MIN_PHYSICAL = -2.2
+const T_MAX_PHYSICAL = 20.0
+
+"""
+    fill_bathymetry_gaps!(data, valid_min, valid_max)
+
+When the model bathymetry is deeper than the BSOSE bathymetry (or at steep slopes),
+regridding leaves missing/unphysical values in cells that are ocean in the model
+but land/unmapped in BSOSE. Rather than inserting arbitrary bounds, we propagate
+the nearest valid physical ocean values downwards (and laterally) through the water column.
+"""
+function fill_bathymetry_gaps!(data, valid_min=S_MIN_PHYSICAL, valid_max=S_MAX_PHYSICAL)
+    Nx, Ny, Nz = size(data)
+    cpu_data = Array(data)
+
+    # 1. Vertical propagation: extend the deepest valid water mass downward
+    for i in 1:Nx, j in 1:Ny
+        # Downward pass: fill deep cells from the valid ocean level directly above
+        for k in Nz-1:-1:1
+            val = cpu_data[i, j, k]
+            if val < valid_min || val > valid_max || isnan(val)
+                above = cpu_data[i, j, k+1]
+                if valid_min <= above <= valid_max && !isnan(above)
+                    cpu_data[i, j, k] = above
+                end
+            end
+        end
+        # Upward pass: in case surface level had missing data
+        for k in 2:Nz
+            val = cpu_data[i, j, k]
+            if val < valid_min || val > valid_max || isnan(val)
+                below = cpu_data[i, j, k-1]
+                if valid_min <= below <= valid_max && !isnan(below)
+                    cpu_data[i, j, k] = below
+                end
+            end
+        end
+    end
+
+    # 2. Horizontal propagation: fill any entirely isolated columns from adjacent horizontal neighbors
+    for k in 1:Nz
+        for i in 1:Nx
+            for j in 2:Ny
+                val = cpu_data[i, j, k]
+                if val < valid_min || val > valid_max || isnan(val)
+                    prev = cpu_data[i, j-1, k]
+                    if valid_min <= prev <= valid_max && !isnan(prev)
+                        cpu_data[i, j, k] = prev
+                    end
+                end
+            end
+            for j in Ny-1:-1:1
+                val = cpu_data[i, j, k]
+                if val < valid_min || val > valid_max || isnan(val)
+                    nxt = cpu_data[i, j+1, k]
+                    if valid_min <= nxt <= valid_max && !isnan(nxt)
+                        cpu_data[i, j, k] = nxt
+                    end
+                end
+            end
+        end
+        for j in 1:Ny
+            for i in 2:Nx
+                val = cpu_data[i, j, k]
+                if val < valid_min || val > valid_max || isnan(val)
+                    prev = cpu_data[i-1, j, k]
+                    if valid_min <= prev <= valid_max && !isnan(prev)
+                        cpu_data[i, j, k] = prev
+                    end
+                end
+            end
+            for i in Nx-1:-1:1
+                val = cpu_data[i, j, k]
+                if val < valid_min || val > valid_max || isnan(val)
+                    nxt = cpu_data[i+1, j, k]
+                    if valid_min <= nxt <= valid_max && !isnan(nxt)
+                        cpu_data[i, j, k] = nxt
+                    end
+                end
+            end
+        end
+    end
+
+    # Final safeguard clamp to realistic Southern Ocean physical limits
+    clamp!(cpu_data, valid_min, valid_max)
+    copyto!(data, cpu_data)
+    return data
+end
+
 """
     boundary_slice_time_series(fts::FieldTimeSeries, side::Symbol)
 
@@ -1044,6 +1136,22 @@ function bsose_open_boundary_conditions(grid;
         @info " -> Surface wind stress is DISABLED (top boundary is no-flux)."
     end
 
+    # Sanitize boundary tracer slices so bathymetric gaps are filled with nearby valid ocean values
+    for (bts, lo, hi) in ((T_west, T_MIN_PHYSICAL, T_MAX_PHYSICAL),
+                          (T_east, T_MIN_PHYSICAL, T_MAX_PHYSICAL),
+                          (T_south, T_MIN_PHYSICAL, T_MAX_PHYSICAL),
+                          (T_north, T_MIN_PHYSICAL, T_MAX_PHYSICAL),
+                          (S_west, S_MIN_PHYSICAL, S_MAX_PHYSICAL),
+                          (S_east, S_MIN_PHYSICAL, S_MAX_PHYSICAL),
+                          (S_south, S_MIN_PHYSICAL, S_MAX_PHYSICAL),
+                          (S_north, S_MIN_PHYSICAL, S_MAX_PHYSICAL))
+        if bts isa FieldTimeSeries
+            for t in 1:length(bts.times)
+                fill_bathymetry_gaps!(parent(bts[t]), lo, hi)
+            end
+        end
+    end
+
     # 4. Construct FieldBoundaryConditions
     # Note: On East/West boundaries, normal velocity is u (NormalFlow), tangential is v (Value).
     #       On South/North boundaries, normal velocity is v (NormalFlow), tangential is u (Value).
@@ -1232,7 +1340,15 @@ function bsose_initial_conditions!(model;
         set!(model; T=T_init, S=S_init)
     end
 
-    @info "Model successfully initialized with BSOSE fields."
+    # Propagate valid ocean values into bathymetry discrepancies / deep slope trenches
+    fill_bathymetry_gaps!(parent(model.tracers.S), S_MIN_PHYSICAL, S_MAX_PHYSICAL)
+    fill_bathymetry_gaps!(parent(model.tracers.T), T_MIN_PHYSICAL, T_MAX_PHYSICAL)
+    fill_halo_regions!(model.tracers.T, model.clock, fields(model))
+    fill_halo_regions!(model.tracers.S, model.clock, fields(model))
+    fill_bathymetry_gaps!(parent(model.tracers.S), S_MIN_PHYSICAL, S_MAX_PHYSICAL)
+    fill_bathymetry_gaps!(parent(model.tracers.T), T_MIN_PHYSICAL, T_MAX_PHYSICAL)
+
+    @info "Model successfully initialized with BSOSE fields and filled bathymetric gaps."
     return nothing
 end
 

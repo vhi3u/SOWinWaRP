@@ -60,13 +60,13 @@ end
 
 # z stretching so that the upper 500 meters of the ocean has dz = 2 meters, and the deeper ocean will gradually stretch to 200 m vertical resolution. 
 if arch isa CPU
-    z = ReferenceToStretchedDiscretization(; extent=5000,
+    z = ReferenceToStretchedDiscretization(; extent=5800,
         constant_spacing=10,
         maximum_spacing=1000,
         constant_spacing_extent=500,
         stretching=PowerLawStretching(1.15))
 else
-    z = ReferenceToStretchedDiscretization(; extent=5000,
+    z = ReferenceToStretchedDiscretization(; extent=5800,
         constant_spacing=DZ_SURFACE,
         maximum_spacing=DZ_BOTTOM,
         constant_spacing_extent=500,
@@ -95,7 +95,7 @@ grid = LatitudeLongitudeGrid(arch;
 bottom_height = regrid_bathymetry(grid,
     height_above_water=1,
     minimum_depth=10,
-    interpolation_passes=25)
+    interpolation_passes=5)
 
 grid = ImmersedBoundaryGrid(grid, GridFittedBottom(bottom_height))
 
@@ -172,34 +172,6 @@ ocean = ocean_simulation(grid;
     closure=closures
 )
 
-# ── Sanitize OBC boundary time series ────────────────────────────────────────
-# NumericalEarth's regridding onto the model grid can produce physically
-# impossible values (e.g. S ≈ -65 PSU, T ≈ -999°C) at cells where the BSOSE
-# bathymetry is shallower than the model grid. These are stored in the boundary
-# FieldTimeSeries objects and injected into ghost cells by fill_halo_regions!
-# at the START of every time step — long after any pre-run tracer clamp.
-# Cleaning the FieldTimeSeries here prevents bad ghost-cell values from creating
-# artificial buoyancy gradients that blow up velocities.
-if OBCS && DATASET == "BSOSE"
-    # Boundary conditions live on the tracer/velocity fields themselves,
-    # not on a top-level model.boundary_conditions field.
-    for (field, lo, hi) in ((ocean.model.tracers.S, 0.5, 42.0),
-        (ocean.model.tracers.T, -2.5, 40.0))
-        for side in (:west, :east, :south, :north)
-            bc = getproperty(field.boundary_conditions, side)
-            if !isnothing(bc) && hasproperty(bc, :condition)
-                fts = bc.condition
-                if fts isa FieldTimeSeries
-                    for t in 1:length(fts.times)
-                        clamp!(parent(fts[t]), lo, hi)
-                    end
-                end
-            end
-        end
-    end
-    @info "OBC boundary time series sanitized (S ∈ [0.5, 42], T ∈ [-2.5, 40])."
-end
-
 # initial conditions based on either BSOSE or the other datasets
 
 if DATASET == "BSOSE"
@@ -209,27 +181,13 @@ else
         MetadataSet(:temperature; dataset=dataset, date=start_date),
         MetadataSet(:salinity; dataset=dataset, date=start_date)
     )
+    fill_bathymetry_gaps!(parent(ocean.model.tracers.S), S_MIN_PHYSICAL, S_MAX_PHYSICAL)
+    fill_bathymetry_gaps!(parent(ocean.model.tracers.T), T_MIN_PHYSICAL, T_MAX_PHYSICAL)
+    fill_halo_regions!(ocean.model.tracers.T, ocean.model.clock, fields(ocean.model))
+    fill_halo_regions!(ocean.model.tracers.S, ocean.model.clock, fields(ocean.model))
+    fill_bathymetry_gaps!(parent(ocean.model.tracers.S), S_MIN_PHYSICAL, S_MAX_PHYSICAL)
+    fill_bathymetry_gaps!(parent(ocean.model.tracers.T), T_MIN_PHYSICAL, T_MAX_PHYSICAL)
 end
-
-# Post-initialization sanity enforcement for TEOS10 compatibility.
-# NumericalEarth's regridding interpolation can produce negative or near-zero salinity
-# at cells where the BSOSE grid bathymetry is shallower than the model grid (overshoot
-# at steep slopes). We must clamp BEFORE update_state! is called by initialize!.
-#
-# Strategy:
-#   1. Clamp parent arrays (interior + halo + immersed) to valid physical ranges.
-#   2. Call update_state! manually to flush fill_halo_regions! with clean values,
-#      so the OBC injection uses clamped interior data as reference.
-#   3. Clamp again after the halo fill in case OBC injection wrote bad halo values.
-function clamp_tracers!(model)
-    clamp!(parent(model.tracers.S), 0.5, 42.0)
-    clamp!(parent(model.tracers.T), -2.5, 40.0)
-end
-
-clamp_tracers!(ocean.model)
-fill_halo_regions!(ocean.model.tracers.T, ocean.model.clock, fields(ocean.model))
-fill_halo_regions!(ocean.model.tracers.S, ocean.model.clock, fields(ocean.model))
-clamp_tracers!(ocean.model)
 
 # ── TEOS10 sqrt guard ─────────────────────────────────────────────────────────
 # The TEOS10 coordinate s(Sᴬ) = √((Sᴬ + ΔS) / Sₐᵤ) crashes for Sᴬ < -32.
@@ -257,8 +215,8 @@ simulation.callbacks[:wizard] = Callback(wizard, IterationInterval(10))
 # Prevents DomainError in TEOS10's sqrt(S) from any numerical noise that accumulates
 # in boundary-adjacent or immersed cells during time stepping.
 function clamp_salinity!(sim)
-    clamp!(parent(sim.model.tracers.S), 0.5, 42.0)
-    clamp!(parent(sim.model.tracers.T), -2.5, 40.0)
+    clamp!(parent(sim.model.tracers.S), S_MIN_PHYSICAL, S_MAX_PHYSICAL)
+    clamp!(parent(sim.model.tracers.T), T_MIN_PHYSICAL, T_MAX_PHYSICAL)
 end
 simulation.callbacks[:clamp_S] = Callback(clamp_salinity!, IterationInterval(1))
 
