@@ -215,13 +215,17 @@ check_array_health("parent(tracers.S)", parent(ocean.model.tracers.S), arch)
 check_array_health("parent(velocities.u)", parent(ocean.model.velocities.u), arch)
 check_array_health("parent(velocities.v)", parent(ocean.model.velocities.v), arch)
 
-println("\nBoundary Condition Slices:")
+println("\nBoundary Condition Slices (First [t=1] & Last [t=end] Time Steps):")
 for (vname, bcs) in pairs(boundary_conditions)
     for side in (:west, :east, :south, :north)
         bc = getproperty(bcs, side)
         if bc !== nothing && hasproperty(bc, :condition) && bc.condition isa FieldTimeSeries
             bts = bc.condition
             check_array_health("$vname.$side [t=1]", parent(bts[1]), arch)
+            Nt = length(bts.times)
+            if Nt > 1
+                check_array_health("$vname.$side [t=$Nt]", parent(bts[Nt]), arch)
+            end
         end
     end
 end
@@ -246,14 +250,28 @@ simulation = Simulation(ocean.model, Δt=1seconds, stop_time=SPINUP_TIME)
 wizard = TimeStepWizard(cfl=0.4, max_Δt=1hours, max_change=1.1, min_Δt=0.1)
 simulation.callbacks[:wizard] = Callback(wizard, IterationInterval(10))
 
-# Periodic progress logging
+# Periodic progress logging with spatial location tracking of peak velocities
 function log_progress(sim)
-    u_curr = maximum(abs, interior(sim.model.velocities.u))
-    v_curr = maximum(abs, interior(sim.model.velocities.v))
-    w_curr = maximum(abs, interior(sim.model.velocities.w))
+    u_int = interior(sim.model.velocities.u)
+    v_int = interior(sim.model.velocities.v)
+    w_int = interior(sim.model.velocities.w)
+    
+    u_curr = maximum(abs, u_int)
+    v_curr = maximum(abs, v_int)
+    w_curr = maximum(abs, w_int)
+    
+    # Locate where peak |v| and |u| occur (CPU index conversion)
+    v_cpu = Array(v_int)
+    u_cpu = Array(u_int)
+    idx_v = argmax(abs.(v_cpu))
+    idx_u = argmax(abs.(u_cpu))
+    
     t_days = sim.model.clock.time / 86400
-    @printf("  [Spinup] Iter: %6d | Time: %6.2f days / %.1f days | Δt: %7.2f s | max|u|: %.4f | max|v|: %.4f | max|w|: %.2e m/s\n",
-        sim.model.clock.iteration, t_days, SPINUP_TIME / 86400, sim.Δt, u_curr, v_curr, w_curr)
+    @printf("  [Spinup] Iter: %6d | Time: %6.2f / %.1fd | Δt: %6.2fs | max|u|: %6.4f at (%d,%d,%d) | max|v|: %6.4f at (%d,%d,%d) | max|w|: %.2e m/s\n",
+        sim.model.clock.iteration, t_days, SPINUP_TIME / 86400, sim.Δt,
+        u_curr, idx_u[1], idx_u[2], idx_u[3],
+        v_curr, idx_v[1], idx_v[2], idx_v[3],
+        w_curr)
     flush(stdout)
 end
 simulation.callbacks[:progress] = Callback(log_progress, IterationInterval(50))
@@ -286,8 +304,29 @@ nan_post = count(isnan, Array(parent(ocean.model.velocities.u))) +
            count(isnan, Array(parent(ocean.model.tracers.T))) +
            count(isnan, Array(parent(ocean.model.tracers.S)))
 
+# Locate where peak velocities and vertical velocity occur
+v_int_arr = Array(interior(ocean.model.velocities.v))
+u_int_arr = Array(interior(ocean.model.velocities.u))
+w_int_arr = Array(interior(ocean.model.velocities.w))
+idx_v_max = argmax(abs.(v_int_arr))
+idx_u_max = argmax(abs.(u_int_arr))
+
+# Retrieve physical coordinates
+underlying = grid isa ImmersedBoundaryGrid ? grid.underlying_grid : grid
+λ_u = underlying.λᶠᵃᵃ[idx_u_max[1]]
+φ_u = underlying.φᵃᶜᵃ[idx_u_max[2]]
+z_u = underlying.z.cᵃᵃᶜ[idx_u_max[3]]
+
+λ_v = underlying.λᶜᵃᵃ[idx_v_max[1]]
+φ_v = underlying.φᵃᶠᵃ[idx_v_max[2]]
+z_v = underlying.z.cᵃᵃᶜ[idx_v_max[3]]
+
 println("\nPost-Spinup Diagnostic State:")
 @printf("  - Velocities : max|u| = %.4f m/s, max|v| = %.4f m/s, max|w| = %.2e m/s\n", u_max_post, v_max_post, w_max_post)
+@printf("  - Peak |u| Location: index (%d, %d, %d) -> (lon = %.2f°, lat = %.2f°, z = %.1f m)\n",
+        idx_u_max[1], idx_u_max[2], idx_u_max[3], λ_u, φ_u, z_u)
+@printf("  - Peak |v| Location: index (%d, %d, %d) -> (lon = %.2f°, lat = %.2f°, z = %.1f m)\n",
+        idx_v_max[1], idx_v_max[2], idx_v_max[3], λ_v, φ_v, z_v)
 @printf("  - Tracers    : T ∈ [%.2f, %.2f] °C, S ∈ [%.2f, %.2f] psu\n", T_min_post, T_max_post, S_min_post, S_max_post)
 @printf("  - Total NaNs : %d\n", nan_post)
 
