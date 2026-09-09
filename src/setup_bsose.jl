@@ -848,9 +848,9 @@ function fill_bathymetry_gaps!(data, valid_min=S_MIN_PHYSICAL, valid_max=S_MAX_P
         end
     end
 
-    # Final safeguard clamp to realistic Southern Ocean physical limits
-    clamp!(cpu_data, valid_min, valid_max)
-    copyto!(data, cpu_data)
+    # # Final safeguard clamp to realistic Southern Ocean physical limits
+    # clamp!(cpu_data, valid_min, valid_max)
+    # copyto!(data, cpu_data)
     return data
 end
 
