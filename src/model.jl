@@ -130,8 +130,8 @@ dates = (start_date, end_date)
 # ==============================================================================
 
 if OBCS && DATASET == "BSOSE"
-    @info "Configuring BSOSE Open Boundary Conditions with PerturbationAdvection..."
-    obc_scheme = PerturbationAdvection(inflow_timescale=1days, outflow_timescale=3hours)
+    @info "Configuring BSOSE Open Boundary Conditions (prescribed boundary values)..."
+    obc_scheme = nothing
     boundary_conditions = bsose_open_boundary_conditions(grid; dataset=dataset, dates=dates, winds=WINDS, scheme=obc_scheme)
 
     if SPONGE_LAYERS

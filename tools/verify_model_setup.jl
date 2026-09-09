@@ -126,7 +126,7 @@ println("  ✓ ImmersedBoundaryGrid created successfully.")
 dataset = BSOSEMonthly()
 
 println("\n[1/4] Configuring Boundary Conditions & Forcings (matching model.jl)...")
-obc_scheme = PerturbationAdvection(inflow_timescale=1days, outflow_timescale=3hours)
+obc_scheme = nothing
 boundary_conditions = bsose_open_boundary_conditions(grid; dataset=dataset, dates=dates, winds=WINDS, scheme=obc_scheme)
 println("  ✓ Open boundary conditions constructed.")
 
@@ -161,7 +161,7 @@ println("  ✓ Initial conditions applied.")
 println("\n[3/4] Validating Model Fields, Slices & GPU Architecture...")
 println("-"^85)
 @printf("%-22s | %-16s | %-10s | %-10s | %-8s | %-18s\n",
-        "Field / Component", "Dimensions", "Min Val", "Max Val", "NaNs", "Array Type")
+    "Field / Component", "Dimensions", "Min Val", "Max Val", "NaNs", "Array Type")
 println("-"^85)
 
 all_passed = true
@@ -185,7 +185,7 @@ function check_array_health(name, arr, target_arch; check_nan=true)
     cpu_arr = Array(arr)
     nan_count = check_nan ? count(isnan, cpu_arr) : 0
     total_nans += nan_count
-    
+
     val_min = (nan_count == length(cpu_arr) || isempty(cpu_arr)) ? NaN : minimum(filter(!isnan, cpu_arr))
     val_max = (nan_count == length(cpu_arr) || isempty(cpu_arr)) ? NaN : maximum(filter(!isnan, cpu_arr))
 
@@ -196,7 +196,7 @@ function check_array_health(name, arr, target_arch; check_nan=true)
 
     sz_str = string(size(cpu_arr))
     @printf("%-22s | %-16s | %10.4f | %10.4f | %8d | %-18s\n",
-            name, sz_str, val_min, val_max, nan_count, short_type)
+        name, sz_str, val_min, val_max, nan_count, short_type)
     return status == "PASS"
 end
 
@@ -253,7 +253,7 @@ function log_progress(sim)
     w_curr = maximum(abs, interior(sim.model.velocities.w))
     t_days = sim.model.clock.time / 86400
     @printf("  [Spinup] Iter: %6d | Time: %6.2f days / %.1f days | Δt: %7.2f s | max|u|: %.4f | max|v|: %.4f | max|w|: %.2e m/s\n",
-            sim.model.clock.iteration, t_days, SPINUP_TIME / 86400, sim.Δt, u_curr, v_curr, w_curr)
+        sim.model.clock.iteration, t_days, SPINUP_TIME / 86400, sim.Δt, u_curr, v_curr, w_curr)
     flush(stdout)
 end
 simulation.callbacks[:progress] = Callback(log_progress, IterationInterval(50))
@@ -304,9 +304,9 @@ println(" VERIFICATION SUMMARY REPORT")
 println("="^85)
 @printf("  1. Boundary Conditions Structure      : %s\n", "PASS")
 @printf("  2. Model State NaN Count               : %s (Initial: %d, Post-Spinup: %d)\n",
-        (total_nans == 0 && nan_post == 0) ? "PASSED" : "FAILED", total_nans, nan_post)
+    (total_nans == 0 && nan_post == 0) ? "PASSED" : "FAILED", total_nans, nan_post)
 @printf("  3. Architecture / GPU Array Storage   : %s (Incompatible: %d)\n",
-        incompatible_arrays == 0 ? "PASSED" : "FAILED", incompatible_arrays)
+    incompatible_arrays == 0 ? "PASSED" : "FAILED", incompatible_arrays)
 @printf("  4. 2-Day Model Spinup Run             : %s\n", spinup_ok ? "PASSED (2.0 Days Completed)" : "FAILED")
 println("="^85)
 
