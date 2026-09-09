@@ -250,7 +250,7 @@ simulation = Simulation(ocean.model, Δt=1seconds, stop_time=SPINUP_TIME)
 wizard = TimeStepWizard(cfl=0.4, max_Δt=1hours, max_change=1.1, min_Δt=0.1)
 simulation.callbacks[:wizard] = Callback(wizard, IterationInterval(10))
 
-# Periodic progress logging with spatial location tracking of peak velocities
+# Periodic progress logging with spatial location tracking of peak velocities and grid fraction
 function log_progress(sim)
     u_int = interior(sim.model.velocities.u)
     v_int = interior(sim.model.velocities.v)
@@ -266,12 +266,18 @@ function log_progress(sim)
     idx_v = argmax(abs.(v_cpu))
     idx_u = argmax(abs.(u_cpu))
     
+    # Count how many cells exceed thresholds
+    n_v_gt1 = count(x -> abs(x) > 1.0, v_cpu)
+    n_v_gt2 = count(x -> abs(x) > 2.0, v_cpu)
+    n_v_gt5 = count(x -> abs(x) > 5.0, v_cpu)
+    pct_v_gt1 = 100.0 * n_v_gt1 / length(v_cpu)
+    
     t_days = sim.model.clock.time / 86400
-    @printf("  [Spinup] Iter: %6d | Time: %6.2f / %.1fd | Δt: %6.2fs | max|u|: %6.4f at (%d,%d,%d) | max|v|: %6.4f at (%d,%d,%d) | max|w|: %.2e m/s\n",
+    @printf("  [Spinup] Iter: %6d | Time: %6.2f / %.1fd | Δt: %6.2fs | max|u|: %6.4f (%d,%d,%d) | max|v|: %6.4f (%d,%d,%d) | |v|>1: %d (%.3f%%), >5: %d\n",
         sim.model.clock.iteration, t_days, SPINUP_TIME / 86400, sim.Δt,
         u_curr, idx_u[1], idx_u[2], idx_u[3],
         v_curr, idx_v[1], idx_v[2], idx_v[3],
-        w_curr)
+        n_v_gt1, pct_v_gt1, n_v_gt5)
     flush(stdout)
 end
 simulation.callbacks[:progress] = Callback(log_progress, IterationInterval(50))
@@ -321,13 +327,34 @@ z_u = underlying.z.cᵃᵃᶜ[idx_u_max[3]]
 φ_v = underlying.φᵃᶠᵃ[idx_v_max[2]]
 z_v = underlying.z.cᵃᵃᶜ[idx_v_max[3]]
 
+# Calculate grid fractions and volume exceeding velocity thresholds
+total_cells = length(v_int_arr)
+n_v_gt05 = count(x -> abs(x) > 0.5, v_int_arr)
+n_v_gt1  = count(x -> abs(x) > 1.0, v_int_arr)
+n_v_gt2  = count(x -> abs(x) > 2.0, v_int_arr)
+n_v_gt5  = count(x -> abs(x) > 5.0, v_int_arr)
+
+n_u_gt05 = count(x -> abs(x) > 0.5, u_int_arr)
+n_u_gt1  = count(x -> abs(x) > 1.0, u_int_arr)
+n_u_gt2  = count(x -> abs(x) > 2.0, u_int_arr)
+n_u_gt5  = count(x -> abs(x) > 5.0, u_int_arr)
+
 println("\nPost-Spinup Diagnostic State:")
 @printf("  - Velocities : max|u| = %.4f m/s, max|v| = %.4f m/s, max|w| = %.2e m/s\n", u_max_post, v_max_post, w_max_post)
 @printf("  - Peak |u| Location: index (%d, %d, %d) -> (lon = %.2f°, lat = %.2f°, z = %.1f m)\n",
         idx_u_max[1], idx_u_max[2], idx_u_max[3], λ_u, φ_u, z_u)
 @printf("  - Peak |v| Location: index (%d, %d, %d) -> (lon = %.2f°, lat = %.2f°, z = %.1f m)\n",
         idx_v_max[1], idx_v_max[2], idx_v_max[3], λ_v, φ_v, z_v)
-@printf("  - Tracers    : T ∈ [%.2f, %.2f] °C, S ∈ [%.2f, %.2f] psu\n", T_min_post, T_max_post, S_min_post, S_max_post)
+println("\nVelocity Grid Distribution (Fraction of Total Domain):")
+@printf("  - |u| > 0.5 m/s : %8d / %d cells (%6.3f%%)\n", n_u_gt05, length(u_int_arr), 100.0 * n_u_gt05 / length(u_int_arr))
+@printf("  - |u| > 1.0 m/s : %8d / %d cells (%6.3f%%)\n", n_u_gt1,  length(u_int_arr), 100.0 * n_u_gt1  / length(u_int_arr))
+@printf("  - |u| > 2.0 m/s : %8d / %d cells (%6.3f%%)\n", n_u_gt2,  length(u_int_arr), 100.0 * n_u_gt2  / length(u_int_arr))
+@printf("  - |u| > 5.0 m/s : %8d / %d cells (%6.3f%%)\n", n_u_gt5,  length(u_int_arr), 100.0 * n_u_gt5  / length(u_int_arr))
+@printf("  - |v| > 0.5 m/s : %8d / %d cells (%6.3f%%)\n", n_v_gt05, total_cells, 100.0 * n_v_gt05 / total_cells)
+@printf("  - |v| > 1.0 m/s : %8d / %d cells (%6.3f%%)\n", n_v_gt1,  total_cells, 100.0 * n_v_gt1  / total_cells)
+@printf("  - |v| > 2.0 m/s : %8d / %d cells (%6.3f%%)\n", n_v_gt2,  total_cells, 100.0 * n_v_gt2  / total_cells)
+@printf("  - |v| > 5.0 m/s : %8d / %d cells (%6.3f%%)\n", n_v_gt5,  total_cells, 100.0 * n_v_gt5  / total_cells)
+@printf("\n  - Tracers    : T ∈ [%.2f, %.2f] °C, S ∈ [%.2f, %.2f] psu\n", T_min_post, T_max_post, S_min_post, S_max_post)
 @printf("  - Total NaNs : %d\n", nan_post)
 
 if nan_post > 0
