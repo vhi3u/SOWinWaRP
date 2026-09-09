@@ -22,6 +22,7 @@ using Oceananigans.BoundaryConditions: PerturbationAdvection
 using Oceananigans.OutputReaders: FieldTimeSeries, Cyclical
 using Oceananigans.Architectures: architecture, CPU, GPU, on_architecture
 using Oceananigans.Fields: interior, location, fill_halo_regions!
+using Oceananigans.ImmersedBoundaries: immersed_peripheral_node, immersed_cell
 using NumericalEarth
 using NumericalEarth.DataWrangling
 using NCDatasets
@@ -916,6 +917,70 @@ function boundary_slice_time_series(fts::FieldTimeSeries, side::Symbol)
     end
 end
 
+"""
+    mask_immersed_boundary_normal_flow!(bts, side, grid)
+
+Zero out prescribed normal boundary flow at any point where the boundary face or adjacent cell
+is immersed (solid bathymetry). This ensures open boundary conditions do not inject momentum
+directly into or across solid land walls.
+"""
+function mask_immersed_boundary_normal_flow!(bts, side, grid)
+    (bts === nothing || !(grid isa ImmersedBoundaryGrid)) && return bts
+    underlying = grid.underlying_grid
+    Nx, Ny, Nz = size(underlying)
+    masked_count = 0
+
+    if side === :west
+        # Normal velocity is u at i=1: (Face, Center, Center)
+        for j in 1:Ny, k in 1:Nz
+            if immersed_peripheral_node(1, j, k, grid, Face(), Center(), Center()) || immersed_cell(1, j, k, grid)
+                for t in 1:length(bts.times)
+                    bts[t][1, j, k] = 0.0
+                end
+                masked_count += 1
+            end
+        end
+    elseif side === :east
+        # Normal velocity is u at i=Nx+1: (Face, Center, Center)
+        for j in 1:Ny, k in 1:Nz
+            if immersed_peripheral_node(Nx + 1, j, k, grid, Face(), Center(), Center()) || immersed_cell(Nx, j, k, grid)
+                for t in 1:length(bts.times)
+                    bts[t][1, j, k] = 0.0
+                end
+                masked_count += 1
+            end
+        end
+    elseif side === :south
+        # Normal velocity is v at j=1: (Center, Face, Center)
+        for i in 1:Nx, k in 1:Nz
+            if immersed_peripheral_node(i, 1, k, grid, Center(), Face(), Center()) || immersed_cell(i, 1, k, grid)
+                for t in 1:length(bts.times)
+                    bts[t][i, 1, k] = 0.0
+                end
+                masked_count += 1
+            end
+        end
+    elseif side === :north
+        # Normal velocity is v at j=Ny+1: (Center, Face, Center)
+        for i in 1:Nx, k in 1:Nz
+            if immersed_peripheral_node(i, Ny + 1, k, grid, Center(), Face(), Center()) || immersed_cell(i, Ny, k, grid)
+                for t in 1:length(bts.times)
+                    bts[t][i, 1, k] = 0.0
+                end
+                masked_count += 1
+            end
+        end
+    end
+
+    if masked_count > 0
+        for t in 1:length(bts.times)
+            fill_halo_regions!(bts[t])
+        end
+        @info "Masked $masked_count immersed/solid face points to zero on $side normal boundary."
+    end
+    return bts
+end
+
 # ==============================================================================
 # 3. Surface Wind Stress Helper (Standalone)
 # ==============================================================================
@@ -1136,6 +1201,16 @@ function bsose_open_boundary_conditions(grid;
                 end
             end
         end
+    end
+
+    # Step 1: Zero out normal velocity components on immersed (solid bathymetry) boundary faces
+    # so that open boundaries do not force flow into or across solid land/bottom topography.
+    if grid isa ImmersedBoundaryGrid
+        @info "Masking normal boundary flow on immersed boundary faces..."
+        mask_immersed_boundary_normal_flow!(u_west, :west, grid)
+        mask_immersed_boundary_normal_flow!(u_east, :east, grid)
+        mask_immersed_boundary_normal_flow!(v_south, :south, grid)
+        mask_immersed_boundary_normal_flow!(v_north, :north, grid)
     end
 
     # Ensure all boundary slices match the grid architecture (e.g., GPU/CuArray)
