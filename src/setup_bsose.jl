@@ -1085,6 +1085,30 @@ function bsose_open_boundary_conditions(grid;
             top_v_cached = wind_bcs.v
         end
 
+        # Sanitize boundary velocity and tracer slices so bathymetric gaps are filled with nearby valid ocean values
+        for (bts, lo, hi) in ((u_west, -5.0, 5.0),
+                              (u_east, -5.0, 5.0),
+                              (u_south, -5.0, 5.0),
+                              (u_north, -5.0, 5.0),
+                              (v_west, -5.0, 5.0),
+                              (v_east, -5.0, 5.0),
+                              (v_south, -5.0, 5.0),
+                              (v_north, -5.0, 5.0),
+                              (T_west, T_MIN_PHYSICAL, T_MAX_PHYSICAL),
+                              (T_east, T_MIN_PHYSICAL, T_MAX_PHYSICAL),
+                              (T_south, T_MIN_PHYSICAL, T_MAX_PHYSICAL),
+                              (T_north, T_MIN_PHYSICAL, T_MAX_PHYSICAL),
+                              (S_west, S_MIN_PHYSICAL, S_MAX_PHYSICAL),
+                              (S_east, S_MIN_PHYSICAL, S_MAX_PHYSICAL),
+                              (S_south, S_MIN_PHYSICAL, S_MAX_PHYSICAL),
+                              (S_north, S_MIN_PHYSICAL, S_MAX_PHYSICAL))
+            if bts isa FieldTimeSeries
+                for t in 1:length(bts.times)
+                    fill_bathymetry_gaps!(parent(bts[t]), lo, hi)
+                end
+            end
+        end
+
         # Save all boundary conditions together into ONE single dataset
         if cache
             @info "Saving all boundary conditions together into single dataset: $dataset_path"
@@ -1115,7 +1139,6 @@ function bsose_open_boundary_conditions(grid;
         end
     end
 
-
     # 3. Top boundary condition (surface wind stress)
     top_u_bc = FluxBoundaryCondition(nothing)
     top_v_bc = FluxBoundaryCondition(nothing)
@@ -1136,21 +1159,6 @@ function bsose_open_boundary_conditions(grid;
         @info " -> Surface wind stress is DISABLED (top boundary is no-flux)."
     end
 
-    # Sanitize boundary tracer slices so bathymetric gaps are filled with nearby valid ocean values
-    for (bts, lo, hi) in ((T_west, T_MIN_PHYSICAL, T_MAX_PHYSICAL),
-                          (T_east, T_MIN_PHYSICAL, T_MAX_PHYSICAL),
-                          (T_south, T_MIN_PHYSICAL, T_MAX_PHYSICAL),
-                          (T_north, T_MIN_PHYSICAL, T_MAX_PHYSICAL),
-                          (S_west, S_MIN_PHYSICAL, S_MAX_PHYSICAL),
-                          (S_east, S_MIN_PHYSICAL, S_MAX_PHYSICAL),
-                          (S_south, S_MIN_PHYSICAL, S_MAX_PHYSICAL),
-                          (S_north, S_MIN_PHYSICAL, S_MAX_PHYSICAL))
-        if bts isa FieldTimeSeries
-            for t in 1:length(bts.times)
-                fill_bathymetry_gaps!(parent(bts[t]), lo, hi)
-            end
-        end
-    end
 
     # 4. Construct FieldBoundaryConditions
     # Note: On East/West boundaries, normal velocity is u (NormalFlow), tangential is v (Value).
@@ -1338,6 +1346,15 @@ function bsose_initial_conditions!(model;
         set!(model; u=u_init, v=v_init, T=T_init, S=S_init)
     else
         set!(model; T=T_init, S=S_init)
+    end
+
+    if velocities
+        fill_bathymetry_gaps!(parent(model.velocities.u), -5.0, 5.0)
+        fill_bathymetry_gaps!(parent(model.velocities.v), -5.0, 5.0)
+        fill_halo_regions!(model.velocities.u, model.clock, fields(model))
+        fill_halo_regions!(model.velocities.v, model.clock, fields(model))
+        fill_bathymetry_gaps!(parent(model.velocities.u), -5.0, 5.0)
+        fill_bathymetry_gaps!(parent(model.velocities.v), -5.0, 5.0)
     end
 
     # Propagate valid ocean values into bathymetry discrepancies / deep slope trenches
