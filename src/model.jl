@@ -130,8 +130,9 @@ dates = (start_date, end_date)
 # ==============================================================================
 
 if OBCS && DATASET == "BSOSE"
-    @info "Configuring BSOSE Open Boundary Conditions..."
-    boundary_conditions = bsose_open_boundary_conditions(grid; dataset=dataset, dates=dates, winds=WINDS)
+    @info "Configuring BSOSE Open Boundary Conditions with PerturbationAdvection..."
+    obc_scheme = PerturbationAdvection(inflow_timescale=1days, outflow_timescale=3hours)
+    boundary_conditions = bsose_open_boundary_conditions(grid; dataset=dataset, dates=dates, winds=WINDS, scheme=obc_scheme)
 
     if SPONGE_LAYERS
         @info "Configuring boundary edge sponge layers (3.0° width, 5-day restoring timescale)..."
@@ -158,10 +159,9 @@ else
 end
 
 vertical_closure = NumericalEarth.Oceans.default_ocean_closure()
-# Note: IsopycnalSkewSymmetricDiffusivity does not support ImmersedBoundaryGrid and causes
-# division by zero / slope blowup across immersed topographic cells.
-# NumericalEarth's default CATKE closure combined with WENO advection provides stable mixing.
-closures = vertical_closure
+# Horizontal scalar diffusivity to damp grid-scale shear and stabilize boundary transitions
+horizontal_closure = HorizontalScalarDiffusivity(ν=100.0, κ=100.0)
+closures = (vertical_closure, horizontal_closure)
 
 # build the ocean model
 
