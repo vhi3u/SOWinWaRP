@@ -926,16 +926,22 @@ directly into or across solid land walls.
 """
 function mask_immersed_boundary_normal_flow!(bts, side, grid)
     (bts === nothing || !(grid isa ImmersedBoundaryGrid)) && return bts
-    underlying = grid.underlying_grid
+
+    # If grid or bts is on GPU, transfer to CPU for indexing and mask evaluation to avoid scalar GPU indexing
+    arch_bts = architecture(bts)
+    cpu_grid = architecture(grid) isa GPU ? on_architecture(CPU(), grid) : grid
+    cpu_bts = arch_bts isa GPU ? on_architecture(CPU(), bts) : bts
+
+    underlying = cpu_grid.underlying_grid
     Nx, Ny, Nz = size(underlying)
     masked_count = 0
 
     if side === :west
         # Normal velocity is u at i=1: (Face, Center, Center)
         for j in 1:Ny, k in 1:Nz
-            if immersed_peripheral_node(1, j, k, grid, Face(), Center(), Center()) || immersed_cell(1, j, k, grid)
-                for t in 1:length(bts.times)
-                    bts[t][1, j, k] = 0.0
+            if immersed_peripheral_node(1, j, k, cpu_grid, Face(), Center(), Center()) || immersed_cell(1, j, k, cpu_grid)
+                for t in 1:length(cpu_bts.times)
+                    cpu_bts[t][1, j, k] = 0.0
                 end
                 masked_count += 1
             end
@@ -943,9 +949,9 @@ function mask_immersed_boundary_normal_flow!(bts, side, grid)
     elseif side === :east
         # Normal velocity is u at i=Nx+1: (Face, Center, Center)
         for j in 1:Ny, k in 1:Nz
-            if immersed_peripheral_node(Nx + 1, j, k, grid, Face(), Center(), Center()) || immersed_cell(Nx, j, k, grid)
-                for t in 1:length(bts.times)
-                    bts[t][1, j, k] = 0.0
+            if immersed_peripheral_node(Nx + 1, j, k, cpu_grid, Face(), Center(), Center()) || immersed_cell(Nx, j, k, cpu_grid)
+                for t in 1:length(cpu_bts.times)
+                    cpu_bts[t][1, j, k] = 0.0
                 end
                 masked_count += 1
             end
@@ -953,9 +959,9 @@ function mask_immersed_boundary_normal_flow!(bts, side, grid)
     elseif side === :south
         # Normal velocity is v at j=1: (Center, Face, Center)
         for i in 1:Nx, k in 1:Nz
-            if immersed_peripheral_node(i, 1, k, grid, Center(), Face(), Center()) || immersed_cell(i, 1, k, grid)
-                for t in 1:length(bts.times)
-                    bts[t][i, 1, k] = 0.0
+            if immersed_peripheral_node(i, 1, k, cpu_grid, Center(), Face(), Center()) || immersed_cell(i, 1, k, cpu_grid)
+                for t in 1:length(cpu_bts.times)
+                    cpu_bts[t][i, 1, k] = 0.0
                 end
                 masked_count += 1
             end
@@ -963,9 +969,9 @@ function mask_immersed_boundary_normal_flow!(bts, side, grid)
     elseif side === :north
         # Normal velocity is v at j=Ny+1: (Center, Face, Center)
         for i in 1:Nx, k in 1:Nz
-            if immersed_peripheral_node(i, Ny + 1, k, grid, Center(), Face(), Center()) || immersed_cell(i, Ny, k, grid)
-                for t in 1:length(bts.times)
-                    bts[t][i, 1, k] = 0.0
+            if immersed_peripheral_node(i, Ny + 1, k, cpu_grid, Center(), Face(), Center()) || immersed_cell(i, Ny, k, cpu_grid)
+                for t in 1:length(cpu_bts.times)
+                    cpu_bts[t][i, 1, k] = 0.0
                 end
                 masked_count += 1
             end
@@ -973,12 +979,13 @@ function mask_immersed_boundary_normal_flow!(bts, side, grid)
     end
 
     if masked_count > 0
-        for t in 1:length(bts.times)
-            fill_halo_regions!(bts[t])
+        for t in 1:length(cpu_bts.times)
+            fill_halo_regions!(cpu_bts[t])
         end
         @info "Masked $masked_count immersed/solid face points to zero on $side normal boundary."
     end
-    return bts
+
+    return arch_bts isa GPU ? on_architecture(arch_bts, cpu_bts) : cpu_bts
 end
 
 # ==============================================================================
@@ -1207,10 +1214,10 @@ function bsose_open_boundary_conditions(grid;
     # so that open boundaries do not force flow into or across solid land/bottom topography.
     if grid isa ImmersedBoundaryGrid
         @info "Masking normal boundary flow on immersed boundary faces..."
-        mask_immersed_boundary_normal_flow!(u_west, :west, grid)
-        mask_immersed_boundary_normal_flow!(u_east, :east, grid)
-        mask_immersed_boundary_normal_flow!(v_south, :south, grid)
-        mask_immersed_boundary_normal_flow!(v_north, :north, grid)
+        u_west = mask_immersed_boundary_normal_flow!(u_west, :west, grid)
+        u_east = mask_immersed_boundary_normal_flow!(u_east, :east, grid)
+        v_south = mask_immersed_boundary_normal_flow!(v_south, :south, grid)
+        v_north = mask_immersed_boundary_normal_flow!(v_north, :north, grid)
     end
 
     # Ensure all boundary slices match the grid architecture (e.g., GPU/CuArray)
