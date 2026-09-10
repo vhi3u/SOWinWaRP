@@ -317,15 +317,15 @@ w_int_arr = Array(interior(ocean.model.velocities.w))
 idx_v_max = argmax(abs.(v_int_arr))
 idx_u_max = argmax(abs.(u_int_arr))
 
-# Retrieve physical coordinates
-underlying = grid isa ImmersedBoundaryGrid ? grid.underlying_grid : grid
-λ_u = underlying.λᶠᵃᵃ[idx_u_max[1]]
-φ_u = underlying.φᵃᶜᵃ[idx_u_max[2]]
-z_u = underlying.z.cᵃᵃᶜ[idx_u_max[3]]
+# Retrieve physical coordinates (using CPU grid to avoid GPU scalar indexing)
+cpu_underlying = on_architecture(CPU(), grid isa ImmersedBoundaryGrid ? grid.underlying_grid : grid)
+λ_u = Oceananigans.Grids.λnode(idx_u_max[1], idx_u_max[2], idx_u_max[3], cpu_underlying, Face(), Center(), Center())
+φ_u = Oceananigans.Grids.φnode(idx_u_max[1], idx_u_max[2], idx_u_max[3], cpu_underlying, Face(), Center(), Center())
+z_u = Oceananigans.Grids.znode(idx_u_max[1], idx_u_max[2], idx_u_max[3], cpu_underlying, Face(), Center(), Center())
 
-λ_v = underlying.λᶜᵃᵃ[idx_v_max[1]]
-φ_v = underlying.φᵃᶠᵃ[idx_v_max[2]]
-z_v = underlying.z.cᵃᵃᶜ[idx_v_max[3]]
+λ_v = Oceananigans.Grids.λnode(idx_v_max[1], idx_v_max[2], idx_v_max[3], cpu_underlying, Center(), Face(), Center())
+φ_v = Oceananigans.Grids.φnode(idx_v_max[1], idx_v_max[2], idx_v_max[3], cpu_underlying, Center(), Face(), Center())
+z_v = Oceananigans.Grids.znode(idx_v_max[1], idx_v_max[2], idx_v_max[3], cpu_underlying, Center(), Face(), Center())
 
 # Calculate grid fractions and volume exceeding velocity thresholds
 total_cells = length(v_int_arr)
