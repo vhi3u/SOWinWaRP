@@ -43,6 +43,27 @@ for t in 1:Nt
 end
 close(ds)
 
+# Scan dynamic colorbar limits directly from valid (non-NaN) data
+valid_T = filter(!isnan, T_data)
+valid_S = filter(!isnan, S_data)
+valid_u = filter(!isnan, u_data)
+valid_v = filter(!isnan, v_data)
+
+T_lims = isempty(valid_T) ? (-2.0, 20.0) : (floor(minimum(valid_T) * 10) / 10, ceil(maximum(valid_T) * 10) / 10)
+S_lims = isempty(valid_S) ? (32.5, 35.5) : (floor(minimum(valid_S) * 10) / 10, ceil(maximum(valid_S) * 10) / 10)
+
+# For velocities with diverging colormap (:balance), use symmetric bounds around zero
+max_u = isempty(valid_u) ? 0.6 : ceil(maximum(abs, valid_u) * 10) / 10
+max_v = isempty(valid_v) ? 0.4 : ceil(maximum(abs, valid_v) * 10) / 10
+u_lims = (-max_u, max_u)
+v_lims = (-max_v, max_v)
+
+println("Dynamic Colorbar Limits Scanned from Data:")
+println("  - Temperature (T) : $T_lims °C")
+println("  - Salinity (S)    : $S_lims PSU")
+println("  - Zonal vel (u)   : $u_lims m/s")
+println("  - Merid vel (v)   : $v_lims m/s")
+
 # ── Figure Layout: 2x2 grid following animate_bsose.jl style ────────────────
 fig = Figure(size=(1400, 950), fontsize=14)
 t_idx = Observable(1)
@@ -62,23 +83,23 @@ lat_bounds = (minimum(lat), maximum(lat))
 # Row 1: Surface Temperature & Surface Salinity
 ax1 = Axis(fig[1, 1], title="Surface Temperature", xlabel="Longitude (°E)", ylabel="Latitude (°N)",
     limits=(lon_bounds[1], lon_bounds[2], lat_bounds[1], lat_bounds[2]))
-hm1 = heatmap!(ax1, lon, lat, surf_T, colormap=:thermal, colorrange=(-2.0, 20.0), nan_color=:gray30)
+hm1 = heatmap!(ax1, lon, lat, surf_T, colormap=:thermal, colorrange=T_lims, nan_color=:gray30)
 Colorbar(fig[1, 2], hm1, label="°C")
 
 ax2 = Axis(fig[1, 3], title="Surface Salinity", xlabel="Longitude (°E)", ylabel="Latitude (°N)",
     limits=(lon_bounds[1], lon_bounds[2], lat_bounds[1], lat_bounds[2]))
-hm2 = heatmap!(ax2, lon, lat, surf_S, colormap=:haline, colorrange=(32.5, 35.5), nan_color=:gray30)
+hm2 = heatmap!(ax2, lon, lat, surf_S, colormap=:haline, colorrange=S_lims, nan_color=:gray30)
 Colorbar(fig[1, 4], hm2, label="PSU")
 
 # Row 2: Surface Zonal Velocity (u) & Surface Meridional Velocity (v)
 ax3 = Axis(fig[2, 1], title="Surface Zonal Velocity (u)", xlabel="Longitude (°E)", ylabel="Latitude (°N)",
     limits=(lon_bounds[1], lon_bounds[2], lat_bounds[1], lat_bounds[2]))
-hm3 = heatmap!(ax3, lon, lat, surf_u, colormap=:balance, colorrange=(-0.6, 0.6), nan_color=:gray30)
+hm3 = heatmap!(ax3, lon, lat, surf_u, colormap=:balance, colorrange=u_lims, nan_color=:gray30)
 Colorbar(fig[2, 2], hm3, label="m/s")
 
 ax4 = Axis(fig[2, 3], title="Surface Meridional Velocity (v)", xlabel="Longitude (°E)", ylabel="Latitude (°N)",
     limits=(lon_bounds[1], lon_bounds[2], lat_bounds[1], lat_bounds[2]))
-hm4 = heatmap!(ax4, lon, lat, surf_v, colormap=:balance, colorrange=(-0.4, 0.4), nan_color=:gray30)
+hm4 = heatmap!(ax4, lon, lat, surf_v, colormap=:balance, colorrange=v_lims, nan_color=:gray30)
 Colorbar(fig[2, 4], hm4, label="m/s")
 
 println("Recording animation to $output (framerate = $framerate fps)...")
