@@ -40,7 +40,7 @@ const WINDS = false # time-varying surface wind forcing from BSOSE data (oceTAUX
 const CHECKPOINTS = false # save state and restart if the model crashes. If false, the model will start from scratch. 
 
 # domain related parameters
-const SCALING = 3 # horizontal resolution = 1 / SCALING degrees. 1/6 = ~15km, 1/2 = 50km
+const SCALING = 6 # horizontal resolution = 1 / SCALING degrees. 1/6 = ~15km, 1/2 = 50km
 const DZ_SURFACE = 2 # m 
 const DZ_BOTTOM = 200 # m
 const CIRCUMPOLAR = false # if true, we will use a circumpolar domain
@@ -160,8 +160,10 @@ end
 
 vertical_closure = NumericalEarth.Oceans.default_ocean_closure()
 # Horizontal scalar diffusivity to damp grid-scale shear and stabilize boundary transitions
-horizontal_closure = HorizontalScalarDiffusivity(ν=100.0, κ=100.0)
-closures = (vertical_closure, horizontal_closure)
+# horizontal_closure = HorizontalScalarDiffusivity(ν=100.0, κ=100.0)
+# closures = (vertical_closure, horizontal_closure)
+closures = vertical_closure
+
 
 # build the ocean model
 
@@ -207,18 +209,18 @@ stop_iteration = haskey(ENV, "STOP_ITERATION") ? parse(Int, ENV["STOP_ITERATION"
 simulation = Simulation(ocean.model, Δt=1seconds, stop_time=stop_time, stop_iteration=stop_iteration)
 
 # adaptive timestep wizard based on CFL (following mediterranean.jl: cfl=0.2, max_change=1.1)
-wizard = TimeStepWizard(cfl=0.4, max_Δt=1hours, max_change=1.1, min_Δt=0.1)
-simulation.callbacks[:wizard] = Callback(wizard, IterationInterval(10))
+wizard = TimeStepWizard(cfl=0.4)
+simulation.callbacks[:wizard] = Callback(wizard, TimeInterval(1days))
 
 # Safety callback: clamp salinity/temperature to physically valid ranges before each time step.
 # Operates on parent() to cover all cells including halos and immersed cells.
 # Prevents DomainError in TEOS10's sqrt(S) from any numerical noise that accumulates
 # in boundary-adjacent or immersed cells during time stepping.
-function clamp_salinity!(sim)
-    clamp!(parent(sim.model.tracers.S), S_MIN_PHYSICAL, S_MAX_PHYSICAL)
-    clamp!(parent(sim.model.tracers.T), T_MIN_PHYSICAL, T_MAX_PHYSICAL)
-end
-simulation.callbacks[:clamp_S] = Callback(clamp_salinity!, IterationInterval(1))
+# function clamp_salinity!(sim)
+#     clamp!(parent(sim.model.tracers.S), S_MIN_PHYSICAL, S_MAX_PHYSICAL)
+#     clamp!(parent(sim.model.tracers.T), T_MIN_PHYSICAL, T_MAX_PHYSICAL)
+# end
+# simulation.callbacks[:clamp_S] = Callback(clamp_salinity!, IterationInterval(1))
 
 # progress logger: Oceanostics TimedMessenger reports wall-clock timing,
 # max velocities and CFL/diffusive stability numbers each interval.
