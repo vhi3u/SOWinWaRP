@@ -13,6 +13,7 @@ using Printf
 using Statistics: mean
 using SeawaterPolynomials
 using Oceananigans.TurbulenceClosures
+using Oceananigans.BoundaryConditions: PerturbationAdvection, NormalRadiation
 using Oceanostics.ProgressMessengers: TimedMessenger
 
 # Include our BSOSE helper module
@@ -130,8 +131,22 @@ dates = (start_date, end_date)
 # ==============================================================================
 
 if OBCS && DATASET == "BSOSE"
-    @info "Configuring BSOSE Open Boundary Conditions (prescribed boundary values)..."
-    obc_scheme = nothing
+    @info "Configuring BSOSE Open Boundary Conditions with radiation scheme..."
+    # In an open-ocean regional domain with strong outflow (ACC carrying ~130 Sv eastward through 150°E),
+    # rigid Dirichlet boundaries reflect outgoing eddies and waves, leading to tracer blowup at the boundary.
+    # PerturbationAdvection / NormalRadiation with outflow_timescale=Inf allows internal waves/eddies to freely
+    # radiate out of the domain, while inflow_timescale=1days nudges incoming boundary flow (West) smoothly to BSOSE.
+    obc_scheme_type = get(ENV, "OBC_SCHEME", "PerturbationAdvection")
+    obc_scheme = if obc_scheme_type == "PerturbationAdvection"
+        PerturbationAdvection(inflow_timescale = 1days, outflow_timescale = Inf)
+    elseif obc_scheme_type == "NormalRadiation"
+        NormalRadiation(inflow_timescale = 1days, outflow_timescale = Inf)
+    elseif obc_scheme_type == "clamped" || obc_scheme_type == "none"
+        nothing
+    else
+        error("Unknown OBC_SCHEME: $obc_scheme_type. Choose 'PerturbationAdvection', 'NormalRadiation', or 'clamped'.")
+    end
+    @info "  -> OBC Scheme: $(obc_scheme === nothing ? "Clamped Dirichlet" : summary(obc_scheme))"
     boundary_conditions = bsose_open_boundary_conditions(grid; dataset=dataset, dates=dates, winds=WINDS, scheme=obc_scheme)
 
     if SPONGE_LAYERS
@@ -158,11 +173,26 @@ else
     forcings = NamedTuple()
 end
 
+# Turbulence closures:
+# 1. Vertical: CATKE / default NumericalEarth vertical closure
 vertical_closure = NumericalEarth.Oceans.default_ocean_closure()
-# Horizontal scalar diffusivity to damp grid-scale shear and stabilize boundary transitions
-# horizontal_closure = HorizontalScalarDiffusivity(ν=100.0, κ=100.0)
-# closures = (vertical_closure, horizontal_closure)
-closures = vertical_closure
+
+# 2. Horizontal: Dissipate grid-scale enstrophy and stabilize boundary shear without
+# over-damping physical mesoscale eddies. Biharmonic diffusivity (∇⁴) is standard for
+# eddy-permitting resolutions (~1/6°). Harmonic diffusivity can also be selected.
+horizontal_closure_type = get(ENV, "HORIZONTAL_CLOSURE", "biharmonic")
+horizontal_closure = if horizontal_closure_type == "biharmonic"
+    HorizontalScalarBiharmonicDiffusivity(ν=1e10, κ=1e10)
+elseif horizontal_closure_type == "harmonic"
+    HorizontalScalarDiffusivity(ν=100.0, κ=100.0)
+elseif horizontal_closure_type == "none"
+    nothing
+else
+    error("Unknown HORIZONTAL_CLOSURE: $horizontal_closure_type. Choose 'biharmonic', 'harmonic', or 'none'.")
+end
+
+closures = horizontal_closure !== nothing ? (vertical_closure, horizontal_closure) : vertical_closure
+@info "Turbulence closures: $(summary(closures))"
 
 
 # build the ocean model

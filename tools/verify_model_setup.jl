@@ -24,7 +24,7 @@ using Oceananigans
 using Oceananigans.Units
 using Oceananigans.Grids
 using Oceananigans.BoundaryConditions
-using Oceananigans.BoundaryConditions: PerturbationAdvection
+using Oceananigans.BoundaryConditions: PerturbationAdvection, NormalRadiation
 using Oceananigans.OutputReaders: FieldTimeSeries
 using Oceananigans.Fields: interior, location, fill_halo_regions!
 using Oceananigans.TurbulenceClosures
@@ -126,9 +126,18 @@ println("  ✓ ImmersedBoundaryGrid created successfully.")
 dataset = BSOSEMonthly()
 
 println("\n[1/4] Configuring Boundary Conditions & Forcings (matching model.jl)...")
-obc_scheme = nothing
+obc_scheme_type = get(ENV, "OBC_SCHEME", "PerturbationAdvection")
+obc_scheme = if obc_scheme_type == "PerturbationAdvection"
+    PerturbationAdvection(inflow_timescale = 1days, outflow_timescale = Inf)
+elseif obc_scheme_type == "NormalRadiation"
+    NormalRadiation(inflow_timescale = 1days, outflow_timescale = Inf)
+elseif obc_scheme_type == "clamped" || obc_scheme_type == "none"
+    nothing
+else
+    error("Unknown OBC_SCHEME: $obc_scheme_type. Choose 'PerturbationAdvection', 'NormalRadiation', or 'clamped'.")
+end
 boundary_conditions = bsose_open_boundary_conditions(grid; dataset=dataset, dates=dates, winds=WINDS, scheme=obc_scheme)
-println("  ✓ Open boundary conditions constructed.")
+println("  ✓ Open boundary conditions constructed (Scheme: $(obc_scheme === nothing ? "Clamped Dirichlet" : summary(obc_scheme))).")
 
 if SPONGE_LAYERS
     forcings = bsose_sponge_layer_forcing(grid; dataset=dataset, dates=dates, sponge_width=3.0, timescale=5days, restore_velocities=true)
@@ -138,8 +147,17 @@ else
 end
 
 vertical_closure = NumericalEarth.Oceans.default_ocean_closure()
-horizontal_closure = HorizontalScalarDiffusivity(ν=100.0, κ=100.0)
-closures = (vertical_closure, horizontal_closure)
+horizontal_closure_type = get(ENV, "HORIZONTAL_CLOSURE", "biharmonic")
+horizontal_closure = if horizontal_closure_type == "biharmonic"
+    HorizontalScalarBiharmonicDiffusivity(ν=1e10, κ=1e10)
+elseif horizontal_closure_type == "harmonic"
+    HorizontalScalarDiffusivity(ν=100.0, κ=100.0)
+elseif horizontal_closure_type == "none"
+    nothing
+else
+    error("Unknown HORIZONTAL_CLOSURE: $horizontal_closure_type. Choose 'biharmonic', 'harmonic', or 'none'.")
+end
+closures = horizontal_closure !== nothing ? (vertical_closure, horizontal_closure) : vertical_closure
 
 # ------------------------------------------------------------------------------
 # 3. Model Assembly & Initial Conditions
@@ -243,7 +261,7 @@ import SeawaterPolynomials.TEOS10 as TEOS10_mod
     @inline s(Sᴬ::FT) where FT = √(max((Sᴬ + FT(ΔS)) / FT(Sₐᵤ), zero(FT)))
 end
 
-SPINUP_TIME = 2days
+SPINUP_TIME = haskey(ENV, "SPINUP_TIME") ? parse(Float64, ENV["SPINUP_TIME"]) : 2days
 simulation = Simulation(ocean.model, Δt=1seconds, stop_time=SPINUP_TIME)
 
 # Adaptive timestep wizard matching model.jl

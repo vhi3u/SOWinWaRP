@@ -18,7 +18,7 @@ using Oceananigans.Units
 using Oceananigans.Grids
 using Oceananigans.Grids: topology
 using Oceananigans.BoundaryConditions
-using Oceananigans.BoundaryConditions: PerturbationAdvection
+using Oceananigans.BoundaryConditions: PerturbationAdvection, NormalRadiation
 using Oceananigans.OutputReaders: FieldTimeSeries, Cyclical
 using Oceananigans.Architectures: architecture, CPU, GPU, on_architecture
 using Oceananigans.Fields: interior, location, fill_halo_regions!
@@ -1045,10 +1045,10 @@ open boundary conditions from BSOSE.
 - `grid`: The simulation `LatitudeLongitudeGrid`.
 - `dataset`: `BSOSEMonthly()` instance.
 - `dates`: Range or collection of dates for open boundary forcing.
-- `scheme`: Matching scheme for the open boundaries. Defaults to `nothing`, which
-            imposes the prescribed BSOSE values directly. `PerturbationAdvection()`
-            is NOT usable here: it drives the boundary faces to several times the
-            prescribed velocity and the run goes to NaN within four time steps.
+- `scheme`: Matching scheme for the open boundaries. Defaults to `nothing` (clamped Dirichlet).
+            Can be an `OpenBoundaryScheme` such as `PerturbationAdvection(inflow_timescale=1days, outflow_timescale=Inf)`
+            or `NormalRadiation(inflow_timescale=1days, outflow_timescale=Inf)` to allow interior waves/eddies
+            to radiate cleanly out of outflow boundaries (e.g. the eastern ACC outflow) without reflection.
 - `winds`: Surface wind forcing. Options:
            - `nothing` or `false` (default): Disables surface wind forcing (no-flux top boundary).
            - `true`: Automatically calls `bsose_surface_wind_stress` and applies top flux.
@@ -1270,8 +1270,8 @@ function bsose_open_boundary_conditions(grid;
     if is_x_periodic
         @info " -> Longitude is Periodic (circumpolar): applying South & North boundary conditions."
         u_bcs = FieldBoundaryConditions(
-            south=ValueBoundaryCondition(u_south; scheme),
-            north=ValueBoundaryCondition(u_north; scheme),
+            south=ValueBoundaryCondition(u_south),
+            north=ValueBoundaryCondition(u_north),
             top=top_u_bc
         )
 
@@ -1296,14 +1296,14 @@ function bsose_open_boundary_conditions(grid;
         u_bcs = FieldBoundaryConditions(
             west=NormalFlowBoundaryCondition(u_west; scheme),
             east=NormalFlowBoundaryCondition(u_east; scheme),
-            south=ValueBoundaryCondition(u_south; scheme),
-            north=ValueBoundaryCondition(u_north; scheme),
+            south=ValueBoundaryCondition(u_south),
+            north=ValueBoundaryCondition(u_north),
             top=top_u_bc
         )
 
         v_bcs = FieldBoundaryConditions(
-            west=ValueBoundaryCondition(v_west; scheme),
-            east=ValueBoundaryCondition(v_east; scheme),
+            west=ValueBoundaryCondition(v_west),
+            east=ValueBoundaryCondition(v_east),
             south=NormalFlowBoundaryCondition(v_south; scheme),
             north=NormalFlowBoundaryCondition(v_north; scheme),
             top=top_v_bc
