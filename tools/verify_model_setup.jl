@@ -73,7 +73,7 @@ const DATASET = "BSOSE"
 φ₁, φ₂ = (-70.0, -40.0)
 
 if arch isa GPU
-    SCALING = 3 # 1/3 degree horizontal resolution
+    SCALING = 6 # 1/3 degree horizontal resolution
     Nx = Int(SCALING * (λ₂ - λ₁))
     Ny = Int(SCALING * (φ₂ - φ₁))
     z = ReferenceToStretchedDiscretization(; extent=5800,
@@ -128,9 +128,9 @@ dataset = BSOSEMonthly()
 println("\n[1/4] Configuring Boundary Conditions & Forcings (matching model.jl)...")
 obc_scheme_type = get(ENV, "OBC_SCHEME", "PerturbationAdvection")
 obc_scheme = if obc_scheme_type == "PerturbationAdvection"
-    PerturbationAdvection(inflow_timescale = 1days, outflow_timescale = Inf)
+    PerturbationAdvection(inflow_timescale=1days, outflow_timescale=Inf)
 elseif obc_scheme_type == "NormalRadiation"
-    NormalRadiation(inflow_timescale = 1days, outflow_timescale = Inf)
+    NormalRadiation(inflow_timescale=1days, outflow_timescale=Inf)
 elseif obc_scheme_type == "clamped" || obc_scheme_type == "none"
     nothing
 else
@@ -273,23 +273,23 @@ function log_progress(sim)
     u_int = interior(sim.model.velocities.u)
     v_int = interior(sim.model.velocities.v)
     w_int = interior(sim.model.velocities.w)
-    
+
     u_curr = maximum(abs, u_int)
     v_curr = maximum(abs, v_int)
     w_curr = maximum(abs, w_int)
-    
+
     # Locate where peak |v| and |u| occur (CPU index conversion)
     v_cpu = Array(v_int)
     u_cpu = Array(u_int)
     idx_v = argmax(abs.(v_cpu))
     idx_u = argmax(abs.(u_cpu))
-    
+
     # Count how many cells exceed thresholds
     n_v_gt1 = count(x -> abs(x) > 1.0, v_cpu)
     n_v_gt2 = count(x -> abs(x) > 2.0, v_cpu)
     n_v_gt5 = count(x -> abs(x) > 5.0, v_cpu)
     pct_v_gt1 = 100.0 * n_v_gt1 / length(v_cpu)
-    
+
     t_days = sim.model.clock.time / 86400
     @printf("  [Spinup] Iter: %6d | Time: %6.2f / %.1fd | Δt: %6.2fs | max|u|: %6.4f (%d,%d,%d) | max|v|: %6.4f (%d,%d,%d) | |v|>1: %d (%.3f%%), >5: %d\n",
         sim.model.clock.iteration, t_days, SPINUP_TIME / 86400, sim.Δt,
@@ -348,30 +348,30 @@ z_v = Oceananigans.Grids.znode(idx_v_max[1], idx_v_max[2], idx_v_max[3], cpu_und
 # Calculate grid fractions and volume exceeding velocity thresholds
 total_cells = length(v_int_arr)
 n_v_gt05 = count(x -> abs(x) > 0.5, v_int_arr)
-n_v_gt1  = count(x -> abs(x) > 1.0, v_int_arr)
-n_v_gt2  = count(x -> abs(x) > 2.0, v_int_arr)
-n_v_gt5  = count(x -> abs(x) > 5.0, v_int_arr)
+n_v_gt1 = count(x -> abs(x) > 1.0, v_int_arr)
+n_v_gt2 = count(x -> abs(x) > 2.0, v_int_arr)
+n_v_gt5 = count(x -> abs(x) > 5.0, v_int_arr)
 
 n_u_gt05 = count(x -> abs(x) > 0.5, u_int_arr)
-n_u_gt1  = count(x -> abs(x) > 1.0, u_int_arr)
-n_u_gt2  = count(x -> abs(x) > 2.0, u_int_arr)
-n_u_gt5  = count(x -> abs(x) > 5.0, u_int_arr)
+n_u_gt1 = count(x -> abs(x) > 1.0, u_int_arr)
+n_u_gt2 = count(x -> abs(x) > 2.0, u_int_arr)
+n_u_gt5 = count(x -> abs(x) > 5.0, u_int_arr)
 
 println("\nPost-Spinup Diagnostic State:")
 @printf("  - Velocities : max|u| = %.4f m/s, max|v| = %.4f m/s, max|w| = %.2e m/s\n", u_max_post, v_max_post, w_max_post)
 @printf("  - Peak |u| Location: index (%d, %d, %d) -> (lon = %.2f°, lat = %.2f°, z = %.1f m)\n",
-        idx_u_max[1], idx_u_max[2], idx_u_max[3], λ_u, φ_u, z_u)
+    idx_u_max[1], idx_u_max[2], idx_u_max[3], λ_u, φ_u, z_u)
 @printf("  - Peak |v| Location: index (%d, %d, %d) -> (lon = %.2f°, lat = %.2f°, z = %.1f m)\n",
-        idx_v_max[1], idx_v_max[2], idx_v_max[3], λ_v, φ_v, z_v)
+    idx_v_max[1], idx_v_max[2], idx_v_max[3], λ_v, φ_v, z_v)
 println("\nVelocity Grid Distribution (Fraction of Total Domain):")
 @printf("  - |u| > 0.5 m/s : %8d / %d cells (%6.3f%%)\n", n_u_gt05, length(u_int_arr), 100.0 * n_u_gt05 / length(u_int_arr))
-@printf("  - |u| > 1.0 m/s : %8d / %d cells (%6.3f%%)\n", n_u_gt1,  length(u_int_arr), 100.0 * n_u_gt1  / length(u_int_arr))
-@printf("  - |u| > 2.0 m/s : %8d / %d cells (%6.3f%%)\n", n_u_gt2,  length(u_int_arr), 100.0 * n_u_gt2  / length(u_int_arr))
-@printf("  - |u| > 5.0 m/s : %8d / %d cells (%6.3f%%)\n", n_u_gt5,  length(u_int_arr), 100.0 * n_u_gt5  / length(u_int_arr))
+@printf("  - |u| > 1.0 m/s : %8d / %d cells (%6.3f%%)\n", n_u_gt1, length(u_int_arr), 100.0 * n_u_gt1 / length(u_int_arr))
+@printf("  - |u| > 2.0 m/s : %8d / %d cells (%6.3f%%)\n", n_u_gt2, length(u_int_arr), 100.0 * n_u_gt2 / length(u_int_arr))
+@printf("  - |u| > 5.0 m/s : %8d / %d cells (%6.3f%%)\n", n_u_gt5, length(u_int_arr), 100.0 * n_u_gt5 / length(u_int_arr))
 @printf("  - |v| > 0.5 m/s : %8d / %d cells (%6.3f%%)\n", n_v_gt05, total_cells, 100.0 * n_v_gt05 / total_cells)
-@printf("  - |v| > 1.0 m/s : %8d / %d cells (%6.3f%%)\n", n_v_gt1,  total_cells, 100.0 * n_v_gt1  / total_cells)
-@printf("  - |v| > 2.0 m/s : %8d / %d cells (%6.3f%%)\n", n_v_gt2,  total_cells, 100.0 * n_v_gt2  / total_cells)
-@printf("  - |v| > 5.0 m/s : %8d / %d cells (%6.3f%%)\n", n_v_gt5,  total_cells, 100.0 * n_v_gt5  / total_cells)
+@printf("  - |v| > 1.0 m/s : %8d / %d cells (%6.3f%%)\n", n_v_gt1, total_cells, 100.0 * n_v_gt1 / total_cells)
+@printf("  - |v| > 2.0 m/s : %8d / %d cells (%6.3f%%)\n", n_v_gt2, total_cells, 100.0 * n_v_gt2 / total_cells)
+@printf("  - |v| > 5.0 m/s : %8d / %d cells (%6.3f%%)\n", n_v_gt5, total_cells, 100.0 * n_v_gt5 / total_cells)
 @printf("\n  - Tracers    : T ∈ [%.2f, %.2f] °C, S ∈ [%.2f, %.2f] psu\n", T_min_post, T_max_post, S_min_post, S_max_post)
 @printf("  - Total NaNs : %d\n", nan_post)
 
