@@ -33,6 +33,7 @@ using NumericalEarth.DataWrangling
 using NumericalEarth.Oceans: ocean_simulation
 using NCDatasets
 using SeawaterPolynomials
+using CairoMakie
 
 import CUDA
 
@@ -70,10 +71,10 @@ const DATASET = "BSOSE"
 
 # Domain boundaries (matching model.jl)
 λ₁, λ₂ = (90.0, 150.0)
-φ₁, φ₂ = (-70.0, -40.0)
+φ₁, φ₂ = (-70.0, -45.0)
 
 if arch isa GPU
-    SCALING = 6 # 1/3 degree horizontal resolution
+    SCALING = 6 # 1/6 degree horizontal resolution
     Nx = Int(SCALING * (λ₂ - λ₁))
     Ny = Int(SCALING * (φ₂ - φ₁))
     z = ReferenceToStretchedDiscretization(; extent=5800,
@@ -119,6 +120,95 @@ bottom_height = regrid_bathymetry(underlying_grid,
 
 grid = ImmersedBoundaryGrid(underlying_grid, GridFittedBottom(bottom_height))
 println("  ✓ ImmersedBoundaryGrid created successfully.")
+
+# ------------------------------------------------------------------------------
+# Boundary Bathymetry Depth Diagnostic & Visual Transects
+# ------------------------------------------------------------------------------
+println("\n[Boundary Bathymetry Diagnostic]")
+println("="^92)
+@printf("%-18s | %-16s | %-12s | %-18s | %s\n",
+        "Boundary Face", "Full Depth Range", "Land Cells", "Water Depth Range", "Shallowest Wet Depth")
+println("-"^92)
+
+bh_raw = Array(interior(bottom_height))
+Nx_b, Ny_b, _ = size(underlying_grid)
+bh_2d = reshape(bh_raw, Nx_b, Ny_b)
+
+z_west = vec(bh_2d[1, :])
+z_east = vec(bh_2d[Nx_b, :])
+z_south = vec(bh_2d[:, 1])
+z_north = vec(bh_2d[:, Ny_b])
+
+lons = collect(λnodes(underlying_grid, Center()))
+lats = collect(φnodes(underlying_grid, Center()))
+
+faces = [
+    ("West (λ = $(λ₁)°E)", z_west, lats, "lat"),
+    ("East (λ = $(λ₂)°E)", z_east, lats, "lat"),
+    ("South (φ = $(φ₁)°S)", z_south, lons, "lon"),
+    ("North (φ = $(φ₂)°S)", z_north, lons, "lon"),
+]
+
+for (name, z_slice, coords, coord_name) in faces
+    wet = z_slice .< 0
+    n_land = count(!, wet)
+    pct_land = 100.0 * n_land / length(z_slice)
+    land_str = @sprintf("%d (%.1f%%)", n_land, pct_land)
+    full_str = @sprintf("[%.1f, %.1f] m", minimum(z_slice), maximum(z_slice))
+
+    if any(wet)
+        wet_vals = z_slice[wet]
+        wet_coords = coords[wet]
+        shallow_idx = argmax(wet_vals)
+        shallow_val = wet_vals[shallow_idx]
+        shallow_coord = wet_coords[shallow_idx]
+        water_str = @sprintf("[%.1f, %.1f] m", minimum(wet_vals), shallow_val)
+        loc_str = @sprintf("%.1f m @ %s = %.2f°", shallow_val, coord_name, shallow_coord)
+    else
+        water_str = "All Land"
+        loc_str = "N/A"
+    end
+    @printf("%-18s | %-16s | %-12s | %-18s | %s\n",
+            name, full_str, land_str, water_str, loc_str)
+end
+println("="^92)
+
+# Save 4-panel visual transect plot
+try
+    fig_bathy = Figure(size=(1200, 800), fontsize=13)
+    Label(fig_bathy[0, 1:2], "Model Boundary Bathymetry Transects (λ: [$(λ₁)°E, $(λ₂)°E], φ: [$(φ₁)°S, $(φ₂)°S])", fontsize=18, font=:bold)
+
+    # Panel 1: West Face
+    ax1 = Axis(fig_bathy[1, 1], title="West Face (λ = $(λ₁)°E)", xlabel="Latitude (°N)", ylabel="Depth (m)")
+    band!(ax1, lats, z_west, 0.0, color=(:dodgerblue, 0.3))
+    lines!(ax1, lats, z_west, color=:navy, linewidth=2)
+    hlines!(ax1, [0.0], color=:gray50, linestyle=:dash)
+
+    # Panel 2: East Face
+    ax2 = Axis(fig_bathy[1, 2], title="East Face (λ = $(λ₂)°E)", xlabel="Latitude (°N)", ylabel="Depth (m)")
+    band!(ax2, lats, z_east, 0.0, color=(:dodgerblue, 0.3))
+    lines!(ax2, lats, z_east, color=:navy, linewidth=2)
+    hlines!(ax2, [0.0], color=:gray50, linestyle=:dash)
+
+    # Panel 3: South Face
+    ax3 = Axis(fig_bathy[2, 1], title="South Face (φ = $(φ₁)°S)", xlabel="Longitude (°E)", ylabel="Depth (m)")
+    band!(ax3, lons, z_south, 0.0, color=(:dodgerblue, 0.3))
+    lines!(ax3, lons, z_south, color=:navy, linewidth=2)
+    hlines!(ax3, [0.0], color=:gray50, linestyle=:dash)
+
+    # Panel 4: North Face
+    ax4 = Axis(fig_bathy[2, 2], title="North Face (φ = $(φ₂)°S)", xlabel="Longitude (°E)", ylabel="Depth (m)")
+    band!(ax4, lons, z_north, 0.0, color=(:dodgerblue, 0.3))
+    lines!(ax4, lons, z_north, color=:navy, linewidth=2)
+    hlines!(ax4, [0.0], color=:gray50, linestyle=:dash)
+
+    mkpath("plots")
+    plot_path = joinpath("plots", "boundary_bathymetry.png")
+    save(plot_path, fig_bathy)
+    println("  ✓ Boundary bathymetry transects saved to $plot_path.")
+catch e
+    @warn "Could not save boundary bathymetry plot: $e"
+end
 
 # ------------------------------------------------------------------------------
 # 2. Boundary Conditions & Forcings

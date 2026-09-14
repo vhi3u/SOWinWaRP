@@ -56,7 +56,7 @@ if CIRCUMPOLAR
     φ₁, φ₂ = (-78, 30)
 else
     λ₁, λ₂ = (90, 150)
-    φ₁, φ₂ = (-70, -40)
+    φ₁, φ₂ = (-70, -45)
 end
 
 # z stretching so that the upper 500 meters of the ocean has dz = 2 meters, and the deeper ocean will gradually stretch to 200 m vertical resolution. 
