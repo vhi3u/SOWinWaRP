@@ -28,6 +28,7 @@ using NumericalEarth.DataWrangling
 using NCDatasets
 using Dates
 using CFTime
+using Printf: @sprintf
 using Downloads
 using NumericalEarth.DataWrangling: JLD2
 
@@ -633,10 +634,26 @@ function bsose_temp_directory(dataset::BSOSEDataset)
     return dir
 end
 
+bsose_bbox_str(::Nothing) = ""
+bsose_bbox_str(c::Number) = @sprintf("_%.1f", c)
+function bsose_bbox_str(c)
+    return @sprintf("_%.1f_%.1f", c[1], c[2])
+end
+
+function bsose_region_suffix(region::DataWrangling.BoundingBox)
+    w_e = bsose_bbox_str(region.longitude)
+    s_n = bsose_bbox_str(region.latitude)
+    return string(w_e, s_n)
+end
+bsose_region_suffix(::Nothing) = ""
+bsose_region_suffix(other) = ""
+
 function DataWrangling.inpainted_metadata_path(metadata::BSOSEMetadatum)
     geom = bsose_geometry(metadata.dataset)
     dstr = metadata.dates isa Dates.AbstractDateTime ? Dates.format(metadata.dates, "yyyymmdd") : "all"
-    name = "bsose_inpainted_i$(metadata.dataset.iteration)_$(metadata.name)_$(dstr)_$(geom.Nx)x$(geom.Ny).jld2"
+    suffix = bsose_region_suffix(metadata.region)
+    geom_str = isempty(suffix) ? "_$(geom.Nx)x$(geom.Ny)" : suffix
+    name = "bsose_inpainted_i$(metadata.dataset.iteration)_$(metadata.name)_$(dstr)$(geom_str).jld2"
     return joinpath(bsose_temp_directory(metadata.dataset), name)
 end
 
@@ -644,7 +661,9 @@ function DataWrangling.inpainted_metadata_path(metadata::BSOSEMetadata)
     geom = bsose_geometry(metadata.dataset)
     start_str = Dates.format(first(metadata.dates), "yyyymmdd")
     end_str = Dates.format(last(metadata.dates), "yyyymmdd")
-    name = "bsose_inpainted_i$(metadata.dataset.iteration)_$(metadata.name)_$(start_str)_to_$(end_str)_$(geom.Nx)x$(geom.Ny).jld2"
+    suffix = bsose_region_suffix(metadata.region)
+    geom_str = isempty(suffix) ? "_$(geom.Nx)x$(geom.Ny)" : suffix
+    name = "bsose_inpainted_i$(metadata.dataset.iteration)_$(metadata.name)_$(start_str)_to_$(end_str)$(geom_str).jld2"
     return joinpath(bsose_temp_directory(metadata.dataset), name)
 end
 
