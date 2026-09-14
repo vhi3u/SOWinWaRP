@@ -2,8 +2,8 @@ using NCDatasets
 using CairoMakie
 using Printf
 
-surface_file = "model_surface_fields.nc"
-output = "animations/bsose_simulation.mp4"
+surface_file = get(ENV, "SURFACE_FILE", "model_surface_fields.nc")
+output = get(ENV, "ANIMATION_OUTPUT", "animations/bsose_simulation.gif")
 framerate = 8
 
 mkpath(dirname(output))

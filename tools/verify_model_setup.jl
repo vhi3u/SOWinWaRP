@@ -23,6 +23,8 @@ using Statistics
 using Oceananigans
 using Oceananigans.Units
 using Oceananigans.Grids
+using Oceananigans.Grids: φnode
+using Oceananigans.Operators: Azᶜᶜᶜ
 using Oceananigans.BoundaryConditions
 using Oceananigans.BoundaryConditions: PerturbationAdvection, NormalRadiation
 using Oceananigans.OutputReaders: FieldTimeSeries
@@ -236,18 +238,51 @@ else
     forcings = NamedTuple()
 end
 
-vertical_closure = NumericalEarth.Oceans.default_ocean_closure()
-horizontal_closure_type = get(ENV, "HORIZONTAL_CLOSURE", "biharmonic")
-horizontal_closure = if horizontal_closure_type == "biharmonic"
-    HorizontalScalarBiharmonicDiffusivity(ν=1e10, κ=1e10)
-elseif horizontal_closure_type == "harmonic"
-    HorizontalScalarDiffusivity(ν=100.0, κ=100.0)
-elseif horizontal_closure_type == "none"
-    nothing
+catke_closure = NumericalEarth.Oceans.default_ocean_closure()
+closure_config = get(ENV, "CLOSURE_CONFIG", get(ENV, "HORIZONTAL_CLOSURE", "ito"))
+
+closures = if closure_config == "ito"
+    # Ito et al. (2026): biharmonic Ah = 3e9 m⁴/s, background νz,κz = 1e-5 m²/s
+    horizontal_viscosity = HorizontalScalarBiharmonicDiffusivity(ν=3e9, κ=3e9)
+    vertical_diffusivity = VerticalScalarDiffusivity(ν=1e-5, κ=1e-5)
+    (catke_closure, horizontal_viscosity, vertical_diffusivity)
+
+elseif closure_config == "bsose"
+    # BSOSE standard values:
+    # Horizontal viscosity 10 m² s⁻¹, Horizontal diffusivity 10 m² s⁻¹
+    # Vertical viscosity 1e-3 m² s⁻¹, Vertical diffusivity 1e-4 m² s⁻¹
+    horizontal_diffusivity = HorizontalScalarDiffusivity(ν=10.0, κ=10.0)
+    vertical_diffusivity = VerticalScalarDiffusivity(ν=1e-3, κ=1e-4)
+    (catke_closure, horizontal_diffusivity, vertical_diffusivity)
+
+elseif closure_config == "henyey_gm"
+    # Biharmonic horizontal viscosity with timescale of 15 days
+    @inline νhb(i, j, k, grid, timescale) = Azᶜᶜᶜ(i, j, k, grid)^2 / timescale
+    ν_field = Field{Center, Center, Center}(grid)
+    set!(ν_field, KernelFunctionOperation{Center, Center, Center}(νhb, grid, 15days))
+    horizontal_viscosity = HorizontalScalarBiharmonicDiffusivity(ν=ν_field, κ=ν_field)
+
+    # Background vertical diffusivity following Henyey et al. (1986)
+    @inline henyey_diffusivity(i, j, k, grid) = max(2e-6, 3e-5 * abs(sind(φnode(i, j, k, grid, Center(), Center(), Center()))))
+    κz_field = Field{Center, Center, Center}(grid)
+    set!(κz_field, KernelFunctionOperation{Center, Center, Center}(henyey_diffusivity, grid))
+    vertical_diffusivity = VerticalScalarDiffusivity(ν=1e-5, κ=κz_field)
+
+    # Gent-McWilliams & Redi isopycnal eddy closure
+    eddy_closure = IsopycnalSkewSymmetricDiffusivity(κ_skew=500, κ_symmetric=200)
+
+    (catke_closure, eddy_closure, horizontal_viscosity, vertical_diffusivity)
+
+elseif closure_config == "biharmonic"
+    horizontal_viscosity = HorizontalScalarBiharmonicDiffusivity(ν=1e10, κ=1e10)
+    (catke_closure, horizontal_viscosity)
+
+elseif closure_config == "none"
+    catke_closure
 else
-    error("Unknown HORIZONTAL_CLOSURE: $horizontal_closure_type. Choose 'biharmonic', 'harmonic', or 'none'.")
+    error("Unknown CLOSURE_CONFIG: $closure_config. Choose 'ito', 'bsose', 'henyey_gm', 'biharmonic', or 'none'.")
 end
-closures = horizontal_closure !== nothing ? (vertical_closure, horizontal_closure) : vertical_closure
+println("  ✓ Turbulence closures configured (Preset: $closure_config): $(summary(closures))")
 
 # ------------------------------------------------------------------------------
 # 3. Model Assembly & Initial Conditions
