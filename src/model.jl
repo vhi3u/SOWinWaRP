@@ -216,14 +216,14 @@ elseif closure_config == "bsose"
 elseif closure_config == "henyey_gm"
     # Biharmonic horizontal viscosity with timescale of 15 days
     @inline νhb(i, j, k, grid, timescale) = Azᶜᶜᶜ(i, j, k, grid)^2 / timescale
-    ν_field = Field{Center, Center, Center}(grid)
-    set!(ν_field, KernelFunctionOperation{Center, Center, Center}(νhb, grid, 15days))
+    ν_field = Field{Center,Center,Center}(grid)
+    set!(ν_field, KernelFunctionOperation{Center,Center,Center}(νhb, grid, 15days))
     horizontal_viscosity = HorizontalScalarBiharmonicDiffusivity(ν=ν_field, κ=ν_field)
 
     # Background vertical diffusivity following Henyey et al. (1986)
     @inline henyey_diffusivity(i, j, k, grid) = max(2e-6, 3e-5 * abs(sind(φnode(i, j, k, grid, Center(), Center(), Center()))))
-    κz_field = Field{Center, Center, Center}(grid)
-    set!(κz_field, KernelFunctionOperation{Center, Center, Center}(henyey_diffusivity, grid))
+    κz_field = Field{Center,Center,Center}(grid)
+    set!(κz_field, KernelFunctionOperation{Center,Center,Center}(henyey_diffusivity, grid))
     vertical_diffusivity = VerticalScalarDiffusivity(ν=1e-5, κ=κz_field)
 
     # Gent-McWilliams & Redi isopycnal eddy closure
@@ -304,7 +304,7 @@ simulation.callbacks[:wizard] = Callback(wizard, IterationInterval(10))
 
 # progress logger: Oceanostics TimedMessenger reports wall-clock timing,
 # max velocities and CFL/diffusive stability numbers each interval.
-callback_interval = haskey(ENV, "CALLBACK_INTERVAL") ? parse(Float64, ENV["CALLBACK_INTERVAL"]) : 1hours
+callback_interval = haskey(ENV, "CALLBACK_INTERVAL") ? parse(Float64, ENV["CALLBACK_INTERVAL"]) : 1days
 progress = TimedMessenger()
 simulation.callbacks[:progress] = Callback(progress, TimeInterval(callback_interval))
 
