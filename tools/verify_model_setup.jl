@@ -80,10 +80,10 @@ if arch isa GPU
     Nx = Int(SCALING * (λ₂ - λ₁))
     Ny = Int(SCALING * (φ₂ - φ₁))
     z = ReferenceToStretchedDiscretization(; extent=5800,
-        constant_spacing=2,
+        constant_spacing=5,
         maximum_spacing=200,
         constant_spacing_extent=500,
-        stretching=PowerLawStretching(1.15))
+        stretching=PowerLawStretching(1.12))
     start_date = DateTime(2014, 1, 1)
     end_date = DateTime(2014, 12, 31)
 else

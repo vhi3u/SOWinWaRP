@@ -129,8 +129,83 @@ hm4 = heatmap!(ax4, lat, z, slice_v, colormap=:balance, colorrange=v_lims, nan_c
 lines!(ax4, lat, bottom_h, color=:black, linewidth=1.5)
 Colorbar(fig[2, 4], hm4, label="m/s")
 
-println("Recording animation to $output (framerate = $framerate fps)...")
+println("Recording full-depth animation to $output (framerate = $framerate fps)...")
 record(fig, output, 1:Nt; framerate=framerate) do t
     t_idx[] = t
 end
-println("Done! Saved to $output")
+println("Done! Full-depth animation saved to $output")
+
+# ==============================================================================
+# ANIMATION 2: Focused Upper-Ocean Transect (0 to -500 m)
+# ==============================================================================
+output_focus = get(ENV, "ANIMATION_FOCUS_OUTPUT", "animations/bsose_simulation_midlon_focus.gif")
+println("\nGenerating focused upper-ocean animation (0 to -500 m) -> $output_focus ...")
+
+# Upper 500m depth mask & limits
+z_focus_mask = z .>= -500.0
+valid_T_focus = filter(!isnan, T_data[:, z_focus_mask, :])
+valid_S_focus = filter(!isnan, S_data[:, z_focus_mask, :])
+valid_u_focus = filter(!isnan, u_data[:, z_focus_mask, :])
+valid_v_focus = filter(!isnan, v_data[:, z_focus_mask, :])
+
+# T_lims_focus = isempty(valid_T_focus) ? T_lims : (floor(minimum(valid_T_focus) * 10) / 10, ceil(maximum(valid_T_focus) * 10) / 10)
+T_lims_focus = (-2, 2)
+S_lims_focus = isempty(valid_S_focus) ? S_lims : (floor(minimum(valid_S_focus) * 10) / 10, ceil(maximum(valid_S_focus) * 10) / 10)
+
+max_u_focus = isempty(valid_u_focus) ? 0.5 : ceil(maximum(abs, valid_u_focus) * 10) / 10
+max_v_focus = isempty(valid_v_focus) ? 0.3 : ceil(maximum(abs, valid_v_focus) * 10) / 10
+u_lims_focus = (-max_u_focus, max_u_focus)
+v_lims_focus = (-max_v_focus, max_v_focus)
+
+println("Focused Upper-Ocean (0 to -500m) Colorbar Limits:")
+println("  - Temperature (T) : $T_lims_focus °C")
+println("  - Salinity (S)    : $S_lims_focus PSU")
+println("  - Zonal vel (u)   : $u_lims_focus m/s")
+println("  - Merid vel (v)   : $v_lims_focus m/s")
+
+fig_focus = Figure(size=(1400, 950), fontsize=14)
+t_focus_idx = Observable(1)
+
+slice_T_focus = @lift(T_data[:, :, $t_focus_idx])
+slice_S_focus = @lift(S_data[:, :, $t_focus_idx])
+slice_u_focus = @lift(u_data[:, :, $t_focus_idx])
+slice_v_focus = @lift(v_data[:, :, $t_focus_idx])
+
+time_str_focus = @lift(@sprintf("Model Simulation Mid-Longitude Focus (λ = %.1f°E, Upper 500m): Day %.1f / %.1f (Step %d / %d)",
+    mid_lon, times[$t_focus_idx] / 86400, times[end] / 86400, $t_focus_idx, Nt))
+Label(fig_focus[0, 1:4], time_str_focus, fontsize=22, font=:bold)
+
+z_focus_bounds = (-500.0, 0.0)
+
+# Row 1: Temperature & Salinity (Upper 500m)
+ax1_f = Axis(fig_focus[1, 1], title="Conservative Temperature (T, 0 to -500m)", xlabel="Latitude (°N)", ylabel="Depth (m)",
+    limits=(lat_bounds[1], lat_bounds[2], z_focus_bounds[1], z_focus_bounds[2]))
+hm1_f = heatmap!(ax1_f, lat, z, slice_T_focus, colormap=:thermal, colorrange=T_lims_focus, nan_color=:gray30)
+lines!(ax1_f, lat, bottom_h, color=:black, linewidth=2.0)
+Colorbar(fig_focus[1, 2], hm1_f, label="°C")
+
+ax2_f = Axis(fig_focus[1, 3], title="Salinity (S, 0 to -500m)", xlabel="Latitude (°N)", ylabel="Depth (m)",
+    limits=(lat_bounds[1], lat_bounds[2], z_focus_bounds[1], z_focus_bounds[2]))
+hm2_f = heatmap!(ax2_f, lat, z, slice_S_focus, colormap=:haline, colorrange=S_lims_focus, nan_color=:gray30)
+lines!(ax2_f, lat, bottom_h, color=:black, linewidth=2.0)
+Colorbar(fig_focus[1, 4], hm2_f, label="PSU")
+
+# Row 2: Zonal Velocity (u) & Meridional Velocity (v) (Upper 500m)
+ax3_f = Axis(fig_focus[2, 1], title="Zonal Velocity (u, 0 to -500m)", xlabel="Latitude (°N)", ylabel="Depth (m)",
+    limits=(lat_bounds[1], lat_bounds[2], z_focus_bounds[1], z_focus_bounds[2]))
+hm3_f = heatmap!(ax3_f, lat, z, slice_u_focus, colormap=:balance, colorrange=u_lims_focus, nan_color=:gray30)
+lines!(ax3_f, lat, bottom_h, color=:black, linewidth=2.0)
+Colorbar(fig_focus[2, 2], hm3_f, label="m/s")
+
+ax4_f = Axis(fig_focus[2, 3], title="Meridional Velocity (v, 0 to -500m)", xlabel="Latitude (°N)", ylabel="Depth (m)",
+    limits=(lat_bounds[1], lat_bounds[2], z_focus_bounds[1], z_focus_bounds[2]))
+hm4_f = heatmap!(ax4_f, lat, z, slice_v_focus, colormap=:balance, colorrange=v_lims_focus, nan_color=:gray30)
+lines!(ax4_f, lat, bottom_h, color=:black, linewidth=2.0)
+Colorbar(fig_focus[2, 4], hm4_f, label="m/s")
+
+println("Recording focused upper-ocean animation to $output_focus (framerate = $framerate fps)...")
+record(fig_focus, output_focus, 1:Nt; framerate=framerate) do t
+    t_focus_idx[] = t
+end
+println("Done! Focused upper-ocean animation saved to $output_focus")
+

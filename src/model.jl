@@ -44,7 +44,7 @@ const CHECKPOINTS = false # save state and restart if the model crashes. If fals
 
 # domain related parameters
 const SCALING = 6 # horizontal resolution = 1 / SCALING degrees. 1/6 = ~15km, 1/2 = 50km
-const DZ_SURFACE = 2 # m 
+const DZ_SURFACE = 5 # m (gives ~135 vertical levels total, with 100 levels in upper 500m)
 const DZ_BOTTOM = 200 # m
 const CIRCUMPOLAR = false # if true, we will use a circumpolar domain
 
@@ -61,7 +61,7 @@ else
     φ₁, φ₂ = (-70, -45)
 end
 
-# z stretching so that the upper 500 meters of the ocean has dz = 2 meters, and the deeper ocean will gradually stretch to 200 m vertical resolution. 
+# z stretching so that the upper 500 meters of the ocean has dz = 5 meters, and the deeper ocean will gradually stretch to 200 m vertical resolution. 
 if arch isa CPU
     z = ReferenceToStretchedDiscretization(; extent=5800,
         constant_spacing=10,
@@ -73,7 +73,7 @@ else
         constant_spacing=DZ_SURFACE,
         maximum_spacing=DZ_BOTTOM,
         constant_spacing_extent=500,
-        stretching=PowerLawStretching(1.15))
+        stretching=PowerLawStretching(1.12))
 end
 
 # grid
@@ -289,7 +289,7 @@ stop_iteration = haskey(ENV, "STOP_ITERATION") ? parse(Int, ENV["STOP_ITERATION"
 simulation = Simulation(ocean.model, Δt=1seconds, stop_time=stop_time, stop_iteration=stop_iteration)
 
 # adaptive timestep wizard based on CFL (following mediterranean.jl: cfl=0.2, max_change=1.1)
-wizard = TimeStepWizard(cfl=0.4, max_change=1.3, min_Δt=0.1)
+wizard = TimeStepWizard(cfl=0.4, max_change=1.1, max_Δt=5minutes, min_Δt=0.1)
 simulation.callbacks[:wizard] = Callback(wizard, IterationInterval(10))
 
 # Safety callback: clamp salinity/temperature to physically valid ranges before each time step.
@@ -304,7 +304,7 @@ simulation.callbacks[:wizard] = Callback(wizard, IterationInterval(10))
 
 # progress logger: Oceanostics TimedMessenger reports wall-clock timing,
 # max velocities and CFL/diffusive stability numbers each interval.
-callback_interval = haskey(ENV, "CALLBACK_INTERVAL") ? parse(Float64, ENV["CALLBACK_INTERVAL"]) : 1days
+callback_interval = 1days
 progress = TimedMessenger()
 simulation.callbacks[:progress] = Callback(progress, TimeInterval(callback_interval))
 

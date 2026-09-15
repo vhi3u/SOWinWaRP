@@ -55,8 +55,8 @@ S_lims = isempty(valid_S) ? (32.5, 35.5) : (floor(minimum(valid_S) * 10) / 10, c
 # For velocities with diverging colormap (:balance), use symmetric bounds around zero
 max_u = isempty(valid_u) ? 0.6 : ceil(maximum(abs, valid_u) * 10) / 10
 max_v = isempty(valid_v) ? 0.4 : ceil(maximum(abs, valid_v) * 10) / 10
-u_lims = (-max_u, max_u)
-v_lims = (-max_v, max_v)
+u_lims = (-0.5, 0.5)
+v_lims = (-0.3, 0.3)
 
 println("Dynamic Colorbar Limits Scanned from Data:")
 println("  - Temperature (T) : $T_lims °C")
