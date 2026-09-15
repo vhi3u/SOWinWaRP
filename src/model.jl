@@ -289,7 +289,7 @@ stop_iteration = haskey(ENV, "STOP_ITERATION") ? parse(Int, ENV["STOP_ITERATION"
 simulation = Simulation(ocean.model, Δt=1seconds, stop_time=stop_time, stop_iteration=stop_iteration)
 
 # adaptive timestep wizard based on CFL (following mediterranean.jl: cfl=0.2, max_change=1.1)
-wizard = TimeStepWizard(cfl=0.4, max_change=1.1, max_Δt=5minutes, min_Δt=0.1)
+wizard = TimeStepWizard(cfl=0.6, max_change=1.1, min_Δt=0.1)
 simulation.callbacks[:wizard] = Callback(wizard, IterationInterval(10))
 
 # Safety callback: clamp salinity/temperature to physically valid ranges before each time step.
