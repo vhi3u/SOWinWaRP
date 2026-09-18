@@ -128,6 +128,15 @@ else
 end
 dates = (start_date, end_date)
 
+# For wind/tracer forcing: load all 12 monthly dates within the year to avoid interpolation discontinuities
+# especially critical for wind forcing which has only monthly data points
+all_available_dates = all_dates(dataset, :temperature)
+bc_dates = filter(d -> year(d) == year(start_date) && d >= start_date && d <= end_date, all_available_dates)
+if length(bc_dates) < 2
+    bc_dates = all_available_dates[1:12]  # Fallback to first 12 months of dataset
+end
+@info "Boundary condition dates: $(length(bc_dates)) time levels from $(bc_dates[1]) to $(bc_dates[end])"
+
 # ==============================================================================
 # Boundary Conditions & Forcing
 # ==============================================================================
@@ -149,17 +158,17 @@ if OBCS && DATASET == "BSOSE"
         error("Unknown OBC_SCHEME: $obc_scheme_type. Choose 'PerturbationAdvection', 'NormalRadiation', or 'clamped'.")
     end
     @info "  -> OBC Scheme: $(obc_scheme === nothing ? "Clamped Dirichlet" : summary(obc_scheme))"
-    boundary_conditions = bsose_open_boundary_conditions(grid; dataset=dataset, dates=dates, winds=WINDS, scheme=obc_scheme)
+    boundary_conditions = bsose_open_boundary_conditions(grid; dataset=dataset, dates=bc_dates, winds=WINDS, scheme=obc_scheme)
 
     if SPONGE_LAYERS
         @info "Configuring boundary edge sponge layers (3.0° width, 5-day restoring timescale)..."
-        forcings = bsose_sponge_layer_forcing(grid; dataset=dataset, dates=dates, sponge_width=3.0, timescale=5days, restore_velocities=true)
+        forcings = bsose_sponge_layer_forcing(grid; dataset=dataset, dates=bc_dates, sponge_width=3.0, timescale=5days, restore_velocities=true)
     else
         forcings = NamedTuple()
     end
 elseif !OBCS
     @info "Configuring whole-region DatasetRestoring (30-day restoring for T and S from $DATASET)..."
-    wind_bcs = (WINDS && DATASET == "BSOSE") ? bsose_surface_wind_stress(grid; dataset=dataset, dates=dates) : nothing
+    wind_bcs = (WINDS && DATASET == "BSOSE") ? bsose_surface_wind_stress(grid; dataset=dataset, dates=bc_dates) : nothing
     boundary_conditions = wind_bcs !== nothing ? (u=FieldBoundaryConditions(top=wind_bcs.u), v=FieldBoundaryConditions(top=wind_bcs.v)) : NamedTuple()
 
     restoring_region = DATASET == "BSOSE" ? bsose_region(grid) : nothing
@@ -302,11 +311,14 @@ simulation.callbacks[:wizard] = Callback(wizard, IterationInterval(10))
 # end
 # simulation.callbacks[:clamp_S] = Callback(clamp_salinity!, IterationInterval(1))
 
+
+# output and progress interval (daily)
+output_interval = 1days
+
 # progress logger: Oceanostics TimedMessenger reports wall-clock timing,
 # max velocities and CFL/diffusive stability numbers each interval.
-callback_interval = 1days
 progress = TimedMessenger()
-simulation.callbacks[:progress] = Callback(progress, TimeInterval(callback_interval))
+simulation.callbacks[:progress] = Callback(progress, TimeInterval(output_interval))
 
 # With Dirichlet open boundaries there is no wave radiation, so any net
 # volume-flux imbalance across the four faces accumulates in the free surface.
@@ -327,7 +339,7 @@ simulation.output_writers[:surface] = NetCDFWriter(
     ocean.model,
     (; u, v, T, S),
     filename="model_surface_fields.nc",
-    schedule=TimeInterval(1days),
+    schedule=TimeInterval(output_interval),
     indices=(:, :, grid.Nz),
     overwrite_existing=true
 )
@@ -337,7 +349,7 @@ simulation.output_writers[:mid_lon] = NetCDFWriter(
     ocean.model,
     (; u, v, T, S),
     filename="model_mid_lon.nc",
-    schedule=TimeInterval(1days),
+    schedule=TimeInterval(output_interval),
     indices=(mid_lon_idx, :, :),
     overwrite_existing=true
 )
