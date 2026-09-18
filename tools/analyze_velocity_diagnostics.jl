@@ -105,6 +105,7 @@ function analyze_surface_velocities(ds_surface)
     end
 
     for i in sample_indices
+        time_days = times[i]
         s = speed[:, :, i]
         max_speed = maximum(s)
         mean_speed = mean(s)
