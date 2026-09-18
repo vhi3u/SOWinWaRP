@@ -39,7 +39,7 @@ end
 
 const OBCS = true # open boundary conditions (NormalFlow with PerturbationAdvection)
 const SPONGE_LAYERS = true # sponge layer restoring (DatasetRestoring) near open boundary edges
-const WINDS = false # time-varying surface wind forcing from BSOSE data (oceTAUX and oceTAUY)
+const WINDS = true # time-varying surface wind forcing from BSOSE data (oceTAUX and oceTAUY)
 const CHECKPOINTS = false # save state and restart if the model crashes. If false, the model will start from scratch. 
 
 # domain related parameters

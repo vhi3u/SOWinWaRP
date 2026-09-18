@@ -68,7 +68,7 @@ println("  - Architecture : $(arch)")
 
 const OBCS = true
 const SPONGE_LAYERS = true
-const WINDS = false
+const WINDS = true
 const DATASET = "BSOSE"
 
 # Domain boundaries (matching model.jl)
