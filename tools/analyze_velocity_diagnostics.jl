@@ -70,20 +70,21 @@ function analyze_surface_velocities(ds_surface)
     v_var = ds_surface["v"]
     times = ds_surface["time"][:]
 
-    # Load data, handling 4D case (e.g., lon, lat, extra_dim, time)
-    if ndims(u_var) == 4
-        u = u_var[:, :, 1, :]  # Take first slice of extra dimension
-        v = v_var[:, :, 1, :]
-    else
-        u = u_var[:, :, :]
-        v = v_var[:, :, :]
-    end
+    # Load data: u is (361, 150, 1, 48), v is (360, 151, 1, 48)
+    u_4d = u_var[:, :, 1, :]
+    v_4d = v_var[:, :, 1, :]
 
-    # Compute velocity magnitude
-    speed = @. sqrt(u^2 + v^2)
+    # Interpolate to cell centers by averaging across staggered dimensions:
+    # u on x-faces: average to get (360, 150, 48)
+    # v on y-faces: average to get (360, 150, 48)
+    u_cells = 0.5 .* (u_4d[1:end-1, :, :] .+ u_4d[2:end, :, :])
+    v_cells = 0.5 .* (v_4d[:, 1:end-1, :] .+ v_4d[:, 2:end, :])
 
-    println("\nGrid dimensions: $(size(u)[1]) x $(size(u)[2]) (horizontal)")
-    println("Time steps: $(size(u)[3])")
+    # Compute velocity magnitude at cell centers
+    speed = @. sqrt(u_cells^2 + v_cells^2)
+
+    println("\nGrid dimensions: $(size(u_cells)[1]) x $(size(u_cells)[2]) (horizontal, at cell centers)")
+    println("Time steps: $(size(u_cells)[3])")
 
     # Statistics by time
     println("\n" * "-"^80)
@@ -195,23 +196,24 @@ function analyze_mid_lon_velocities(ds_mid)
     u_var = ds_mid["u"]
     v_var = ds_mid["v"]
 
-    # Load data, handling 4D case
-    if ndims(u_var) == 4
-        u = u_var[:, :, 1, :]  # Take first slice of extra dimension
-        v = v_var[:, :, 1, :]
-    else
-        u = u_var[:, :, :]
-        v = v_var[:, :, :]
-    end
+    # Load data: u is (1, 150, 135, 48), v is (1, 151, 135, 48)
+    u_4d = u_var[:, :, :, :]
+    v_4d = v_var[:, :, :, :]
     times = ds_mid["time"][:]
 
+    # Interpolate v to cell centers (average in y direction)
+    # u: (1, 150, 135, 48) at center-y
+    # v: (1, 151, 135, 48) at face-y -> average to (1, 150, 135, 48)
+    u_cells = u_4d
+    v_cells = 0.5 .* (v_4d[:, 1:end-1, :, :] .+ v_4d[:, 2:end, :, :])
+
     # Compute horizontal speed
-    speed_h = @. sqrt(u^2 + v^2)
+    speed_h = @. sqrt(u_cells^2 + v_cells^2)
 
     println("\nGrid dimensions:")
-    @printf("  - Latitudinal: %d points\n", size(u)[1])
-    @printf("  - Vertical   : %d levels\n", size(u)[2])
-    @printf("  - Time steps : %d\n", size(u)[3])
+    @printf("  - Latitudinal: %d points\n", size(u_cells)[2])
+    @printf("  - Vertical   : %d levels\n", size(u_cells)[3])
+    @printf("  - Time steps : %d\n", size(u_cells)[4])
 
     # Statistics by time
     println("\n" * "-"^80)
@@ -221,16 +223,16 @@ function analyze_mid_lon_velocities(ds_mid)
     println("-"^80)
 
     max_speeds_mid = Float64[]
-    sample_indices = round.(Int, range(1, size(speed_h, 3), length=min(20, size(speed_h, 3))))
+    sample_indices = round.(Int, range(1, size(speed_h, 4), length=min(20, size(speed_h, 4))))
 
-    for i in axes(speed_h, 3)
-        sh = speed_h[:, :, i]
+    for t in axes(speed_h, 4)
+        sh = speed_h[:, :, :, t]
         push!(max_speeds_mid, maximum(sh))
     end
 
-    for i in sample_indices
-        time_days = times[i]
-        sh = speed_h[:, :, i]
+    for t in sample_indices
+        time_days = times[t]
+        sh = speed_h[:, :, :, t]
         max_h_speed = maximum(sh)
         mean_h_speed = mean(sh)
         p99_speed = quantile(vec(sh), 0.99)
@@ -246,12 +248,12 @@ function analyze_mid_lon_velocities(ds_mid)
     @printf("%-12s %-15s %-15s\n", "Depth Index", "Max Speed", "Mean Speed")
     println("-"^80)
 
-    speed_h_tavg = mean(speed_h, dims=3)[:, :, 1]  # Average over time
+    speed_h_tavg = mean(speed_h, dims=4)  # Average over time (dim 4): result is (1, 150, 135)
 
     # Sample depth levels
-    sample_z = round.(Int, range(1, size(speed_h_tavg, 2), length=min(15, size(speed_h_tavg, 2))))
+    sample_z = round.(Int, range(1, size(speed_h_tavg, 3), length=min(15, size(speed_h_tavg, 3))))
     for z_idx in sample_z
-        s_at_depth = speed_h_tavg[:, z_idx]
+        s_at_depth = speed_h_tavg[1, :, z_idx]  # Get latitude profile at this depth
         max_s = maximum(s_at_depth)
         mean_s = mean(s_at_depth)
         @printf("%-12d %-15.6f %-15.6f\n", z_idx, max_s, mean_s)
@@ -263,11 +265,11 @@ function analyze_mid_lon_velocities(ds_mid)
     println("-"^80)
 
     max_idx = argmax(speed_h_tavg)
-    y_idx, z_idx = max_idx[1], max_idx[2]
-    max_speed_at_idx = speed_h_tavg[y_idx, z_idx]
+    y_idx, z_idx = max_idx[2], max_idx[3]  # dims 2 and 3 are lat and z
+    max_speed_at_idx = speed_h_tavg[1, y_idx, z_idx]
 
-    @printf("  - Latitude index : %d (of %d)\n", y_idx, size(speed_h_tavg, 1))
-    @printf("  - Depth index    : %d (of %d)\n", z_idx, size(speed_h_tavg, 2))
+    @printf("  - Latitude index : %d (of %d)\n", y_idx, size(speed_h_tavg, 2))
+    @printf("  - Depth index    : %d (of %d)\n", z_idx, size(speed_h_tavg, 3))
     @printf("  - Max speed      : %.6f m/s\n", max_speed_at_idx)
 end
 
