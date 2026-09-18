@@ -16,6 +16,15 @@ using NCDatasets
 using Statistics
 using Printf
 
+function print_ncdf_info(ds, label)
+    """Print NetCDF structure information."""
+    println("    Variables in $label file:")
+    for (name, var) in ds
+        size_str = string(size(var))
+        println("      - $name: $size_str")
+    end
+end
+
 function load_datasets(surface_file="model_surface_fields.nc", mid_lon_file="model_mid_lon.nc")
     """Load NetCDF files and return datasets."""
     println("Loading NetCDF files...")
@@ -26,6 +35,7 @@ function load_datasets(surface_file="model_surface_fields.nc", mid_lon_file="mod
     if isfile(surface_file)
         ds_surface = NCDataset(surface_file)
         println("  ✓ Loaded $surface_file")
+        print_ncdf_info(ds_surface, "surface")
     else
         println("  ✗ $surface_file not found")
     end
@@ -33,6 +43,7 @@ function load_datasets(surface_file="model_surface_fields.nc", mid_lon_file="mod
     if isfile(mid_lon_file)
         ds_mid = NCDataset(mid_lon_file)
         println("  ✓ Loaded $mid_lon_file")
+        print_ncdf_info(ds_mid, "mid-lon")
     else
         println("  ✗ $mid_lon_file not found")
     end
@@ -54,9 +65,19 @@ function analyze_surface_velocities(ds_surface)
     println(" SURFACE VELOCITY ANALYSIS")
     println("="^80)
 
-    u = ds_surface["u"][:, :, :]  # Load all data
-    v = ds_surface["v"][:, :, :]
+    # Handle 4D variables (staggered grids from Oceananigans)
+    u_var = ds_surface["u"]
+    v_var = ds_surface["v"]
     times = ds_surface["time"][:]
+
+    # Load data, handling 4D case (e.g., lon, lat, extra_dim, time)
+    if ndims(u_var) == 4
+        u = u_var[:, :, 1, :]  # Take first slice of extra dimension
+        v = v_var[:, :, 1, :]
+    else
+        u = u_var[:, :, :]
+        v = v_var[:, :, :]
+    end
 
     # Compute velocity magnitude
     speed = @. sqrt(u^2 + v^2)
@@ -170,8 +191,18 @@ function analyze_mid_lon_velocities(ds_mid)
     println(" MID-LONGITUDE SLICE VELOCITY ANALYSIS")
     println("="^80)
 
-    u = ds_mid["u"][:, :, :]  # [lat, z, time]
-    v = ds_mid["v"][:, :, :]
+    # Handle 4D variables (staggered grids from Oceananigans)
+    u_var = ds_mid["u"]
+    v_var = ds_mid["v"]
+
+    # Load data, handling 4D case
+    if ndims(u_var) == 4
+        u = u_var[:, :, 1, :]  # Take first slice of extra dimension
+        v = v_var[:, :, 1, :]
+    else
+        u = u_var[:, :, :]
+        v = v_var[:, :, :]
+    end
     times = ds_mid["time"][:]
 
     # Compute horizontal speed
