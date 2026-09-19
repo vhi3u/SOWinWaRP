@@ -128,13 +128,11 @@ else
 end
 dates = (start_date, end_date)
 
-# For wind/tracer forcing: load all 12 monthly dates within the year to avoid interpolation discontinuities
-# especially critical for wind forcing which has only monthly data points
+# For wind/tracer forcing: use full year of monthly data (functions have their own date defaults)
+# The bsose_open_boundary_conditions and bsose_surface_wind_stress functions will load 12 monthly
+# dates to ensure smooth interpolation without discontinuities at month boundaries
 all_available_dates = all_dates(dataset, :temperature)
-bc_dates = filter(d -> year(d) == year(start_date) && d >= start_date && d <= end_date, all_available_dates)
-if length(bc_dates) < 2
-    bc_dates = all_available_dates[1:12]  # Fallback to first 12 months of dataset
-end
+bc_dates = all_available_dates[1:12]  # First 12 months for proper monthly interpolation
 @info "Boundary condition dates: $(length(bc_dates)) time levels from $(bc_dates[1]) to $(bc_dates[end])"
 
 # ==============================================================================
