@@ -6,6 +6,7 @@ using Oceananigans.Units
 using Oceananigans.Grids
 using NumericalEarth
 using NumericalEarth.ECCO
+using NumericalEarth.DataWrangling: all_dates
 using CUDA: has_cuda_gpu, allowscalar
 using NCDatasets
 using Dates
@@ -129,12 +130,18 @@ else
 end
 dates = (start_date, end_date)
 
-# For wind/tracer forcing: use full year of monthly data (functions have their own date defaults)
-# The bsose_open_boundary_conditions and bsose_surface_wind_stress functions will load 12 monthly
-# dates to ensure smooth interpolation without discontinuities at month boundaries
-all_available_dates = all_dates(dataset, :temperature)
-bc_dates = all_available_dates[1:12]  # First 12 months for proper monthly interpolation
-@info "Boundary condition dates: $(length(bc_dates)) time levels from $(bc_dates[1]) to $(bc_dates[end])"
+# For wind/tracer forcing: prepare boundary condition dates (only needed for monthly winds)
+if MONTHLY_WINDS
+    # For monthly winds: use full year of monthly data to ensure smooth interpolation
+    # without discontinuities at month boundaries
+    all_available_dates = all_dates(dataset, :temperature)
+    bc_dates = all_available_dates[1:12]  # First 12 months for proper monthly interpolation
+    @info "Boundary condition dates: $(length(bc_dates)) time levels from $(bc_dates[1]) to $(bc_dates[end])"
+else
+    # For 5-day winds: still need bc_dates for tracer/OBC, but dates are less critical
+    all_available_dates = all_dates(dataset, :temperature)
+    bc_dates = all_available_dates[1:12]
+end
 
 # ==============================================================================
 # Boundary Conditions & Forcing
