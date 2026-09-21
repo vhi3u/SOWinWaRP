@@ -1097,19 +1097,27 @@ function load_5day_wind_stress(grid;
 
         @info "  Loaded $(length(times)) time levels of 5-day wind data"
 
-        # Create Fields for each time step and store in FieldTimeSeries format
-        # Initialize arrays to hold time series
-        taux_fts_data = similar(taux_data)
-        tauy_fts_data = similar(tauy_data)
+        # Create Fields for each time step
+        taux_fields = []
+        tauy_fields = []
 
-        # Convert stress (N/m²) to kinematic momentum flux (m²/s²)
-        taux_fts_data .= taux_data ./ ρ₀
-        tauy_fts_data .= tauy_data ./ ρ₀
+        for t in 1:length(times)
+            # Create fields at center locations
+            taux_field = Field{Center, Center, Nothing}(grid)
+            tauy_field = Field{Center, Center, Nothing}(grid)
 
-        # Create FieldTimeSeries from data arrays
-        # FieldTimeSeries expects data as (spatial_dims..., time_steps)
-        taux_fts = FieldTimeSeries(taux_fts_data, (times,))
-        tauy_fts = FieldTimeSeries(tauy_fts_data, (times,))
+            # Fill with data, converting from stress to kinematic momentum flux
+            interior(taux_field) .= taux_data[:, :, t] ./ ρ₀
+            interior(tauy_field) .= tauy_data[:, :, t] ./ ρ₀
+
+            push!(taux_fields, taux_field)
+            push!(tauy_fields, tauy_field)
+        end
+
+        # Create FieldTimeSeries from Field vectors with times
+        # Use RectilinearGrid location specification (Center, Center, Nothing)
+        taux_fts = FieldTimeSeries(times, taux_fields)
+        tauy_fts = FieldTimeSeries(times, tauy_fields)
 
         # Extract top boundary slices (same as monthly winds)
         top_u_slice = boundary_slice_time_series(taux_fts, :top)
