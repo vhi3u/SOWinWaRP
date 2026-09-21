@@ -1084,24 +1084,31 @@ function load_5day_wind_stress(grid;
     @info "  TAUX: $taux_file"
     @info "  TAUY: $tauy_file"
 
-    # Create metadata for FieldTimeSeries
-    taux_metadata = Metadata(:zonal_wind_stress; dataset="5day_BSOSE_2014")
-    tauy_metadata = Metadata(:meridional_wind_stress; dataset="5day_BSOSE_2014")
+    # Load 5-day wind data directly from NetCDF files
+    ds_taux = NCDataset(taux_path)
+    ds_tauy = NCDataset(tauy_path)
 
-    # Load as FieldTimeSeries
-    taux_fts = FieldTimeSeries(taux_metadata, grid)
-    tauy_fts = FieldTimeSeries(tauy_metadata, grid)
+    try
+        # Load all time steps and convert units
+        times = ds_taux["time"][:] |> Array
+        taux_all = Array(ds_taux["oceTAUX"][:, :, 1, :]) ./ ρ₀  # Surface level (z=1) only
+        tauy_all = Array(ds_tauy["oceTAUY"][:, :, 1, :]) ./ ρ₀
 
-    @info "  Loaded 5-day averaged wind data: $(length(taux_fts.times)) time levels"
+        @info "  Loaded 5-day averaged wind data: $(length(times)) time levels"
 
-    # Convert stress (N/m²) to kinematic momentum flux (m²/s²): divide by ρ₀
-    for t in 1:length(taux_fts.times)
-        interior(taux_fts[t]) ./= ρ₀
-        interior(tauy_fts[t]) ./= ρ₀
+        # Create FieldTimeSeries from pre-loaded data
+        # Note: times are in seconds since epoch, FieldTimeSeries will handle interpolation
+        taux_fts = FieldTimeSeries(taux_all, (times,))
+        tauy_fts = FieldTimeSeries(tauy_all, (times,))
+
+        # Get top-level boundary slices
+        top_u_slice = taux_fts
+        top_v_slice = tauy_fts
+
+    finally
+        close(ds_taux)
+        close(ds_tauy)
     end
-
-    top_u_slice = boundary_slice_time_series(taux_fts, :top)
-    top_v_slice = boundary_slice_time_series(tauy_fts, :top)
 
     return (u=FluxBoundaryCondition(top_u_slice),
             v=FluxBoundaryCondition(top_v_slice))
