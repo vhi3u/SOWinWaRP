@@ -40,6 +40,7 @@ end
 const OBCS = true # open boundary conditions (NormalFlow with PerturbationAdvection)
 const SPONGE_LAYERS = true # sponge layer restoring (DatasetRestoring) near open boundary edges
 const WINDS = true # time-varying surface wind forcing from BSOSE data (oceTAUX and oceTAUY)
+const MONTHLY_WINDS = false # if true, use monthly winds; if false, use 5-day averaged winds
 const CHECKPOINTS = false # save state and restart if the model crashes. If false, the model will start from scratch. 
 
 # domain related parameters
@@ -156,11 +157,16 @@ if OBCS && DATASET == "BSOSE"
         error("Unknown OBC_SCHEME: $obc_scheme_type. Choose 'PerturbationAdvection', 'NormalRadiation', or 'clamped'.")
     end
     @info "  -> OBC Scheme: $(obc_scheme === nothing ? "Clamped Dirichlet" : summary(obc_scheme))"
-    boundary_conditions = bsose_open_boundary_conditions(grid; dataset=dataset, dates=bc_dates, winds=WINDS, scheme=obc_scheme)
+
+    # Configure winds based on MONTHLY_WINDS flag
+    wind_option = WINDS ? (MONTHLY_WINDS ? true : "5day") : false
+    boundary_conditions = bsose_open_boundary_conditions(grid; dataset=dataset, dates=bc_dates, winds=wind_option, scheme=obc_scheme)
 
     if SPONGE_LAYERS
-        @info "Configuring boundary edge sponge layers (3.0° width, 5-day restoring timescale)..."
-        forcings = bsose_sponge_layer_forcing(grid; dataset=dataset, dates=bc_dates, sponge_width=3.0, timescale=5days, restore_velocities=true)
+        # Set sponge timescale based on wind forcing frequency
+        sponge_timescale = MONTHLY_WINDS ? 30days : 5days
+        @info "Configuring boundary edge sponge layers (3.0° width, $(sponge_timescale) restoring timescale)..."
+        forcings = bsose_sponge_layer_forcing(grid; dataset=dataset, dates=bc_dates, sponge_width=3.0, timescale=sponge_timescale, restore_velocities=true)
     else
         forcings = NamedTuple()
     end

@@ -1045,6 +1045,68 @@ function bsose_surface_wind_stress(grid;
         v=FluxBoundaryCondition(top_v_slice))
 end
 
+"""
+    load_5day_wind_stress(grid;
+                          taux_file="oceTAUX_bsoseI156_2014_5day.nc",
+                          tauy_file="oceTAUY_bsoseI156_2014_5day.nc",
+                          data_dir=default_bsose_directory(),
+                          ρ₀=1026.0)
+
+Load 5-day averaged wind stress from separate TAUX and TAUY NetCDF files and return as boundary conditions.
+
+# Arguments
+- `grid`: The simulation grid
+- `taux_file`: Name of NetCDF file containing zonal (u) wind stress
+- `tauy_file`: Name of NetCDF file containing meridional (v) wind stress
+- `data_dir`: Directory containing wind data files
+- `ρ₀`: Seawater density for wind stress conversion (kg/m³)
+
+# Returns
+- NamedTuple `(u=FluxBoundaryCondition(...), v=FluxBoundaryCondition(...))`
+"""
+function load_5day_wind_stress(grid;
+                               taux_file="oceTAUX_bsoseI156_2014_5day.nc",
+                               tauy_file="oceTAUY_bsoseI156_2014_5day.nc",
+                               data_dir=default_bsose_directory(),
+                               ρ₀=1026.0)
+
+    taux_path = joinpath(data_dir, taux_file)
+    tauy_path = joinpath(data_dir, tauy_file)
+
+    if !isfile(taux_path)
+        error("5-day TAUX wind file not found at: $taux_path")
+    end
+    if !isfile(tauy_path)
+        error("5-day TAUY wind file not found at: $tauy_path")
+    end
+
+    @info "Loading 5-day averaged wind stress..."
+    @info "  TAUX: $taux_file"
+    @info "  TAUY: $tauy_file"
+
+    # Create metadata for FieldTimeSeries
+    taux_metadata = Metadata(:zonal_wind_stress; dataset="5day_BSOSE_2014")
+    tauy_metadata = Metadata(:meridional_wind_stress; dataset="5day_BSOSE_2014")
+
+    # Load as FieldTimeSeries
+    taux_fts = FieldTimeSeries(taux_metadata, grid)
+    tauy_fts = FieldTimeSeries(tauy_metadata, grid)
+
+    @info "  Loaded 5-day averaged wind data: $(length(taux_fts.times)) time levels"
+
+    # Convert stress (N/m²) to kinematic momentum flux (m²/s²): divide by ρ₀
+    for t in 1:length(taux_fts.times)
+        interior(taux_fts[t]) ./= ρ₀
+        interior(tauy_fts[t]) ./= ρ₀
+    end
+
+    top_u_slice = boundary_slice_time_series(taux_fts, :top)
+    top_v_slice = boundary_slice_time_series(tauy_fts, :top)
+
+    return (u=FluxBoundaryCondition(top_u_slice),
+            v=FluxBoundaryCondition(top_v_slice))
+end
+
 # ==============================================================================
 # 4. Open Boundary Conditions (OBCs)
 # ==============================================================================
@@ -1173,6 +1235,10 @@ function bsose_open_boundary_conditions(grid;
             wind_bcs = bsose_surface_wind_stress(grid; dataset, dates, ρ₀)
             top_u_cached = wind_bcs.u
             top_v_cached = wind_bcs.v
+        elseif winds == "5day"
+            wind_bcs = load_5day_wind_stress(grid; ρ₀)
+            top_u_cached = wind_bcs.u
+            top_v_cached = wind_bcs.v
         end
 
         # Sanitize boundary velocity and tracer slices so bathymetric gaps are filled with nearby valid ocean values
@@ -1271,6 +1337,16 @@ function bsose_open_boundary_conditions(grid;
             top_v_bc = top_v_cached
         else
             wind_bcs = bsose_surface_wind_stress(grid; dataset, dates, ρ₀)
+            top_u_bc = wind_bcs.u
+            top_v_bc = wind_bcs.v
+        end
+    elseif winds == "5day"
+        # Load 5-day averaged wind forcing
+        if top_u_cached !== nothing && top_v_cached !== nothing
+            top_u_bc = top_u_cached
+            top_v_bc = top_v_cached
+        else
+            wind_bcs = load_5day_wind_stress(grid; ρ₀)
             top_u_bc = wind_bcs.u
             top_v_bc = wind_bcs.v
         end
