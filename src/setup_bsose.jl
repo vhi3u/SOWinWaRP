@@ -1053,6 +1053,7 @@ end
                           ρ₀=1026.0)
 
 Load 5-day averaged wind stress from separate TAUX and TAUY NetCDF files and return as boundary conditions.
+Uses the same FieldTimeSeries approach as monthly winds but with 5-day temporal resolution.
 
 # Arguments
 - `grid`: The simulation grid
@@ -1084,26 +1085,35 @@ function load_5day_wind_stress(grid;
     @info "  TAUX: $taux_file"
     @info "  TAUY: $tauy_file"
 
-    # Load 5-day wind data directly from NetCDF files
+    # Load 5-day wind data from NetCDF files
     ds_taux = NCDataset(taux_path)
     ds_tauy = NCDataset(tauy_path)
 
     try
-        # Load all time steps and convert units
-        times = ds_taux["time"][:] |> Array
-        taux_all = Array(ds_taux["oceTAUX"][:, :, 1, :]) ./ ρ₀  # Surface level (z=1) only
-        tauy_all = Array(ds_tauy["oceTAUY"][:, :, 1, :]) ./ ρ₀
+        # Extract time and data
+        times = Array(ds_taux["time"][:])
+        taux_data = Array(ds_taux["oceTAUX"][:, :, :])  # (lon, lat, time)
+        tauy_data = Array(ds_tauy["oceTAUY"][:, :, :])
 
-        @info "  Loaded 5-day averaged wind data: $(length(times)) time levels"
+        @info "  Loaded $(length(times)) time levels of 5-day wind data"
 
-        # Create FieldTimeSeries from pre-loaded data
-        # Note: times are in seconds since epoch, FieldTimeSeries will handle interpolation
-        taux_fts = FieldTimeSeries(taux_all, (times,))
-        tauy_fts = FieldTimeSeries(tauy_all, (times,))
+        # Create Fields for each time step and store in FieldTimeSeries format
+        # Initialize arrays to hold time series
+        taux_fts_data = similar(taux_data)
+        tauy_fts_data = similar(tauy_data)
 
-        # Get top-level boundary slices
-        top_u_slice = taux_fts
-        top_v_slice = tauy_fts
+        # Convert stress (N/m²) to kinematic momentum flux (m²/s²)
+        taux_fts_data .= taux_data ./ ρ₀
+        tauy_fts_data .= tauy_data ./ ρ₀
+
+        # Create FieldTimeSeries from data arrays
+        # FieldTimeSeries expects data as (spatial_dims..., time_steps)
+        taux_fts = FieldTimeSeries(taux_fts_data, (times,))
+        tauy_fts = FieldTimeSeries(tauy_fts_data, (times,))
+
+        # Extract top boundary slices (same as monthly winds)
+        top_u_slice = boundary_slice_time_series(taux_fts, :top)
+        top_v_slice = boundary_slice_time_series(tauy_fts, :top)
 
     finally
         close(ds_taux)
