@@ -51,8 +51,7 @@ import NumericalEarth.DataWrangling:
     available_variables,
     default_inpainting,
     centers_to_interfaces,
-    metadata_path,
-    resolve_filename
+    metadata_path
 
 import Downloads: download
 
@@ -113,40 +112,6 @@ end
 
 Base.summary(ds::BSOSEMonthly) = "BSOSEMonthly(iteration=$(ds.iteration), dir=\"$(ds.dir)\")"
 
-"""
-    BSOSE5Day(; dir = default_bsose_directory(), iteration = 156)
-
-Construct a `BSOSE5Day` dataset descriptor for 5-day averaged BSOSE fields (such as wind stress).
-"""
-struct BSOSE5Day <: BSOSEDataset
-    dir::String
-    iteration::Int
-end
-
-function BSOSE5Day(; dir=default_bsose_directory(), iteration=nothing)
-    if isnothing(iteration)
-        if isdir(dir)
-            files = readdir(dir)
-            if any(f -> occursin("156", f) || occursin("I156", f), files)
-                iteration = 156
-            elseif any(f -> occursin("105", f) || occursin("i105", f), files)
-                iteration = 105
-            else
-                iteration = 156
-            end
-        else
-            iteration = 156
-        end
-    end
-    return BSOSE5Day(abspath(dir), iteration)
-end
-
-Base.summary(ds::BSOSE5Day) = "BSOSE5Day(iteration=$(ds.iteration), dir=\"$(ds.dir)\")"
-
-# NumericalEarth DataWrangling interface for BSOSE5Day
-dataset_variable_name(ds::BSOSE5Day, var::Symbol) = get(BSOSE_VARIABLE_NAMES, var, string(var))
-dataset_location(ds::BSOSE5Day, var::Symbol) = get(BSOSE_LOCATIONS, var, (Center, Center, Center))
-resolve_filename(ds::BSOSE5Day, var_name::Symbol) = resolve_5day_wind_filename(ds.dir, var_name, ds.iteration)
 
 # Variable name dictionary
 const BSOSE_VARIABLE_NAMES = Dict(
@@ -195,53 +160,6 @@ const BSOSE_LOCATIONS = Dict(
 
 bsose_iteration_tokens(iteration::Int) = ("i$(iteration)", "$(iteration)")
 
-"""
-    resolve_5day_wind_filename(dir::String, var_name::Symbol, iteration::Int)
-
-Resolve 5-day averaged wind stress filename for a given variable.
-"""
-function resolve_5day_wind_filename(dir::String, var_name::Symbol, iteration::Int)
-    shortname = get(BSOSE_VARIABLE_NAMES, var_name, string(var_name))
-
-    # Candidate filename patterns for 5-day wind stress
-    cands_156 = [
-        "$(shortname)_bsoseI156_2014_5day.nc",
-        "$(uppercase(shortname))_bsoseI156_2014_5day.nc",
-        "$(titlecase(shortname))_bsoseI156_2014_5day.nc",
-        "bsose_i156_2014_5day_$(shortname).nc",
-    ]
-
-    cands_105 = [
-        "$(shortname)_bsoseI105_2008to2012_5day.nc",
-        "bsose_i105_2008to2012_5day_$(shortname).nc",
-    ]
-
-    candidates = iteration == 156 ? vcat(cands_156, cands_105) : vcat(cands_105, cands_156)
-
-    for cand in candidates
-        if isfile(joinpath(dir, cand))
-            return cand
-        end
-    end
-
-    # Fallback: search directory for any 5day file matching the variable
-    if isdir(dir)
-        t_low = lowercase(shortname)
-        matches = filter(readdir(dir)) do f
-            endswith(f, ".nc") && occursin("5day", lowercase(f)) && occursin(t_low, lowercase(f))
-        end
-
-        for token in bsose_iteration_tokens(iteration)
-            for f in matches
-                occursin(token, lowercase(f)) && return f
-            end
-        end
-
-        isempty(matches) || return first(matches)
-    end
-
-    return iteration == 156 ? "$(shortname)_bsoseI156_2014_5day.nc" : "$(shortname)_bsoseI105_2008to2012_5day.nc"
-end
 
 """
     bsose_names_iteration(filename, iteration)
@@ -340,6 +258,34 @@ end
 # Oceananigans indexes bottom-to-surface, so `retrieve_data` reverses dim 3.
 DataWrangling.reversed_vertical_axis(::BSOSEDataset) = true
 
+# Each BSOSE monthly file holds a calendar-month average stamped at the END of the month it
+# averages (to within a day: the stamps sit at uniform year/12 intervals, so they drift either
+# side of the month boundary). Snapping the stamp to the nearest month boundary recovers the
+# month the average was taken over, which is what `native_times` needs to place each sample at
+# its own middle rather than at its end, and what gives a twelve-month series a `Cyclical`
+# period of exactly one year instead of one inferred from the spacing of the stamps.
+function DataWrangling.averaging_window(metadatum::BSOSEMetadatum)
+    window_stop = round(DateTime(metadatum.dates), Month)
+    return (window_stop - Month(1), window_stop)
+end
+
+"""
+    model_clock_offset(metadata, reference_date)
+
+The shift in seconds that puts a `FieldTimeSeries` built from `metadata` onto the model clock.
+
+`native_times` measures a series from the stamp of its first record, so a series used as-is
+makes model time zero mean "the first record of the dataset". Adding this offset to its times
+makes model time `t` mean the calendar date `reference_date + t` instead, which is the clock
+the initial condition, the output writers and the analysis scripts all assume. `nothing` leaves
+the series on the dataset's own clock.
+"""
+function model_clock_offset(metadata, reference_date)
+    isnothing(reference_date) && return 0.0
+    first_stamp = DateTime(first(metadata).dates)
+    return Dates.value(Dates.Millisecond(first_stamp - DateTime(reference_date))) / 1000
+end
+
 function DataWrangling.longitude_name(metadata::BSOSEMetadata)
     loc = dataset_location(metadata.dataset, metadata.name)
     return loc[1] === Face ? "XG" : "XC"
@@ -350,21 +296,6 @@ function DataWrangling.latitude_name(metadata::BSOSEMetadata)
     return loc[2] === Face ? "YG" : "YC"
 end
 
-function resolve_bsose_5day_filename(dir::String, var_name::Symbol, iteration::Int)
-    shortname = get(BSOSE_VARIABLE_NAMES, var_name, string(var_name))
-    if isdir(dir)
-        cands = filter(readdir(dir)) do f
-            endswith(f, ".nc") && occursin("5day", lowercase(f)) && occursin(lowercase(shortname), lowercase(f))
-        end
-        for tok in bsose_iteration_tokens(iteration)
-            for f in cands
-                occursin(tok, lowercase(f)) && return f
-            end
-        end
-        isempty(cands) || return first(cands)
-    end
-    return "$(shortname)_bsoseI$(iteration)_2014_5day.nc"
-end
 
 function DataWrangling.default_download_directory(dataset::BSOSEDataset)
     return dataset.dir
@@ -372,10 +303,6 @@ end
 
 function DataWrangling.metadata_filename(dataset::BSOSEMonthly, name, date, region)
     return resolve_bsose_filename(dataset.dir, name, dataset.iteration)
-end
-
-function DataWrangling.metadata_filename(dataset::BSOSE5Day, name, date, region)
-    return resolve_bsose_5day_filename(dataset.dir, name, dataset.iteration)
 end
 
 # ------------------------------------------------------------------------------
@@ -771,8 +698,7 @@ function DataWrangling.inpainted_metadata_path(metadata::BSOSEMetadata)
     end_str = Dates.format(last(metadata.dates), "yyyymmdd")
     suffix = bsose_region_suffix(metadata.region)
     geom_str = isempty(suffix) ? "_$(geom.Nx)x$(geom.Ny)" : suffix
-    tag = metadata.dataset isa BSOSE5Day ? "5day_" : ""
-    name = "bsose_inpainted_$(tag)i$(metadata.dataset.iteration)_$(metadata.name)_$(start_str)_to_$(end_str)$(geom_str).jld2"
+    name = "bsose_inpainted_i$(metadata.dataset.iteration)_$(metadata.name)_$(start_str)_to_$(end_str)$(geom_str).jld2"
     return joinpath(bsose_temp_directory(metadata.dataset), name)
 end
 
@@ -793,21 +719,6 @@ function DataWrangling.all_dates(dataset::BSOSEMonthly, var)
     else
         return collect(DateTime(2008, 1, 1):Month(1):DateTime(2012, 12, 1))
     end
-end
-
-function DataWrangling.all_dates(dataset::BSOSE5Day, var)
-    fn = resolve_bsose_5day_filename(dataset.dir, var, dataset.iteration)
-    fp = joinpath(dataset.dir, fn)
-    if isfile(fp)
-        try
-            ds = Dataset(fp)
-            dates = [DateTime(t) for t in ds["time"][:]]
-            close(ds)
-            return dates
-        catch
-        end
-    end
-    return collect(DateTime(2014, 1, 5):Day(5):DateTime(2014, 12, 31))
 end
 
 function Downloads.download(metadata::Metadata{<:BSOSEDataset})
@@ -1005,10 +916,12 @@ from a 3D `FieldTimeSeries`.
 
 The resulting 2D FieldTimeSeries has the reduced dimensionality and index structure
 required by Oceananigans boundary conditions (`YZFTS` for west/east, `XZFTS` for south/north).
+
+`time_offset` (seconds) shifts the slice onto the model clock; see [`model_clock_offset`](@ref).
 """
-function boundary_slice_time_series(fts::FieldTimeSeries, side::Symbol)
+function boundary_slice_time_series(fts::FieldTimeSeries, side::Symbol; time_offset=0)
     grid = fts.grid
-    times = fts.times
+    times = fts.times .+ time_offset
     time_indexing = fts.time_indexing
     LX, LY, LZ = location(fts)
     Nx, Ny, Nz = size(grid)
@@ -1139,55 +1052,56 @@ end
     bsose_surface_wind_stress(grid;
                               dataset = BSOSEMonthly(),
                               dates = all_dates(dataset, :temperature)[1:12],
-                              ρ₀ = 1026.0)
+                              ρ₀ = 1026.0,
+                              reference_date = nothing)
 
-Load BSOSE surface wind stress (`oceTAUX` and `oceTAUY`), convert to kinematic
-momentum flux (`τ / ρ₀`), and return a `NamedTuple` of top `FluxBoundaryCondition`s:
+Load BSOSE surface wind stress (`oceTAUX` and `oceTAUY`), convert to the kinematic
+momentum flux Oceananigans expects at a top boundary (`-τ / ρ₀`), and return a
+`NamedTuple` of top `FluxBoundaryCondition`s:
 `(; u = FluxBoundaryCondition(top_u), v = FluxBoundaryCondition(top_v))`.
+
+`reference_date` is the calendar date of model time zero; see [`model_clock_offset`](@ref).
 
 Can be used standalone or passed to `bsose_open_boundary_conditions`.
 """
 function bsose_surface_wind_stress(grid;
     dataset=BSOSEMonthly(),
     dates=nothing,
-    ρ₀=1026.0)
+    ρ₀=1026.0,
+    reference_date=nothing)
     if isnothing(dates)
         available = all_dates(dataset, :zonal_wind_stress)
         dates = available[1:min(12, length(available))]
     end
     @info "Loading surface wind stress ($(summary(dataset)))..."
     region = bsose_region(grid)
-    taux_fts = FieldTimeSeries(Metadata(:zonal_wind_stress; dataset, dates, region), grid)
-    tauy_fts = FieldTimeSeries(Metadata(:meridional_wind_stress; dataset, dates, region), grid)
+    taux_meta = Metadata(:zonal_wind_stress; dataset, dates, region)
+    tauy_meta = Metadata(:meridional_wind_stress; dataset, dates, region)
+    taux_fts = FieldTimeSeries(taux_meta, grid)
+    tauy_fts = FieldTimeSeries(tauy_meta, grid)
 
-    # Convert stress (N/m²) to kinematic momentum flux (m²/s²): divide by ρ₀
-    for t in 1:length(dates)
-        interior(taux_fts[t]) ./= ρ₀
-        interior(tauy_fts[t]) ./= ρ₀
+    time_offset = model_clock_offset(taux_meta, reference_date)
+    top_u_slice = boundary_slice_time_series(taux_fts, :top; time_offset)
+    top_v_slice = boundary_slice_time_series(tauy_fts, :top; time_offset)
+
+    # Convert stress (N/m²) to the kinematic momentum flux a top boundary condition takes
+    # (m²/s²). A flux at the top is positive upward, so an eastward stress τˣ > 0 — momentum
+    # carried *into* the ocean — enters as -τˣ/ρ₀.
+    #
+    # This has to happen here, on the sliced series, rather than on `taux_fts` above: the
+    # series returned by `FieldTimeSeries(::Metadata, grid)` keeps only two snapshots in
+    # memory and reloads them from disk whenever a third is indexed, so scaling it in place
+    # is silently undone. The slices are ordinary in-memory series, so the scaling sticks.
+    # Scaling `parent` covers the halos too, which were filled during slicing.
+    for t in 1:length(top_u_slice.times)
+        parent(top_u_slice[t]) .*= -1 / ρ₀
+        parent(top_v_slice[t]) .*= -1 / ρ₀
     end
-
-    top_u_slice = boundary_slice_time_series(taux_fts, :top)
-    top_v_slice = boundary_slice_time_series(tauy_fts, :top)
 
     return (u=FluxBoundaryCondition(top_u_slice),
         v=FluxBoundaryCondition(top_v_slice))
 end
 
-"""
-    load_5day_wind_stress(grid;
-                          dataset = BSOSE5Day(),
-                          dates = nothing,
-                          ρ₀ = 1026.0)
-
-Load 5-day averaged wind stress via the same Metadata/FieldTimeSeries pipeline as monthly winds.
-Works with BSOSE5Day dataset type to find and load the 5-day wind files.
-"""
-function load_5day_wind_stress(grid;
-                               dataset=BSOSE5Day(),
-                               dates=nothing,
-                               ρ₀=1026.0)
-    return bsose_surface_wind_stress(grid; dataset=dataset, dates=dates, ρ₀=ρ₀)
-end
 
 # ==============================================================================
 # 4. Open Boundary Conditions (OBCs)
@@ -1217,6 +1131,9 @@ open boundary conditions from BSOSE.
            - `true`: Automatically calls `bsose_surface_wind_stress` and applies top flux.
            - A `NamedTuple` `(; u, v)` returned from `bsose_surface_wind_stress(grid; ...)`.
 - `ρ₀`: Seawater density for wind stress conversion (kg/m³). Default: 1026.0.
+- `reference_date`: Calendar date of model time zero, so that the boundary and wind series are
+                    stepped on the model clock; see [`model_clock_offset`](@ref). `nothing`
+                    (default) leaves them on the dataset's own clock.
 - `cache`: If `true`, saves and loads all boundary conditions to/from a SINGLE unified dataset file.
 - `cache_file`: Optional custom file path for the unified dataset file.
 """
@@ -1226,6 +1143,7 @@ function bsose_open_boundary_conditions(grid;
     scheme=nothing,
     winds=nothing,
     ρ₀=1026.0,
+    reference_date=nothing,
     cache=true,
     cache_file=nothing)
     @info "Setting up BSOSE Open Boundary Conditions..."
@@ -1241,8 +1159,8 @@ function bsose_open_boundary_conditions(grid;
     is_x_periodic = topology(underlying, 1) === Periodic
 
     # Unified dataset filename
-    wind_tag = winds == "5day" ? "_5daywinds" : (winds === true ? "_winds" : "")
-    default_dataset_name = "bsose_dataset_$(dataset.iteration)_$(start_str)_to_$(end_str)_$(Nx)x$(Ny)x$(Nz)$(wind_tag).jld2"
+    wind_tag = winds === true ? "_winds" : ""
+    default_dataset_name = "bsose_dataset_v2_$(dataset.iteration)_$(start_str)_to_$(end_str)_$(Nx)x$(Ny)x$(Nz)$(wind_tag).jld2"
     dataset_path = cache_file !== nothing ? cache_file : joinpath(dataset.dir, default_dataset_name)
 
     # 1. Attempt loading from single unified dataset
@@ -1280,7 +1198,9 @@ function bsose_open_boundary_conditions(grid;
         @info "Extracting BSOSE fields for simulation window ($start_d to $end_d)..."
         region = bsose_region(grid)
         @info " -> Loading BSOSE u_velocity..."
-        u_fts = FieldTimeSeries(Metadata(:u_velocity; dataset, dates, region), grid)
+        u_meta = Metadata(:u_velocity; dataset, dates, region)
+        time_offset = model_clock_offset(u_meta, reference_date)
+        u_fts = FieldTimeSeries(u_meta, grid)
         @info " -> Loading BSOSE v_velocity..."
         v_fts = FieldTimeSeries(Metadata(:v_velocity; dataset, dates, region), grid)
         @info " -> Loading BSOSE temperature..."
@@ -1290,36 +1210,32 @@ function bsose_open_boundary_conditions(grid;
 
         # 2. Extract 2D boundary slices
         @info " -> Extracting boundary slices (West, East, South, North)..."
-        u_west = boundary_slice_time_series(u_fts, :west)
-        u_east = boundary_slice_time_series(u_fts, :east)
-        u_south = boundary_slice_time_series(u_fts, :south)
-        u_north = boundary_slice_time_series(u_fts, :north)
+        u_west = boundary_slice_time_series(u_fts, :west; time_offset)
+        u_east = boundary_slice_time_series(u_fts, :east; time_offset)
+        u_south = boundary_slice_time_series(u_fts, :south; time_offset)
+        u_north = boundary_slice_time_series(u_fts, :north; time_offset)
 
-        v_west = boundary_slice_time_series(v_fts, :west)
-        v_east = boundary_slice_time_series(v_fts, :east)
-        v_south = boundary_slice_time_series(v_fts, :south)
-        v_north = boundary_slice_time_series(v_fts, :north)
+        v_west = boundary_slice_time_series(v_fts, :west; time_offset)
+        v_east = boundary_slice_time_series(v_fts, :east; time_offset)
+        v_south = boundary_slice_time_series(v_fts, :south; time_offset)
+        v_north = boundary_slice_time_series(v_fts, :north; time_offset)
 
-        T_west = boundary_slice_time_series(T_fts, :west)
-        T_east = boundary_slice_time_series(T_fts, :east)
-        T_south = boundary_slice_time_series(T_fts, :south)
-        T_north = boundary_slice_time_series(T_fts, :north)
+        T_west = boundary_slice_time_series(T_fts, :west; time_offset)
+        T_east = boundary_slice_time_series(T_fts, :east; time_offset)
+        T_south = boundary_slice_time_series(T_fts, :south; time_offset)
+        T_north = boundary_slice_time_series(T_fts, :north; time_offset)
 
-        S_west = boundary_slice_time_series(S_fts, :west)
-        S_east = boundary_slice_time_series(S_fts, :east)
-        S_south = boundary_slice_time_series(S_fts, :south)
-        S_north = boundary_slice_time_series(S_fts, :north)
+        S_west = boundary_slice_time_series(S_fts, :west; time_offset)
+        S_east = boundary_slice_time_series(S_fts, :east; time_offset)
+        S_south = boundary_slice_time_series(S_fts, :south; time_offset)
+        S_north = boundary_slice_time_series(S_fts, :north; time_offset)
 
         top_u_cached = nothing
         top_v_cached = nothing
 
         # Compute winds if enabled so they can be saved into the single dataset
         if winds === true
-            wind_bcs = bsose_surface_wind_stress(grid; dataset, dates, ρ₀)
-            top_u_cached = wind_bcs.u
-            top_v_cached = wind_bcs.v
-        elseif winds == "5day"
-            wind_bcs = load_5day_wind_stress(grid; dataset=BSOSE5Day(; dir=dataset.dir), dates=(start_d, end_d), ρ₀)
+            wind_bcs = bsose_surface_wind_stress(grid; dataset, dates, ρ₀, reference_date)
             top_u_cached = wind_bcs.u
             top_v_cached = wind_bcs.v
         end
@@ -1419,17 +1335,7 @@ function bsose_open_boundary_conditions(grid;
             top_u_bc = top_u_cached
             top_v_bc = top_v_cached
         else
-            wind_bcs = bsose_surface_wind_stress(grid; dataset, dates, ρ₀)
-            top_u_bc = wind_bcs.u
-            top_v_bc = wind_bcs.v
-        end
-    elseif winds == "5day"
-        # Load 5-day averaged wind forcing
-        if top_u_cached !== nothing && top_v_cached !== nothing
-            top_u_bc = top_u_cached
-            top_v_bc = top_v_cached
-        else
-            wind_bcs = load_5day_wind_stress(grid; dataset=BSOSE5Day(; dir=dataset.dir), dates=(start_d, end_d), ρ₀)
+            wind_bcs = bsose_surface_wind_stress(grid; dataset, dates, ρ₀, reference_date)
             top_u_bc = wind_bcs.u
             top_v_bc = wind_bcs.v
         end
@@ -1516,7 +1422,8 @@ end
                                dates = nothing,
                                sponge_width = 3.0,
                                timescale = 5days,
-                               restore_velocities = true)
+                               restore_velocities = true,
+                               reference_date = nothing)
 
 Construct sponge layer forcing using `DatasetRestoring` for all open boundaries.
 A smooth cosine taper relaxes variables toward BSOSE values within `sponge_width`
@@ -1528,7 +1435,8 @@ function bsose_sponge_layer_forcing(grid;
     dates=nothing,
     sponge_width=3.0, # degrees
     timescale=5days,
-    restore_velocities=true)
+    restore_velocities=true,
+    reference_date=nothing)
 
     underlying = grid isa ImmersedBoundaryGrid ? grid.underlying_grid : grid
     is_x_periodic = topology(underlying, 1) === Periodic
@@ -1571,19 +1479,33 @@ function bsose_sponge_layer_forcing(grid;
     T_meta = Metadata(:temperature; dataset, start_date, end_date, region)
     S_meta = Metadata(:salinity; dataset, start_date, end_date, region)
 
-    FT = DatasetRestoring(T_meta, grid; rate=rate, mask=sponge_mask)
-    FS = DatasetRestoring(S_meta, grid; rate=rate, mask=sponge_mask)
+    FT = restore_on_model_clock!(DatasetRestoring(T_meta, grid; rate=rate, mask=sponge_mask), reference_date)
+    FS = restore_on_model_clock!(DatasetRestoring(S_meta, grid; rate=rate, mask=sponge_mask), reference_date)
 
     if restore_velocities
         @info " -> Restoring u and v velocities in boundary sponge layers to damp accelerations."
         u_meta = Metadata(:u_velocity; dataset, start_date, end_date, region)
         v_meta = Metadata(:v_velocity; dataset, start_date, end_date, region)
-        Fu = DatasetRestoring(u_meta, grid; rate=rate, mask=sponge_mask)
-        Fv = DatasetRestoring(v_meta, grid; rate=rate, mask=sponge_mask)
+        Fu = restore_on_model_clock!(DatasetRestoring(u_meta, grid; rate=rate, mask=sponge_mask), reference_date)
+        Fv = restore_on_model_clock!(DatasetRestoring(v_meta, grid; rate=rate, mask=sponge_mask), reference_date)
         return (u=Fu, v=Fv, T=FT, S=FS)
     else
         return (T=FT, S=FS)
     end
+end
+
+"""
+    restore_on_model_clock!(restoring::DatasetRestoring, reference_date)
+
+Shift the times of the series inside `restoring` onto the model clock, so that a sponge layer
+reads the same calendar date as the open boundaries and the wind stress at any model time.
+`DatasetRestoring` builds its own `FieldTimeSeries`, so the shift is applied after the fact.
+"""
+function restore_on_model_clock!(restoring, reference_date)
+    isnothing(reference_date) && return restoring
+    fts = restoring.field_time_series
+    fts.times .+= model_clock_offset(fts.backend.metadata, reference_date)
+    return restoring
 end
 
 # ==============================================================================

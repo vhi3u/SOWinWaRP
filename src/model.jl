@@ -41,7 +41,6 @@ end
 const OBCS = true # open boundary conditions (NormalFlow with PerturbationAdvection)
 const SPONGE_LAYERS = true # sponge layer restoring (DatasetRestoring) near open boundary edges
 const WINDS = true # time-varying surface wind forcing from BSOSE data (oceTAUX and oceTAUY)
-const MONTHLY_WINDS = false # if true, use monthly winds; if false, use 5-day averaged winds
 const CHECKPOINTS = false # save state and restart if the model crashes. If false, the model will start from scratch. 
 
 # domain related parameters
@@ -130,18 +129,16 @@ else
 end
 dates = (start_date, end_date)
 
-# For wind/tracer forcing: prepare boundary condition dates (only needed for monthly winds)
-if MONTHLY_WINDS
-    # For monthly winds: use full year of monthly data to ensure smooth interpolation
-    # without discontinuities at month boundaries
-    all_available_dates = all_dates(dataset, :temperature)
-    bc_dates = all_available_dates[1:12]  # First 12 months for proper monthly interpolation
-    @info "Boundary condition dates: $(length(bc_dates)) time levels from $(bc_dates[1]) to $(bc_dates[end])"
-else
-    # For 5-day winds: still need bc_dates for tracer/OBC, but dates are less critical
-    all_available_dates = all_dates(dataset, :temperature)
-    bc_dates = all_available_dates[1:12]
-end
+# Boundary condition, sponge and wind forcing dates: the twelve monthly records of the simulation
+# year, so the series interpolates smoothly across month boundaries, wraps with a one-year
+# cyclical period, and covers the same year the initial condition is taken from. BSOSE stamps
+# each monthly mean at the end of the month it averages, so the records of a calendar year are
+# those stamped inside it.
+all_available_dates = all_dates(dataset, :temperature)
+simulation_year_dates = filter(d -> start_date <= d < start_date + Year(1), all_available_dates)
+bc_dates = length(simulation_year_dates) >= 12 ? simulation_year_dates[1:12] : all_available_dates[1:12]
+@info "Boundary condition dates: $(length(bc_dates)) time levels from $(bc_dates[1]) to $(bc_dates[end])"
+@info "Model time zero corresponds to $start_date; forcing is stepped on that clock."
 
 # ==============================================================================
 # Boundary Conditions & Forcing
@@ -165,21 +162,18 @@ if OBCS && DATASET == "BSOSE"
     end
     @info "  -> OBC Scheme: $(obc_scheme === nothing ? "Clamped Dirichlet" : summary(obc_scheme))"
 
-    # Configure winds based on MONTHLY_WINDS flag
-    wind_option = WINDS ? (MONTHLY_WINDS ? true : "5day") : false
-    boundary_conditions = bsose_open_boundary_conditions(grid; dataset=dataset, dates=bc_dates, winds=wind_option, scheme=obc_scheme)
+    boundary_conditions = bsose_open_boundary_conditions(grid; dataset=dataset, dates=bc_dates, winds=WINDS, scheme=obc_scheme, reference_date=start_date)
 
     if SPONGE_LAYERS
-        # Set sponge timescale based on wind forcing frequency
-        sponge_timescale = MONTHLY_WINDS ? 30days : 5days
+        sponge_timescale = 30days
         @info "Configuring boundary edge sponge layers (3.0° width, $(sponge_timescale) restoring timescale)..."
-        forcings = bsose_sponge_layer_forcing(grid; dataset=dataset, dates=bc_dates, sponge_width=3.0, timescale=sponge_timescale, restore_velocities=true)
+        forcings = bsose_sponge_layer_forcing(grid; dataset=dataset, dates=bc_dates, sponge_width=3.0, timescale=sponge_timescale, restore_velocities=true, reference_date=start_date)
     else
         forcings = NamedTuple()
     end
 elseif !OBCS
     @info "Configuring whole-region DatasetRestoring (30-day restoring for T and S from $DATASET)..."
-    wind_bcs = (WINDS && DATASET == "BSOSE") ? bsose_surface_wind_stress(grid; dataset=dataset, dates=bc_dates) : nothing
+    wind_bcs = (WINDS && DATASET == "BSOSE") ? bsose_surface_wind_stress(grid; dataset=dataset, dates=bc_dates, reference_date=start_date) : nothing
     boundary_conditions = wind_bcs !== nothing ? (u=FieldBoundaryConditions(top=wind_bcs.u), v=FieldBoundaryConditions(top=wind_bcs.v)) : NamedTuple()
 
     restoring_region = DATASET == "BSOSE" ? bsose_region(grid) : nothing
@@ -188,6 +182,11 @@ elseif !OBCS
 
     FT = DatasetRestoring(temperature_metadata, grid; rate=1 / 30days)
     FS = DatasetRestoring(salinity_metadata, grid; rate=1 / 30days)
+
+    if DATASET == "BSOSE"
+        restore_on_model_clock!(FT, start_date)
+        restore_on_model_clock!(FS, start_date)
+    end
 
     forcings = (T=FT, S=FS)
 else
