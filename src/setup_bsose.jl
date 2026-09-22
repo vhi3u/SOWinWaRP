@@ -112,6 +112,36 @@ end
 
 Base.summary(ds::BSOSEMonthly) = "BSOSEMonthly(iteration=$(ds.iteration), dir=\"$(ds.dir)\")"
 
+"""
+    BSOSE5Day(; dir = default_bsose_directory(), iteration = 156)
+
+Construct a `BSOSE5Day` dataset descriptor for 5-day averaged BSOSE fields (such as wind stress).
+"""
+struct BSOSE5Day <: BSOSEDataset
+    dir::String
+    iteration::Int
+end
+
+function BSOSE5Day(; dir=default_bsose_directory(), iteration=nothing)
+    if isnothing(iteration)
+        if isdir(dir)
+            files = readdir(dir)
+            if any(f -> occursin("156", f) || occursin("I156", f), files)
+                iteration = 156
+            elseif any(f -> occursin("105", f) || occursin("i105", f), files)
+                iteration = 105
+            else
+                iteration = 156
+            end
+        else
+            iteration = 156
+        end
+    end
+    return BSOSE5Day(abspath(dir), iteration)
+end
+
+Base.summary(ds::BSOSE5Day) = "BSOSE5Day(iteration=$(ds.iteration), dir=\"$(ds.dir)\")"
+
 # Variable name dictionary
 const BSOSE_VARIABLE_NAMES = Dict(
     :temperature => "THETA",
@@ -266,8 +296,32 @@ function DataWrangling.latitude_name(metadata::BSOSEMetadata)
     return loc[2] === Face ? "YG" : "YC"
 end
 
+function resolve_bsose_5day_filename(dir::String, var_name::Symbol, iteration::Int)
+    shortname = get(BSOSE_VARIABLE_NAMES, var_name, string(var_name))
+    if isdir(dir)
+        cands = filter(readdir(dir)) do f
+            endswith(f, ".nc") && occursin("5day", lowercase(f)) && occursin(lowercase(shortname), lowercase(f))
+        end
+        for tok in bsose_iteration_tokens(iteration)
+            for f in cands
+                occursin(tok, lowercase(f)) && return f
+            end
+        end
+        isempty(cands) || return first(cands)
+    end
+    return "$(shortname)_bsoseI$(iteration)_2014_5day.nc"
+end
+
+function DataWrangling.default_download_directory(dataset::BSOSEDataset)
+    return dataset.dir
+end
+
 function DataWrangling.metadata_filename(dataset::BSOSEMonthly, name, date, region)
     return resolve_bsose_filename(dataset.dir, name, dataset.iteration)
+end
+
+function DataWrangling.metadata_filename(dataset::BSOSE5Day, name, date, region)
+    return resolve_bsose_5day_filename(dataset.dir, name, dataset.iteration)
 end
 
 # ------------------------------------------------------------------------------
@@ -663,7 +717,8 @@ function DataWrangling.inpainted_metadata_path(metadata::BSOSEMetadata)
     end_str = Dates.format(last(metadata.dates), "yyyymmdd")
     suffix = bsose_region_suffix(metadata.region)
     geom_str = isempty(suffix) ? "_$(geom.Nx)x$(geom.Ny)" : suffix
-    name = "bsose_inpainted_i$(metadata.dataset.iteration)_$(metadata.name)_$(start_str)_to_$(end_str)$(geom_str).jld2"
+    tag = metadata.dataset isa BSOSE5Day ? "5day_" : ""
+    name = "bsose_inpainted_$(tag)i$(metadata.dataset.iteration)_$(metadata.name)_$(start_str)_to_$(end_str)$(geom_str).jld2"
     return joinpath(bsose_temp_directory(metadata.dataset), name)
 end
 
@@ -684,6 +739,21 @@ function DataWrangling.all_dates(dataset::BSOSEMonthly, var)
     else
         return collect(DateTime(2008, 1, 1):Month(1):DateTime(2012, 12, 1))
     end
+end
+
+function DataWrangling.all_dates(dataset::BSOSE5Day, var)
+    fn = resolve_bsose_5day_filename(dataset.dir, var, dataset.iteration)
+    fp = joinpath(dataset.dir, fn)
+    if isfile(fp)
+        try
+            ds = Dataset(fp)
+            dates = [DateTime(t) for t in ds["time"][:]]
+            close(ds)
+            return dates
+        catch
+        end
+    end
+    return collect(DateTime(2014, 1, 5):Day(5):DateTime(2014, 12, 31))
 end
 
 function Downloads.download(metadata::Metadata{<:BSOSEDataset})
@@ -1025,9 +1095,13 @@ Can be used standalone or passed to `bsose_open_boundary_conditions`.
 """
 function bsose_surface_wind_stress(grid;
     dataset=BSOSEMonthly(),
-    dates=all_dates(dataset, :temperature)[1:12],
+    dates=nothing,
     ρ₀=1026.0)
-    @info "Loading BSOSE surface wind stress (oceTAUX, oceTAUY)..."
+    if isnothing(dates)
+        available = all_dates(dataset, :zonal_wind_stress)
+        dates = available[1:min(12, length(available))]
+    end
+    @info "Loading surface wind stress ($(summary(dataset)))..."
     region = bsose_region(grid)
     taux_fts = FieldTimeSeries(Metadata(:zonal_wind_stress; dataset, dates, region), grid)
     tauy_fts = FieldTimeSeries(Metadata(:meridional_wind_stress; dataset, dates, region), grid)
@@ -1047,89 +1121,34 @@ end
 
 """
     load_5day_wind_stress(grid;
-                          taux_file="oceTAUX_bsoseI156_2014_5day.nc",
-                          tauy_file="oceTAUY_bsoseI156_2014_5day.nc",
-                          data_dir=default_bsose_directory(),
-                          ρ₀=1026.0)
+                          dataset = BSOSE5Day(),
+                          dates = nothing,
+                          ρ₀ = 1026.0)
 
-Load 5-day averaged wind stress from separate TAUX and TAUY NetCDF files and return as boundary conditions.
-Uses the same FieldTimeSeries approach as monthly winds but with 5-day temporal resolution.
-
-# Arguments
-- `grid`: The simulation grid
-- `taux_file`: Name of NetCDF file containing zonal (u) wind stress
-- `tauy_file`: Name of NetCDF file containing meridional (v) wind stress
-- `data_dir`: Directory containing wind data files
-- `ρ₀`: Seawater density for wind stress conversion (kg/m³)
-
-# Returns
-- NamedTuple `(u=FluxBoundaryCondition(...), v=FluxBoundaryCondition(...))`
+Load 5-day averaged wind stress via the exact same DataWrangling pipeline as monthly winds:
+native grid cropping, land inpainting, bilinear interpolation onto `grid`, division by `ρ₀`,
+and top slice extraction.
 """
 function load_5day_wind_stress(grid;
-                               taux_file="oceTAUX_bsoseI156_2014_5day.nc",
-                               tauy_file="oceTAUY_bsoseI156_2014_5day.nc",
-                               data_dir=default_bsose_directory(),
+                               dataset=BSOSE5Day(),
+                               dates=nothing,
                                ρ₀=1026.0)
-
-    taux_path = joinpath(data_dir, taux_file)
-    tauy_path = joinpath(data_dir, tauy_file)
-
-    if !isfile(taux_path)
-        error("5-day TAUX wind file not found at: $taux_path")
-    end
-    if !isfile(tauy_path)
-        error("5-day TAUY wind file not found at: $tauy_path")
-    end
-
-    @info "Loading 5-day averaged wind stress..."
-    @info "  TAUX: $taux_file"
-    @info "  TAUY: $tauy_file"
-
-    # Load 5-day wind data from NetCDF files
-    ds_taux = NCDataset(taux_path)
-    ds_tauy = NCDataset(tauy_path)
-
-    try
-        # Extract time and data
-        times = Array(ds_taux["time"][:])
-        taux_data = Array(ds_taux["oceTAUX"][:, :, :])  # (lon, lat, time)
-        tauy_data = Array(ds_tauy["oceTAUY"][:, :, :])
-
-        @info "  Loaded $(length(times)) time levels of 5-day wind data"
-
-        # Create Fields for each time step
-        taux_fields = []
-        tauy_fields = []
-
-        for t in 1:length(times)
-            # Create fields at center locations
-            taux_field = Field{Center, Center, Nothing}(grid)
-            tauy_field = Field{Center, Center, Nothing}(grid)
-
-            # Fill with data, converting from stress to kinematic momentum flux
-            interior(taux_field) .= taux_data[:, :, t] ./ ρ₀
-            interior(tauy_field) .= tauy_data[:, :, t] ./ ρ₀
-
-            push!(taux_fields, taux_field)
-            push!(tauy_fields, tauy_field)
+    ds5 = dataset isa BSOSE5Day ? dataset : BSOSE5Day(dataset.dir, dataset.iteration)
+    
+    if dates isa Tuple
+        start_d, end_d = dates
+        available = all_dates(ds5, :zonal_wind_stress)
+        wind_dates = filter(d -> (DateTime(d) >= DateTime(start_d) - Day(5)) && (DateTime(d) <= DateTime(end_d) + Day(5)), available)
+        if isempty(wind_dates)
+            wind_dates = available
         end
-
-        # Create FieldTimeSeries from Field vectors with times
-        # Use RectilinearGrid location specification (Center, Center, Nothing)
-        taux_fts = FieldTimeSeries(times, taux_fields)
-        tauy_fts = FieldTimeSeries(times, tauy_fields)
-
-        # Extract top boundary slices (same as monthly winds)
-        top_u_slice = boundary_slice_time_series(taux_fts, :top)
-        top_v_slice = boundary_slice_time_series(tauy_fts, :top)
-
-    finally
-        close(ds_taux)
-        close(ds_tauy)
+    elseif isnothing(dates)
+        wind_dates = all_dates(ds5, :zonal_wind_stress)
+    else
+        wind_dates = dates
     end
 
-    return (u=FluxBoundaryCondition(top_u_slice),
-            v=FluxBoundaryCondition(top_v_slice))
+    return bsose_surface_wind_stress(grid; dataset=ds5, dates=wind_dates, ρ₀)
 end
 
 # ==============================================================================
@@ -1184,7 +1203,8 @@ function bsose_open_boundary_conditions(grid;
     is_x_periodic = topology(underlying, 1) === Periodic
 
     # Unified dataset filename
-    default_dataset_name = "bsose_dataset_$(dataset.iteration)_$(start_str)_to_$(end_str)_$(Nx)x$(Ny)x$(Nz).jld2"
+    wind_tag = winds == "5day" ? "_5daywinds" : (winds === true ? "_winds" : "")
+    default_dataset_name = "bsose_dataset_$(dataset.iteration)_$(start_str)_to_$(end_str)_$(Nx)x$(Ny)x$(Nz)$(wind_tag).jld2"
     dataset_path = cache_file !== nothing ? cache_file : joinpath(dataset.dir, default_dataset_name)
 
     # 1. Attempt loading from single unified dataset
@@ -1261,7 +1281,7 @@ function bsose_open_boundary_conditions(grid;
             top_u_cached = wind_bcs.u
             top_v_cached = wind_bcs.v
         elseif winds == "5day"
-            wind_bcs = load_5day_wind_stress(grid; ρ₀)
+            wind_bcs = load_5day_wind_stress(grid; dataset, dates=(start_d, end_d), ρ₀)
             top_u_cached = wind_bcs.u
             top_v_cached = wind_bcs.v
         end
@@ -1371,7 +1391,7 @@ function bsose_open_boundary_conditions(grid;
             top_u_bc = top_u_cached
             top_v_bc = top_v_cached
         else
-            wind_bcs = load_5day_wind_stress(grid; ρ₀)
+            wind_bcs = load_5day_wind_stress(grid; dataset, dates=(start_d, end_d), ρ₀)
             top_u_bc = wind_bcs.u
             top_v_bc = wind_bcs.v
         end
