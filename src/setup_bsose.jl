@@ -51,7 +51,8 @@ import NumericalEarth.DataWrangling:
     available_variables,
     default_inpainting,
     centers_to_interfaces,
-    metadata_path
+    metadata_path,
+    resolve_filename
 
 import Downloads: download
 
@@ -142,6 +143,11 @@ end
 
 Base.summary(ds::BSOSE5Day) = "BSOSE5Day(iteration=$(ds.iteration), dir=\"$(ds.dir)\")"
 
+# NumericalEarth DataWrangling interface for BSOSE5Day
+dataset_variable_name(ds::BSOSE5Day, var::Symbol) = get(BSOSE_VARIABLE_NAMES, var, string(var))
+dataset_location(ds::BSOSE5Day, var::Symbol) = get(BSOSE_LOCATIONS, var, (Center, Center, Center))
+resolve_filename(ds::BSOSE5Day, var_name::Symbol) = resolve_5day_wind_filename(ds.dir, var_name, ds.iteration)
+
 # Variable name dictionary
 const BSOSE_VARIABLE_NAMES = Dict(
     :temperature => "THETA",
@@ -188,6 +194,54 @@ const BSOSE_LOCATIONS = Dict(
 )
 
 bsose_iteration_tokens(iteration::Int) = ("i$(iteration)", "$(iteration)")
+
+"""
+    resolve_5day_wind_filename(dir::String, var_name::Symbol, iteration::Int)
+
+Resolve 5-day averaged wind stress filename for a given variable.
+"""
+function resolve_5day_wind_filename(dir::String, var_name::Symbol, iteration::Int)
+    shortname = get(BSOSE_VARIABLE_NAMES, var_name, string(var_name))
+
+    # Candidate filename patterns for 5-day wind stress
+    cands_156 = [
+        "$(shortname)_bsoseI156_2014_5day.nc",
+        "$(uppercase(shortname))_bsoseI156_2014_5day.nc",
+        "$(titlecase(shortname))_bsoseI156_2014_5day.nc",
+        "bsose_i156_2014_5day_$(shortname).nc",
+    ]
+
+    cands_105 = [
+        "$(shortname)_bsoseI105_2008to2012_5day.nc",
+        "bsose_i105_2008to2012_5day_$(shortname).nc",
+    ]
+
+    candidates = iteration == 156 ? vcat(cands_156, cands_105) : vcat(cands_105, cands_156)
+
+    for cand in candidates
+        if isfile(joinpath(dir, cand))
+            return cand
+        end
+    end
+
+    # Fallback: search directory for any 5day file matching the variable
+    if isdir(dir)
+        t_low = lowercase(shortname)
+        matches = filter(readdir(dir)) do f
+            endswith(f, ".nc") && occursin("5day", lowercase(f)) && occursin(t_low, lowercase(f))
+        end
+
+        for token in bsose_iteration_tokens(iteration)
+            for f in matches
+                occursin(token, lowercase(f)) && return f
+            end
+        end
+
+        isempty(matches) || return first(matches)
+    end
+
+    return iteration == 156 ? "$(shortname)_bsoseI156_2014_5day.nc" : "$(shortname)_bsoseI105_2008to2012_5day.nc"
+end
 
 """
     bsose_names_iteration(filename, iteration)
@@ -1125,30 +1179,14 @@ end
                           dates = nothing,
                           ρ₀ = 1026.0)
 
-Load 5-day averaged wind stress via the exact same DataWrangling pipeline as monthly winds:
-native grid cropping, land inpainting, bilinear interpolation onto `grid`, division by `ρ₀`,
-and top slice extraction.
+Load 5-day averaged wind stress via the same Metadata/FieldTimeSeries pipeline as monthly winds.
+Works with BSOSE5Day dataset type to find and load the 5-day wind files.
 """
 function load_5day_wind_stress(grid;
                                dataset=BSOSE5Day(),
                                dates=nothing,
                                ρ₀=1026.0)
-    ds5 = dataset isa BSOSE5Day ? dataset : BSOSE5Day(dataset.dir, dataset.iteration)
-    
-    if dates isa Tuple
-        start_d, end_d = dates
-        available = all_dates(ds5, :zonal_wind_stress)
-        wind_dates = filter(d -> (DateTime(d) >= DateTime(start_d) - Day(5)) && (DateTime(d) <= DateTime(end_d) + Day(5)), available)
-        if isempty(wind_dates)
-            wind_dates = available
-        end
-    elseif isnothing(dates)
-        wind_dates = all_dates(ds5, :zonal_wind_stress)
-    else
-        wind_dates = dates
-    end
-
-    return bsose_surface_wind_stress(grid; dataset=ds5, dates=wind_dates, ρ₀)
+    return bsose_surface_wind_stress(grid; dataset=dataset, dates=dates, ρ₀=ρ₀)
 end
 
 # ==============================================================================
@@ -1281,7 +1319,7 @@ function bsose_open_boundary_conditions(grid;
             top_u_cached = wind_bcs.u
             top_v_cached = wind_bcs.v
         elseif winds == "5day"
-            wind_bcs = load_5day_wind_stress(grid; dataset, dates=(start_d, end_d), ρ₀)
+            wind_bcs = load_5day_wind_stress(grid; dataset=BSOSE5Day(; dir=dataset.dir), dates=(start_d, end_d), ρ₀)
             top_u_cached = wind_bcs.u
             top_v_cached = wind_bcs.v
         end
@@ -1391,7 +1429,7 @@ function bsose_open_boundary_conditions(grid;
             top_u_bc = top_u_cached
             top_v_bc = top_v_cached
         else
-            wind_bcs = load_5day_wind_stress(grid; dataset, dates=(start_d, end_d), ρ₀)
+            wind_bcs = load_5day_wind_stress(grid; dataset=BSOSE5Day(; dir=dataset.dir), dates=(start_d, end_d), ρ₀)
             top_u_bc = wind_bcs.u
             top_v_bc = wind_bcs.v
         end
