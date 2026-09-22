@@ -301,7 +301,7 @@ end
 
 # some housekeeping to set up the simulation (progress checks and adaptive timestep)
 
-stop_time = haskey(ENV, "STOP_TIME") ? parse(Float64, ENV["STOP_TIME"]) : 60days
+stop_time = haskey(ENV, "STOP_TIME") ? parse(Float64, ENV["STOP_TIME"]) : 365days
 stop_iteration = haskey(ENV, "STOP_ITERATION") ? parse(Int, ENV["STOP_ITERATION"]) : Inf
 # Start with a very small Δt so the first CATKE evaluation is numerically gentle;
 # the wizard will ramp this up within a few iterations.
