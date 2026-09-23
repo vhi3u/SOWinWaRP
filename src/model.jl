@@ -15,7 +15,7 @@ using Statistics: mean
 using SeawaterPolynomials
 using Oceananigans.TurbulenceClosures
 using Oceananigans.Grids: φnode
-using Oceananigans.Operators: Azᶜᶜᶜ
+using Oceananigans.Operators: Azᶜᶜᶜ, Ax_qᶠᶜᶜ, Ay_qᶜᶠᶜ
 using Oceananigans.BoundaryConditions: PerturbationAdvection, NormalRadiation
 using Oceanostics.ProgressMessengers: TimedMessenger
 
@@ -42,6 +42,17 @@ const OBCS = true # open boundary conditions (NormalFlow with PerturbationAdvect
 const SPONGE_LAYERS = true # sponge layer restoring (DatasetRestoring) near open boundary edges
 const WINDS = true # time-varying surface wind forcing from BSOSE data (oceTAUX and oceTAUY)
 const CHECKPOINTS = false # save state and restart if the model crashes. If false, the model will start from scratch. 
+const BOUNDARY_DIAGNOSTICS = true # write free-surface height, boundary-face slices, and a per-face volume transport log
+
+# Open boundary matching scheme: "PerturbationAdvection", "NormalRadiation", or "clamped".
+const OBC_SCHEME = "PerturbationAdvection"
+
+# Turbulence closure set: "ito", "bsose", "henyey_gm", "biharmonic", or "none". Each is
+# described where the closures are built below.
+const CLOSURE_CONFIG = "ito"
+
+# Stop the run early after this many time steps, for a smoke test. Inf runs the full period.
+const STOP_ITERATION = Inf
 
 # domain related parameters
 const SCALING = 6 # horizontal resolution = 1 / SCALING degrees. 1/6 = ~15km, 1/2 = 50km
@@ -119,26 +130,70 @@ end
 
 @info "Selected dataset: $(summary(dataset))"
 
-# Simulation time window (1 year of forcing): local device has a different dataset than HPC GPU.
-if arch isa CPU
-    start_date = DateTime(2009, 1, 1)
-    end_date = DateTime(2009, 12, 31)
-else
-    start_date = DateTime(2014, 1, 1)
-    end_date = DateTime(2014, 12, 31)
-end
-dates = (start_date, end_date)
+# ==============================================================================
+# Simulation window
+#
+# The period the model simulates: it starts at start_date and stops at end_date. These
+# two lines are the only place the period is set — the stop time, the monthly records
+# loaded for the boundary conditions, winds and sponges, and the date the initial
+# condition is read from all follow from them.
+#
+# BSOSE iteration 156 (HPC) covers 2013-2024; iteration 105 (local CPU) covers
+# 2008-2012, so a local test run needs dates inside that earlier range.
+# ==============================================================================
+start_date = DateTime("2014-06-01")
+end_date = DateTime("2016-06-01")
 
-# Boundary condition, sponge and wind forcing dates: the twelve monthly records of the simulation
-# year, so the series interpolates smoothly across month boundaries, wraps with a one-year
-# cyclical period, and covers the same year the initial condition is taken from. BSOSE stamps
-# each monthly mean at the end of the month it averages, so the records of a calendar year are
-# those stamped inside it.
+# option if need to do tests on CPU
+# start_date = DateTime("2009-06-01")
+# end_date = DateTime("2011-06-01")
+
+end_date > start_date || error("end_date ($end_date) must be later than start_date ($start_date).")
+
+dates = (start_date, end_date)
+simulation_seconds = Dates.value(Second(end_date - start_date))
+simulation_days = simulation_seconds / 86400
+
+# Monthly records for the boundary conditions, winds and sponge nudging.
 all_available_dates = all_dates(dataset, :temperature)
-simulation_year_dates = filter(d -> start_date <= d < start_date + Year(1), all_available_dates)
-bc_dates = length(simulation_year_dates) >= 12 ? simulation_year_dates[1:12] : all_available_dates[1:12]
-@info "Boundary condition dates: $(length(bc_dates)) time levels from $(bc_dates[1]) to $(bc_dates[end])"
-@info "Model time zero corresponds to $start_date; forcing is stepped on that clock."
+
+if end_date < first(all_available_dates) || start_date > last(all_available_dates)
+    error("""$(summary(dataset)) holds no data for $start_date to $end_date. Its monthly records \
+             run from $(first(all_available_dates)) to $(last(all_available_dates)); set start_date \
+             and end_date above to a period inside that range.""")
+end
+
+# Take the records whose data falls inside the run and extend by one at each end. Taking the
+# whole window rather than a fixed twelve is what makes a multi-year run follow the real
+# BSOSE years instead of replaying one year cyclically; the extra record at each end lets
+# the series interpolate across the first and last half-month rather than wrapping around
+# to the other end of the record.
+#
+# The test is on each record's window CENTRE, not on its stamp. A record's value sits at the
+# middle of the month it averages while its stamp sits at the end of that month, so
+# selecting on stamps pads the head by two records and leaves the tail half a month short —
+# which silently hands the last two weeks of the run to the cyclical wrap.
+inside = findall(d -> start_date <= bsose_window_center(d) <= end_date, all_available_dates)
+
+lo, hi = if isempty(inside)   # a run shorter than the gap between records: bracket it
+    (something(findlast(d -> bsose_window_center(d) <= start_date, all_available_dates), firstindex(all_available_dates)),
+        something(findfirst(d -> bsose_window_center(d) >= end_date, all_available_dates), lastindex(all_available_dates)))
+else
+    (first(inside), last(inside))
+end
+
+lo = max(firstindex(all_available_dates), lo - 1)
+hi = min(lastindex(all_available_dates), hi + 1)
+bc_dates = all_available_dates[lo:hi]
+
+if bsose_window_center(last(bc_dates)) < end_date
+    @warn """$(summary(dataset)) records stop at $(last(bc_dates)), before the run ends at $end_date. \
+             The forcing will wrap cyclically for the remainder of the run."""
+end
+
+@info @sprintf("Simulating %s to %s (%.1f days)", start_date, end_date, simulation_days)
+@info "Boundary condition dates: $(length(bc_dates)) monthly records from $(bc_dates[1]) to $(bc_dates[end])"
+@info "Model time zero corresponds to $start_date; all forcing is stepped on that clock."
 
 # ==============================================================================
 # Boundary Conditions & Forcing
@@ -150,15 +205,14 @@ if OBCS && DATASET == "BSOSE"
     # rigid Dirichlet boundaries reflect outgoing eddies and waves, leading to tracer blowup at the boundary.
     # PerturbationAdvection / NormalRadiation with outflow_timescale=Inf allows internal waves/eddies to freely
     # radiate out of the domain, while inflow_timescale=1days nudges incoming boundary flow (West) smoothly to BSOSE.
-    obc_scheme_type = get(ENV, "OBC_SCHEME", "PerturbationAdvection")
-    obc_scheme = if obc_scheme_type == "PerturbationAdvection"
+    obc_scheme = if OBC_SCHEME == "PerturbationAdvection"
         PerturbationAdvection(inflow_timescale=1days, outflow_timescale=Inf)
-    elseif obc_scheme_type == "NormalRadiation"
+    elseif OBC_SCHEME == "NormalRadiation"
         NormalRadiation(inflow_timescale=1days, outflow_timescale=Inf)
-    elseif obc_scheme_type == "clamped" || obc_scheme_type == "none"
+    elseif OBC_SCHEME == "clamped" || OBC_SCHEME == "none"
         nothing
     else
-        error("Unknown OBC_SCHEME: $obc_scheme_type. Choose 'PerturbationAdvection', 'NormalRadiation', or 'clamped'.")
+        error("Unknown OBC_SCHEME: $OBC_SCHEME. Choose 'PerturbationAdvection', 'NormalRadiation', or 'clamped'.")
     end
     @info "  -> OBC Scheme: $(obc_scheme === nothing ? "Clamped Dirichlet" : summary(obc_scheme))"
 
@@ -202,7 +256,7 @@ end
 # 1. Base vertical mixing: CATKE (TKE-based boundary layer and interior mixing)
 catke_closure = NumericalEarth.Oceans.default_ocean_closure()
 
-# 2. Closure configuration switch (configurable via ENV["CLOSURE_CONFIG"]):
+# 2. Closure configuration switch (set by CLOSURE_CONFIG at the top of this file):
 #   - "ito" (Default): Ito et al. (2026) MITgcm baseline configuration
 #         * Horizontal: Biharmonic viscosity & diffusivity Ah = 3×10⁹ m⁴/s (momentum & tracers, Laplacian K=0)
 #         * Vertical: CATKE + background vertical diffusivity & viscosity (νz = 10⁻⁵ m²/s, κz = 10⁻⁵ m²/s)
@@ -216,15 +270,13 @@ catke_closure = NumericalEarth.Oceans.default_ocean_closure()
 #         * Eddy: IsopycnalSkewSymmetricDiffusivity (κ_skew = 500, κ_symmetric = 200)
 #   - "biharmonic": Constant biharmonic (ν = 10¹⁰ m⁴/s, κ = 10¹⁰ m⁴/s) + CATKE
 #   - "none": CATKE vertical mixing only
-closure_config = get(ENV, "CLOSURE_CONFIG", get(ENV, "HORIZONTAL_CLOSURE", "ito"))
-
-closures = if closure_config == "ito"
+closures = if CLOSURE_CONFIG == "ito"
     # Ito et al. (2026): biharmonic Ah = 3e9 m⁴/s, background νz,κz = 1e-5 m²/s
     horizontal_viscosity = HorizontalScalarBiharmonicDiffusivity(ν=3e9, κ=3e9)
     vertical_diffusivity = VerticalScalarDiffusivity(ν=1e-5, κ=1e-5)
     (catke_closure, horizontal_viscosity, vertical_diffusivity)
 
-elseif closure_config == "bsose"
+elseif CLOSURE_CONFIG == "bsose"
     # BSOSE standard values:
     # Horizontal viscosity 10 m² s⁻¹, Horizontal diffusivity 10 m² s⁻¹
     # Vertical viscosity 1e-3 m² s⁻¹, Vertical diffusivity 1e-4 m² s⁻¹
@@ -232,7 +284,7 @@ elseif closure_config == "bsose"
     vertical_diffusivity = VerticalScalarDiffusivity(ν=1e-3, κ=1e-4)
     (catke_closure, horizontal_diffusivity, vertical_diffusivity)
 
-elseif closure_config == "henyey_gm"
+elseif CLOSURE_CONFIG == "henyey_gm"
     # Biharmonic horizontal viscosity with timescale of 15 days
     @inline νhb(i, j, k, grid, timescale) = Azᶜᶜᶜ(i, j, k, grid)^2 / timescale
     ν_field = Field{Center,Center,Center}(grid)
@@ -250,17 +302,17 @@ elseif closure_config == "henyey_gm"
 
     (catke_closure, eddy_closure, horizontal_viscosity, vertical_diffusivity)
 
-elseif closure_config == "biharmonic"
+elseif CLOSURE_CONFIG == "biharmonic"
     horizontal_viscosity = HorizontalScalarBiharmonicDiffusivity(ν=1e10, κ=1e10)
     (catke_closure, horizontal_viscosity)
 
-elseif closure_config == "none"
+elseif CLOSURE_CONFIG == "none"
     catke_closure
 else
-    error("Unknown CLOSURE_CONFIG: $closure_config. Choose 'ito', 'bsose', 'henyey_gm', 'biharmonic', or 'none'.")
+    error("Unknown CLOSURE_CONFIG: $CLOSURE_CONFIG. Choose 'ito', 'bsose', 'henyey_gm', 'biharmonic', or 'none'.")
 end
 
-@info "Selected closure configuration: $closure_config"
+@info "Selected closure configuration: $CLOSURE_CONFIG"
 @info "Turbulence closures: $(summary(closures))"
 
 
@@ -301,11 +353,12 @@ end
 
 # some housekeeping to set up the simulation (progress checks and adaptive timestep)
 
-stop_time = haskey(ENV, "STOP_TIME") ? parse(Float64, ENV["STOP_TIME"]) : 365days
-stop_iteration = haskey(ENV, "STOP_ITERATION") ? parse(Int, ENV["STOP_ITERATION"]) : Inf
+# The run length comes from start_date and end_date; STOP_ITERATION can cut it short.
 # Start with a very small Δt so the first CATKE evaluation is numerically gentle;
 # the wizard will ramp this up within a few iterations.
-simulation = Simulation(ocean.model, Δt=1seconds, stop_time=stop_time, stop_iteration=stop_iteration)
+simulation = Simulation(ocean.model, Δt=1seconds,
+    stop_time=Float64(simulation_seconds),
+    stop_iteration=STOP_ITERATION)
 
 # adaptive timestep wizard based on CFL (following mediterranean.jl: cfl=0.2, max_change=1.1)
 wizard = TimeStepWizard(cfl=0.6, max_change=1.1, min_Δt=0.1)
@@ -363,6 +416,87 @@ simulation.output_writers[:mid_lon] = NetCDFWriter(
     indices=(mid_lon_idx, :, :),
     overwrite_existing=true
 )
+
+# ==============================================================================
+# Open boundary diagnostics
+#
+# Three things are needed to tell an open boundary from a bounded box, and none of
+# them are in the surface or mid-longitude output:
+#
+#   1. Free-surface height. Water that cannot leave piles up in η, so a drifting
+#      domain-mean η is the direct signature of a net volume imbalance.
+#   2. Volume transport through each of the four faces. Net outflow should be a small
+#      residual of the gross transport (the ACC alone carries ~100 Sv through this
+#      domain) and should balance the rate of change of volume in the free surface.
+#   3. Full-depth slices at each face, to see whether flow and tracers cross the
+#      boundary at every depth or only near the surface, and to compare against the
+#      BSOSE values the boundary conditions prescribe.
+# ==============================================================================
+
+if BOUNDARY_DIAGNOSTICS
+    # η lives at (Center, Center, Face) on a single level, which NetCDFWriter cannot write
+    # directly; reducing over the (length-one) vertical gives an ordinary 2D field.
+    η_2d = Field(Average(ocean.model.free_surface.displacement, dims=3))
+
+    simulation.output_writers[:free_surface] = NetCDFWriter(
+        ocean.model,
+        (; η=η_2d),
+        filename="model_free_surface.nc",
+        schedule=TimeInterval(output_interval),
+        overwrite_existing=true
+    )
+
+    # Outermost cell of each face, full depth. The writer takes a single `indices` tuple,
+    # so on the east and north faces the normal velocity written is the inner face of that
+    # cell; the exact boundary-face transport is what the log below integrates.
+    boundary_interval = 5days
+    face_indices = (west=(1, :, :),
+        east=(grid.Nx, :, :),
+        south=(:, 1, :),
+        north=(:, grid.Ny, :))
+
+    for (face, indices) in pairs(face_indices)
+        simulation.output_writers[Symbol(:face_, face)] = NetCDFWriter(
+            ocean.model,
+            (; u, v, T, S),
+            filename="model_face_$(face).nc",
+            schedule=TimeInterval(boundary_interval),
+            indices=indices,
+            overwrite_existing=true
+        )
+    end
+
+    # Volume transport through each boundary face: ∫∫ u·n dA over the face.
+    u_transport = KernelFunctionOperation{Face,Center,Center}(Ax_qᶠᶜᶜ, grid, u)
+    v_transport = KernelFunctionOperation{Center,Face,Center}(Ay_qᶜᶠᶜ, grid, v)
+
+    west_transport = Field(u_transport; indices=(1, :, :))
+    east_transport = Field(u_transport; indices=(grid.Nx + 1, :, :))
+    south_transport = Field(v_transport; indices=(:, 1, :))
+    north_transport = Field(v_transport; indices=(:, grid.Ny + 1, :))
+
+    function log_open_boundaries(sim)
+        Sv = 1e6
+        west = sum(compute!(west_transport)) / Sv
+        east = sum(compute!(east_transport)) / Sv
+        south = sum(compute!(south_transport)) / Sv
+        north = sum(compute!(north_transport)) / Sv
+
+        # Outward-positive, so `net` is the volume leaving the domain per unit time.
+        net = -west + east - south + north
+        gross = abs(west) + abs(east) + abs(south) + abs(north)
+        residual = gross == 0 ? 0.0 : 100 * abs(net) / gross
+
+        η = sim.model.free_surface.displacement
+        @info @sprintf("        transport (Sv): W %+8.2f | E %+8.2f | S %+8.2f | N %+8.2f || net out %+8.3f (%.2f%% of gross)",
+            west, east, south, north, net, residual)
+        @info @sprintf("        free surface  : mean η = %+.4f m, max|η| = %.4f m",
+            mean(η), maximum(abs, η))
+        flush(stdout)
+    end
+
+    simulation.callbacks[:open_boundaries] = Callback(log_open_boundaries, TimeInterval(output_interval))
+end
 
 # checkpointing
 

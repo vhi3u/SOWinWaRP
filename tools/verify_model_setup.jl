@@ -239,7 +239,7 @@ else
 end
 
 catke_closure = NumericalEarth.Oceans.default_ocean_closure()
-closure_config = get(ENV, "CLOSURE_CONFIG", get(ENV, "HORIZONTAL_CLOSURE", "ito"))
+closure_config = get(ENV, "CLOSURE_CONFIG", "ito")   # matches CLOSURE_CONFIG in src/model.jl
 
 closures = if closure_config == "ito"
     # Ito et al. (2026): biharmonic Ah = 3e9 m⁴/s, background νz,κz = 1e-5 m²/s

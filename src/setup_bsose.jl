@@ -264,10 +264,32 @@ DataWrangling.reversed_vertical_axis(::BSOSEDataset) = true
 # month the average was taken over, which is what `native_times` needs to place each sample at
 # its own middle rather than at its end, and what gives a twelve-month series a `Cyclical`
 # period of exactly one year instead of one inferred from the spacing of the stamps.
-function DataWrangling.averaging_window(metadatum::BSOSEMetadatum)
-    window_stop = round(DateTime(metadatum.dates), Month)
+"""
+    bsose_averaging_window(stamp)
+
+The `(start, stop)` dates of the month a BSOSE monthly record averages, recovered from the
+date it is stamped with by snapping that stamp to the nearest month boundary.
+"""
+function bsose_averaging_window(stamp)
+    window_stop = round(DateTime(stamp), Month)
     return (window_stop - Month(1), window_stop)
 end
+
+"""
+    bsose_window_center(stamp)
+
+The middle of the month a BSOSE monthly record averages, which is where a linearly
+interpolating `FieldTimeSeries` places that record's value. Half a month earlier than the
+date the record is stamped with, so it is the right thing to compare a simulation date
+against when choosing which records a run needs.
+"""
+function bsose_window_center(stamp)
+    window_start, window_stop = bsose_averaging_window(stamp)
+    half = Dates.value(Millisecond(window_stop - window_start)) ÷ 2
+    return window_start + Millisecond(half)
+end
+
+DataWrangling.averaging_window(metadatum::BSOSEMetadatum) = bsose_averaging_window(metadatum.dates)
 
 """
     model_clock_offset(metadata, reference_date)
@@ -743,12 +765,16 @@ function find_bsose_time_index(ds::Dataset, target_date)
 
     time_raw = ds["time"][:]
     target_dt = DateTime(target_date)
-    target_y = Dates.year(target_dt)
-    target_m = Dates.month(target_dt)
 
+    # Pick the record whose averaging window contains `target_date`, using the same
+    # convention as `averaging_window`: a BSOSE monthly mean is stamped at the end of the
+    # month it averages. Matching the calendar month of the stamp instead would be wrong
+    # whenever the stamp drifts past the month boundary — the February mean of iteration
+    # 105 is stamped 2008-03-01T20:00, so a run starting 2008-03-01 would initialise from
+    # February data while its boundary conditions and winds are already in March.
     for (i, t) in enumerate(time_raw)
-        dt = DateTime(t)
-        if Dates.year(dt) == target_y && Dates.month(dt) == target_m
+        window_start, window_stop = bsose_averaging_window(t)
+        if window_start <= target_dt < window_stop
             return i
         end
     end
