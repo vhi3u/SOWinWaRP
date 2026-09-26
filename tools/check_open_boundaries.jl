@@ -53,6 +53,11 @@ np = max(2, min(probe_cells, Nx ÷ 3, Ny ÷ 3))
 Δφ = φf[2] - φf[1]
 
 println(@sprintf("  - Grid: Nx = %d, Ny = %d, %d snapshots over %.1f days", Nx, Ny, Nt, days[end] - days[1]))
+println(@sprintf("  - Assuming model day 0 = %s, so the run covers %s to %s.",
+    Dates.format(start_date, "yyyy-mm-dd"),
+    Dates.format(start_date, "yyyy-mm-dd"),
+    Dates.format(start_date + Second(round(Int, times[end])), "yyyy-mm-dd")))
+println("    (this must match start_date in src/model.jl — set START_DATE to override)")
 println(@sprintf("  - Probing %d cells in from each face (sponge is %.1f° ≈ %.0f cells in x, %.0f in y)",
     np, sponge_width, sponge_width / Δλ, sponge_width / Δφ))
 
@@ -229,21 +234,25 @@ if compare_bsose
 
         dataset = BSOSEMonthly()
         available = all_dates(dataset, :temperature)
-        year_dates = filter(d -> start_date <= d < start_date + Year(1), available)
-        bc_dates = length(year_dates) >= 12 ? year_dates[1:12] : available[1:12]
+        run_end = start_date + Second(round(Int, times[end]))
+
+        # The same rule src/model.jl uses: records whose window CENTRE falls in the run,
+        # extended by one at each end so the first and last half-month interpolate instead
+        # of wrapping cyclically to the far end of the record.
+        inside = findall(d -> start_date <= bsose_window_center(d) <= run_end, available)
+        lo, hi = isempty(inside) ?
+                 (something(findlast(d -> bsose_window_center(d) <= start_date, available), firstindex(available)),
+            something(findfirst(d -> bsose_window_center(d) >= run_end, available), lastindex(available))) :
+                 (first(inside), last(inside))
+        lo = max(firstindex(available), lo - 1)
+        hi = min(lastindex(available), hi + 1)
+        bc_dates = available[lo:hi]
+
         println(@sprintf("  Using %s, %d monthly records, %s to %s",
             summary(dataset), length(bc_dates), bc_dates[1], bc_dates[end]))
 
         region = bsose_region(grid2d)
-        series = Dict{Symbol,Any}()
-        for (key, name) in ((:T, :temperature), (:S, :salinity), (:u, :u_velocity), (:v, :v_velocity))
-            metadata = Metadata(name; dataset, dates=bc_dates, region)
-            fts = FieldTimeSeries(metadata, grid2d)
-            fts.times .+= model_clock_offset(metadata, start_date)   # onto the model clock
-            series[key] = fts
-        end
 
-        # Sample BSOSE at every model output time, at the outermost cell of each face
         for f in active_faces
             bsose_model[f] = Dict{Symbol,Matrix{Float64}}()
             bsose_data[f] = Dict{Symbol,Matrix{Float64}}()
@@ -253,20 +262,51 @@ if compare_bsose
             end
         end
 
-        # Where each face sits in the horizontal, and the sign that makes its normal
-        # velocity point out of the domain.
+        # Read each record once at the boundary cells, then interpolate those short series
+        # in time onto the model output times. Sampling the FieldTimeSeries at all 366 model
+        # times instead would re-interpolate the whole domain hundreds of times over.
+        record_times = Float64[]
+        record_lines = Dict(f => Dict(var => Vector{Vector{Float64}}() for var in (:T, :S, :normal))
+                            for f in active_faces)
+
         edge_of = Dict(:west => (A -> A[1, :]), :east => (A -> A[Nx, :]),
             :south => (A -> A[:, 1]), :north => (A -> A[:, Ny]))
         normal_component = Dict(:west => :u, :east => :u, :south => :v, :north => :v)
         outward_sign = Dict(:west => -1, :east => 1, :south => -1, :north => 1)
 
-        for t in 1:Nt
-            snapshot = Dict(key => interior(fts[Oceananigans.Units.Time(times[t])], :, :, 1)
-                            for (key, fts) in series)
-            for f in active_faces
-                bsose_data[f][:T][:, t] = edge_of[f](snapshot[:T])
-                bsose_data[f][:S][:, t] = edge_of[f](snapshot[:S])
-                bsose_data[f][:normal][:, t] = outward_sign[f] .* edge_of[f](snapshot[normal_component[f]])
+        fields = Dict{Symbol,Any}()
+        for (key, name) in ((:T, :temperature), (:S, :salinity), (:u, :u_velocity), (:v, :v_velocity))
+            metadata = Metadata(name; dataset, dates=bc_dates, region)
+            fts = FieldTimeSeries(metadata, grid2d)
+            offset = model_clock_offset(metadata, start_date)   # onto the model clock
+            if key == :T
+                append!(record_times, fts.times .+ offset)
+            end
+            fields[key] = [Array(interior(fts[n], :, :, 1)) for n in 1:length(fts.times)]
+        end
+
+        for f in active_faces
+            for n in 1:length(record_times)
+                push!(record_lines[f][:T], edge_of[f](fields[:T][n]))
+                push!(record_lines[f][:S], edge_of[f](fields[:S][n]))
+                push!(record_lines[f][:normal], outward_sign[f] .* edge_of[f](fields[normal_component[f]][n]))
+            end
+        end
+
+        # Linear interpolation in time, holding the end values outside the record range
+        function at_model_time(lines, t)
+            n = searchsortedlast(record_times, t)
+            n <= 0 && return lines[1]
+            n >= length(record_times) && return lines[end]
+            w = (t - record_times[n]) / (record_times[n+1] - record_times[n])
+            return (1 - w) .* lines[n] .+ w .* lines[n+1]
+        end
+
+        for f in active_faces
+            for var in (:T, :S, :normal)
+                for t in 1:Nt
+                    bsose_data[f][var][:, t] = at_model_time(record_lines[f][var], times[t])
+                end
             end
         end
 

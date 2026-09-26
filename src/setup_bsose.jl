@@ -1377,6 +1377,12 @@ function bsose_open_boundary_conditions(grid;
     # Note: On East/West boundaries, normal velocity is u (NormalFlow), tangential is v (Value).
     #       On South/North boundaries, normal velocity is v (NormalFlow), tangential is u (Value).
     # If the domain is longitudinally periodic (e.g. Circumpolar), only South and North BCs are applied.
+    #
+    # The tangential conditions are deliberately plain `Value`, with no matching scheme. Giving
+    # them the scheme as well was tried and diverges: `Value(PerturbationAdvection)` on a
+    # tangential component sends v on the west/east faces from 0.17 m/s to NaN within about ten
+    # time steps, at inflow/outflow timescales of 0/Inf, 1day/Inf, 0/1day and 1hour/1day alike.
+    # It surfaces as `InexactError: Int64(NaN)` in `step_free_surface!`, not as an obvious blowup.
     if is_x_periodic
         @info " -> Longitude is Periodic (circumpolar): applying South & North boundary conditions."
         u_bcs = FieldBoundaryConditions(
