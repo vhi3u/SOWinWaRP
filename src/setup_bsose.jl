@@ -1378,24 +1378,30 @@ function bsose_open_boundary_conditions(grid;
     #       On South/North boundaries, normal velocity is v (NormalFlow), tangential is u (Value).
     # If the domain is longitudinally periodic (e.g. Circumpolar), only South and North BCs are applied.
     #
-    # The tangential components carry a matching scheme too, so that an eddy on its way out of
-    # the domain is not held to the monthly-mean along-boundary velocity while its normal
-    # component radiates away — clamping them leaves meridional velocity visibly stuck along
-    # the western boundary.
+    # The tangential components get a zero-gradient condition rather than a prescribed value.
     #
-    # Caution: at 1 degree on CPU this configuration diverges within ~5 time steps (v on the
-    # west/east faces runs away to NaN, surfacing as `InexactError: Int64(NaN)` in
-    # `step_free_surface!` once the timestep wizard next runs). That was reproduced at eight
-    # inflow/outflow timescale pairs and with biharmonic viscosity scaled up 1300x to match the
-    # 1/6-degree damping rate. The 1 degree grid does not reproduce the western-boundary
-    # artifact this is meant to fix, so it may not be a faithful test of the production setup —
-    # but watch the first minute of a run for that error.
-    tangential_scheme = PerturbationAdvection(inflow_timescale=5days, outflow_timescale=5days)
+    # Two things motivate this. First, a `Value` condition fills the halo by mirroring the
+    # interior about the prescribed value (`v_halo = 2 v̄ - v_interior`), so any departure of
+    # the interior from the monthly mean is reflected back with the opposite sign; against a
+    # biharmonic viscosity that produces a boundary overshoot, which is the meridional velocity
+    # visibly pinned along the western edge. Second, the split-explicit free surface gives the
+    # BAROTROPIC tangential velocity a zero-gradient (NoFlux) condition at these faces whatever
+    # the 3D field uses, so a prescribed value here also leaves the baroclinic and barotropic
+    # halves of the same face disagreeing. Zero gradient removes both: nothing is pinned, and
+    # the 3D condition matches the barotropic one.
+    #
+    # `Value(PerturbationAdvection)` is NOT the alternative — it diverges within ~5 time steps
+    # (v on west/east to NaN, surfacing as `InexactError: Int64(NaN)` in `step_free_surface!`),
+    # confirmed at eight inflow/outflow timescale pairs at 1 degree and at 1/6 degree on GPU.
+    #
+    # The BSOSE tangential velocity is not lost: the sponge layer restores u and v toward it
+    # across the outer `sponge_width` degrees.
+    tangential_bc() = GradientBoundaryCondition(0)
     if is_x_periodic
         @info " -> Longitude is Periodic (circumpolar): applying South & North boundary conditions."
         u_bcs = FieldBoundaryConditions(
-            south=ValueBoundaryCondition(u_south; scheme=tangential_scheme),
-            north=ValueBoundaryCondition(u_north; scheme=tangential_scheme),
+            south=tangential_bc(),
+            north=tangential_bc(),
             top=top_u_bc
         )
 
@@ -1420,14 +1426,14 @@ function bsose_open_boundary_conditions(grid;
         u_bcs = FieldBoundaryConditions(
             west=NormalFlowBoundaryCondition(u_west; scheme),
             east=NormalFlowBoundaryCondition(u_east; scheme),
-            south=ValueBoundaryCondition(u_south; scheme=tangential_scheme),
-            north=ValueBoundaryCondition(u_north; scheme=tangential_scheme),
+            south=tangential_bc(),
+            north=tangential_bc(),
             top=top_u_bc
         )
 
         v_bcs = FieldBoundaryConditions(
-            west=ValueBoundaryCondition(v_west; scheme=tangential_scheme),
-            east=ValueBoundaryCondition(v_east; scheme=tangential_scheme),
+            west=tangential_bc(),
+            east=tangential_bc(),
             south=NormalFlowBoundaryCondition(v_south; scheme),
             north=NormalFlowBoundaryCondition(v_north; scheme),
             top=top_v_bc
