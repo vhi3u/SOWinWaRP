@@ -1378,16 +1378,24 @@ function bsose_open_boundary_conditions(grid;
     #       On South/North boundaries, normal velocity is v (NormalFlow), tangential is u (Value).
     # If the domain is longitudinally periodic (e.g. Circumpolar), only South and North BCs are applied.
     #
-    # The tangential conditions are deliberately plain `Value`, with no matching scheme. Giving
-    # them the scheme as well was tried and diverges: `Value(PerturbationAdvection)` on a
-    # tangential component sends v on the west/east faces from 0.17 m/s to NaN within about ten
-    # time steps, at inflow/outflow timescales of 0/Inf, 1day/Inf, 0/1day and 1hour/1day alike.
-    # It surfaces as `InexactError: Int64(NaN)` in `step_free_surface!`, not as an obvious blowup.
+    # The tangential components carry a matching scheme too, so that an eddy on its way out of
+    # the domain is not held to the monthly-mean along-boundary velocity while its normal
+    # component radiates away — clamping them leaves meridional velocity visibly stuck along
+    # the western boundary.
+    #
+    # Caution: at 1 degree on CPU this configuration diverges within ~5 time steps (v on the
+    # west/east faces runs away to NaN, surfacing as `InexactError: Int64(NaN)` in
+    # `step_free_surface!` once the timestep wizard next runs). That was reproduced at eight
+    # inflow/outflow timescale pairs and with biharmonic viscosity scaled up 1300x to match the
+    # 1/6-degree damping rate. The 1 degree grid does not reproduce the western-boundary
+    # artifact this is meant to fix, so it may not be a faithful test of the production setup —
+    # but watch the first minute of a run for that error.
+    tangential_scheme = PerturbationAdvection(inflow_timescale=5days, outflow_timescale=5days)
     if is_x_periodic
         @info " -> Longitude is Periodic (circumpolar): applying South & North boundary conditions."
         u_bcs = FieldBoundaryConditions(
-            south=ValueBoundaryCondition(u_south),
-            north=ValueBoundaryCondition(u_north),
+            south=ValueBoundaryCondition(u_south; scheme=tangential_scheme),
+            north=ValueBoundaryCondition(u_north; scheme=tangential_scheme),
             top=top_u_bc
         )
 
@@ -1412,14 +1420,14 @@ function bsose_open_boundary_conditions(grid;
         u_bcs = FieldBoundaryConditions(
             west=NormalFlowBoundaryCondition(u_west; scheme),
             east=NormalFlowBoundaryCondition(u_east; scheme),
-            south=ValueBoundaryCondition(u_south),
-            north=ValueBoundaryCondition(u_north),
+            south=ValueBoundaryCondition(u_south; scheme=tangential_scheme),
+            north=ValueBoundaryCondition(u_north; scheme=tangential_scheme),
             top=top_u_bc
         )
 
         v_bcs = FieldBoundaryConditions(
-            west=ValueBoundaryCondition(v_west),
-            east=ValueBoundaryCondition(v_east),
+            west=ValueBoundaryCondition(v_west; scheme=tangential_scheme),
+            east=ValueBoundaryCondition(v_east; scheme=tangential_scheme),
             south=NormalFlowBoundaryCondition(v_south; scheme),
             north=NormalFlowBoundaryCondition(v_north; scheme),
             top=top_v_bc
