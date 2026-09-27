@@ -49,7 +49,7 @@ end
 # Change it for each experiment so runs do not overwrite one another, then animate
 # the result with `./run_animate_simulation RUN_NAME`.
 # ==============================================================================
-const RUN_NAME = "model"
+const RUN_NAME = "2YS6_surface_flux"
 
 # flags
 
