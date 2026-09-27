@@ -89,6 +89,10 @@ for f in face_names
     tracer_S[f] = Array{Float32}(undef, np, along, Nt)
 end
 
+# Track where the domain-wide surface extremes live: a maximum sitting in the outermost
+# cells is a boundary artifact setting the CFL, not the circulation.
+peak = Dict(:u => (val=0.0, i=0, j=0, t=0), :v => (val=0.0, i=0, j=0, t=0))
+
 print("Reading boundary strips")
 for t in 1:Nt
     t % max(1, Nt ÷ 20) == 0 && print(".")
@@ -120,6 +124,13 @@ for t in 1:Nt
     tracer_T[:north][:, :, t] = permutedims(T[:, Ny:-1:Ny-np+1], (2, 1))
     tracer_S[:south][:, :, t] = permutedims(S[:, 1:np], (2, 1))
     tracer_S[:north][:, :, t] = permutedims(S[:, Ny:-1:Ny-np+1], (2, 1))
+
+    for (name, field) in ((:u, uc), (:v, vc))
+        m, idx = findmax(abs, field)
+        if m > peak[name].val
+            peak[name] = (val=Float64(m), i=idx[1], j=idx[2], t=t)
+        end
+    end
 end
 println(" done")
 close(ds)
@@ -156,6 +167,17 @@ for f in active_faces
     println(@sprintf("%-7s %10.4f %10.4f %10.4f %10.4f %11.1f%%",
         f, mean(edge), maximum(edge), minimum(edge), maximum(abs, edge),
         100 * mean(outflow_fraction[f])))
+end
+
+println()
+println("Where the domain-wide surface extremes sit:")
+for (name, unit) in ((:u, "zonal"), (:v, "meridional"))
+    p = peak[name]
+    edge = min(p.i - 1, Nx - p.i, p.j - 1, Ny - p.j)   # cells to the nearest boundary
+    verdict = edge <= 2 ? "ON THE BOUNDARY — this sets the CFL, not the circulation" :
+              edge <= np ? "inside the sponge/boundary zone" : "in the interior"
+    println(@sprintf("  max|%s| = %.3f m/s at %.2f°E, %.2f°N on day %.0f — %d cells from the nearest edge: %s",
+        name, p.val, λc[p.i], φc[p.j], days[p.t], edge, verdict))
 end
 
 println()
