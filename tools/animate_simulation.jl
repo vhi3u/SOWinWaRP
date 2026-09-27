@@ -1,53 +1,31 @@
+# ==============================================================================
+# animate_simulation.jl
+#
+# Animates a model run, surface maps and mid-longitude transects together:
+#
+#   RUN_surface.mp4        surface T, S, u, v
+#   RUN_midlon.mp4         mid-longitude T, S, u, v against latitude and depth
+#   RUN_midlon_focus.mp4   the same transect over the upper FOCUS_DEPTH metres
+#
+# Reads `RUN_surface.nc` and `RUN_midlon.nc`, the files `RUN_NAME` in src/model.jl
+# produces. Either may be missing; the animations that depend on it are skipped.
+#
+#     julia --project=.
+#     julia> include("tools/animate_simulation.jl")
+#     julia> animate_simulation("model")
+#
+# or, on a CPU node, `./run_animate_simulation model`.
+# ==============================================================================
+
 using NCDatasets
 using CairoMakie
 using Printf
 
-surface_file = get(ENV, "SURFACE_FILE", "model_surface_fields.nc")
-output = get(ENV, "ANIMATION_OUTPUT", "animations/bsose_simulation.gif")
-framerate = 8
-
-mkpath(dirname(output))
-
-println("Loading simulation surface fields from: ", surface_file)
-ds = Dataset(surface_file)
-lon = Float64.(ds["λ_caa"][:])
-lat = Float64.(ds["φ_aca"][:])
-times = Float64.(ds["time"][:])
-Nt = length(times)
-
-mask = ds["inactive_nodes_ccc"][:, :, 1] .!= 0
-
-T_data = Array{Float32}(undef, length(lon), length(lat), Nt)
-S_data = Array{Float32}(undef, length(lon), length(lat), Nt)
-u_data = Array{Float32}(undef, length(lon), length(lat), Nt)
-v_data = Array{Float32}(undef, length(lon), length(lat), Nt)
-
-for t in 1:Nt
-    Tt = ds["T"][:, :, 1, t]
-    St = ds["S"][:, :, 1, t]
-    u_raw = ds["u"][:, :, 1, t]
-    v_raw = ds["v"][:, :, 1, t]
-
-    uc = 0.5f0 .* (u_raw[1:end-1, :] .+ u_raw[2:end, :])
-    vc = 0.5f0 .* (v_raw[:, 1:end-1] .+ v_raw[:, 2:end])
-
-    Tt[mask] .= NaN32
-    St[mask] .= NaN32
-    uc[mask] .= NaN32
-    vc[mask] .= NaN32
-
-    T_data[:, :, t] = Tt
-    S_data[:, :, t] = St
-    u_data[:, :, t] = uc
-    v_data[:, :, t] = vc
-end
-close(ds)
-
 # ── Colour limits: explicit if given, otherwise scanned from the data ──────────
 #
 # Each field takes its limits from an environment variable if one is set, and
-# scans the data if not. The literals further down are only fallbacks for a field
-# that is entirely NaN.
+# scans the data if not. The literals in the calls below are only fallbacks for a
+# field that is entirely NaN.
 #
 #   U_LIMS=0.5          symmetric, becomes (-0.5, 0.5)
 #   U_LIMS="-0.4,0.6"   explicit lo,hi pair
@@ -57,7 +35,6 @@ close(ds)
 # min/max, i.e. the full range of the run. Set it below 1 (e.g. 0.995) when a
 # handful of extreme cells flatten everything else -- values outside the range are
 # still drawn, in the colormap's end colours, so the extremes stay visible.
-clim_q = parse(Float64, get(ENV, "CLIM_QUANTILE", "1.0"))
 
 """
     env_lims(key)
@@ -90,16 +67,10 @@ function resolve_lims(key, scanned)
     return given === nothing ? (scanned, "scanned") : (given, "set via $key")
 end
 
-valid_T = filter(!isnan, T_data)
-valid_S = filter(!isnan, S_data)
-valid_u = filter(!isnan, u_data)
-valid_v = filter(!isnan, v_data)
-valid_speed = sqrt.(valid_u .^ 2 .+ valid_v .^ 2)
-
 quantile_of(v, p) = (s = sort(v); s[clamp(round(Int, p * length(s)), 1, length(s))])
 
 "Limits spanning the data, rounded outward to a multiple of `step`."
-function scan_lims(v, fallback; step=0.1)
+function scan_lims(v, fallback; step=0.1, clim_q=1.0)
     isempty(v) && return fallback
     lo = clim_q >= 1 ? minimum(v) : quantile_of(v, 1 - clim_q)
     hi = clim_q >= 1 ? maximum(v) : quantile_of(v, clim_q)
@@ -108,95 +79,291 @@ function scan_lims(v, fallback; step=0.1)
 end
 
 "Limits symmetric about zero, so that the diverging :balance colormap stays centred."
-function scan_sym_lims(v, fallback; step=0.1)
+function scan_sym_lims(v, fallback; step=0.1, clim_q=1.0)
     isempty(v) && return fallback
     a = abs.(v)
     m = ceil((clim_q >= 1 ? maximum(a) : quantile_of(a, clim_q)) / step) * step
     return m <= 0 ? fallback : (-m, m)
 end
 
-T_lims, T_src = resolve_lims("T_LIMS", scan_lims(valid_T, (-2.0, 20.0)))
-S_lims, S_src = resolve_lims("S_LIMS", scan_lims(valid_S, (32.5, 35.5)))
-u_lims, u_src = resolve_lims("U_LIMS", scan_sym_lims(valid_u, (-0.5, 0.5)))
-v_lims, v_src = resolve_lims("V_LIMS", scan_sym_lims(valid_v, (-0.3, 0.3)))
-
-println("Colorbar limits",
-    clim_q >= 1 ? " (scans use full min/max)" : @sprintf(" (scans use quantile %.4g)", clim_q), ":")
-@printf("  - Temperature (T) : %8.2f .. %8.2f °C    [%s]\n", T_lims..., T_src)
-@printf("  - Salinity (S)    : %8.2f .. %8.2f PSU   [%s]\n", S_lims..., S_src)
-@printf("  - Zonal vel (u)   : %8.2f .. %8.2f m/s   [%s]\n", u_lims..., u_src)
-@printf("  - Merid vel (v)   : %8.2f .. %8.2f m/s   [%s]\n", v_lims..., v_src)
-
-# Where the fast water actually is. If max sits far above p99, the full-range
-# colorbar will be dominated by a few cells and the rest of the field will look
-# flat -- rerun with CLIM_QUANTILE=0.995 in that case.
-println("Velocity magnitudes over all frames:")
-for (name, v) in (("|u|", abs.(valid_u)), ("|v|", abs.(valid_v)), ("speed", valid_speed))
-    isempty(v) && continue
-    @printf("  - %-5s  max %6.3f   p99.9 %6.3f   p99 %6.3f   p95 %6.3f   median %6.3f m/s\n",
-        name, maximum(v), quantile_of(v, 0.999), quantile_of(v, 0.99),
-        quantile_of(v, 0.95), quantile_of(v, 0.5))
-end
-
-scanning_velocities = u_src == "scanned" || v_src == "scanned"
-
-if scanning_velocities && !isempty(valid_speed) &&
-   maximum(valid_speed) > 3 * quantile_of(valid_speed, 0.99)
-    @printf("  note: peak speed %.2f m/s is %.1fx the 99th percentile (%.2f m/s).\n",
-        maximum(valid_speed), maximum(valid_speed) / quantile_of(valid_speed, 0.99),
-        quantile_of(valid_speed, 0.99))
-    println("        Rerun with CLIM_QUANTILE=0.995 to bring out the broader field.")
-end
-
 # Values outside colorrange are drawn in the colormap's end colours rather than
-# being silently saturated, so clipped extremes stay visible on the map.
+# being silently saturated, so clipped extremes stay visible.
 clip_lo(cmap) = cgrad(cmap)[0.0]
 clip_hi(cmap) = cgrad(cmap)[1.0]
 
-# ── Figure Layout: 2x2 grid following animate_bsose.jl style ────────────────
-fig = Figure(size=(1400, 950), fontsize=14)
-t_idx = Observable(1)
-
-surf_T = @lift(T_data[:, :, $t_idx])
-surf_S = @lift(S_data[:, :, $t_idx])
-surf_u = @lift(u_data[:, :, $t_idx])
-surf_v = @lift(v_data[:, :, $t_idx])
-
-time_str = @lift(@sprintf("Model Simulation: Day %.1f / %.1f (Step %d / %d)",
-    times[$t_idx] / 86400, times[end] / 86400, $t_idx, Nt))
-Label(fig[0, 1:4], time_str, fontsize=22, font=:bold)
-
-lon_bounds = (minimum(lon), maximum(lon))
-lat_bounds = (minimum(lat), maximum(lat))
-
-# Row 1: Surface Temperature & Surface Salinity
-ax1 = Axis(fig[1, 1], title="Surface Temperature", xlabel="Longitude (°E)", ylabel="Latitude (°N)",
-    limits=(lon_bounds[1], lon_bounds[2], lat_bounds[1], lat_bounds[2]))
-hm1 = heatmap!(ax1, lon, lat, surf_T, colormap=:thermal, colorrange=T_lims, nan_color=:gray30,
-    lowclip=clip_lo(:thermal), highclip=clip_hi(:thermal))
-Colorbar(fig[1, 2], hm1, label="°C")
-
-ax2 = Axis(fig[1, 3], title="Surface Salinity", xlabel="Longitude (°E)", ylabel="Latitude (°N)",
-    limits=(lon_bounds[1], lon_bounds[2], lat_bounds[1], lat_bounds[2]))
-hm2 = heatmap!(ax2, lon, lat, surf_S, colormap=:haline, colorrange=S_lims, nan_color=:gray30,
-    lowclip=clip_lo(:haline), highclip=clip_hi(:haline))
-Colorbar(fig[1, 4], hm2, label="PSU")
-
-# Row 2: Surface Zonal Velocity (u) & Surface Meridional Velocity (v)
-ax3 = Axis(fig[2, 1], title="Surface Zonal Velocity (u)", xlabel="Longitude (°E)", ylabel="Latitude (°N)",
-    limits=(lon_bounds[1], lon_bounds[2], lat_bounds[1], lat_bounds[2]))
-hm3 = heatmap!(ax3, lon, lat, surf_u, colormap=:balance, colorrange=u_lims, nan_color=:gray30,
-    lowclip=clip_lo(:balance), highclip=clip_hi(:balance))
-Colorbar(fig[2, 2], hm3, label="m/s")
-
-ax4 = Axis(fig[2, 3], title="Surface Meridional Velocity (v)", xlabel="Longitude (°E)", ylabel="Latitude (°N)",
-    limits=(lon_bounds[1], lon_bounds[2], lat_bounds[1], lat_bounds[2]))
-hm4 = heatmap!(ax4, lon, lat, surf_v, colormap=:balance, colorrange=v_lims, nan_color=:gray30,
-    lowclip=clip_lo(:balance), highclip=clip_hi(:balance))
-Colorbar(fig[2, 4], hm4, label="m/s")
-
-println("Recording animation to $output (framerate = $framerate fps)...")
-record(fig, output, 1:Nt; framerate=framerate) do t
-    t_idx[] = t
+"Report the chosen limits and where each came from."
+function report_limits(pairs, clim_q)
+    println("Colorbar limits",
+        clim_q >= 1 ? " (scans use full min/max)" : @sprintf(" (scans use quantile %.4g)", clim_q), ":")
+    for (name, unit, lims, src) in pairs
+        @printf("  - %-17s : %8.2f .. %8.2f %-5s [%s]\n", name, lims..., unit, src)
+    end
 end
-println("Done! Saved to $output")
+
+"""
+    report_speeds(valid_u, valid_v, scanning)
+
+Where the fast water actually is. If the maximum sits far above the 99th
+percentile, a full-range colorbar is dominated by a few cells and the rest of the
+field looks flat; say so, since `CLIM_QUANTILE` is the fix.
+"""
+function report_speeds(valid_u, valid_v, scanning)
+    valid_speed = sqrt.(valid_u .^ 2 .+ valid_v .^ 2)
+    println("Velocity magnitudes over all frames:")
+    for (name, v) in (("|u|", abs.(valid_u)), ("|v|", abs.(valid_v)), ("speed", valid_speed))
+        isempty(v) && continue
+        @printf("  - %-5s  max %6.3f   p99.9 %6.3f   p99 %6.3f   p95 %6.3f   median %6.3f m/s\n",
+            name, maximum(v), quantile_of(v, 0.999), quantile_of(v, 0.99),
+            quantile_of(v, 0.95), quantile_of(v, 0.5))
+    end
+
+    if scanning && !isempty(valid_speed) &&
+       maximum(valid_speed) > 3 * quantile_of(valid_speed, 0.99)
+        @printf("  note: peak speed %.2f m/s is %.1fx the 99th percentile (%.2f m/s).\n",
+            maximum(valid_speed), maximum(valid_speed) / quantile_of(valid_speed, 0.99),
+            quantile_of(valid_speed, 0.99))
+        println("        Rerun with CLIM_QUANTILE=0.995 to bring out the broader field.")
+    end
+end
+
+# ── Surface maps ──────────────────────────────────────────────────────────────
+
+function animate_surface(surface_file, output; framerate, clim_q, video...)
+    println("\nLoading surface fields from: ", surface_file)
+    ds = Dataset(surface_file)
+    lon = Float64.(ds["λ_caa"][:])
+    lat = Float64.(ds["φ_aca"][:])
+    times = Float64.(ds["time"][:])
+    Nt = length(times)
+
+    mask = ds["inactive_nodes_ccc"][:, :, 1] .!= 0
+
+    T_data = Array{Float32}(undef, length(lon), length(lat), Nt)
+    S_data = Array{Float32}(undef, length(lon), length(lat), Nt)
+    u_data = Array{Float32}(undef, length(lon), length(lat), Nt)
+    v_data = Array{Float32}(undef, length(lon), length(lat), Nt)
+
+    for t in 1:Nt
+        Tt = ds["T"][:, :, 1, t]
+        St = ds["S"][:, :, 1, t]
+        u_raw = ds["u"][:, :, 1, t]
+        v_raw = ds["v"][:, :, 1, t]
+
+        # u and v live on faces; centre them on the tracer grid before plotting
+        uc = 0.5f0 .* (u_raw[1:end-1, :] .+ u_raw[2:end, :])
+        vc = 0.5f0 .* (v_raw[:, 1:end-1] .+ v_raw[:, 2:end])
+
+        Tt[mask] .= NaN32
+        St[mask] .= NaN32
+        uc[mask] .= NaN32
+        vc[mask] .= NaN32
+
+        T_data[:, :, t] = Tt
+        S_data[:, :, t] = St
+        u_data[:, :, t] = uc
+        v_data[:, :, t] = vc
+    end
+    close(ds)
+
+    valid_T = filter(!isnan, T_data)
+    valid_S = filter(!isnan, S_data)
+    valid_u = filter(!isnan, u_data)
+    valid_v = filter(!isnan, v_data)
+
+    T_lims, T_src = resolve_lims("T_LIMS", scan_lims(valid_T, (-2.0, 20.0); clim_q))
+    S_lims, S_src = resolve_lims("S_LIMS", scan_lims(valid_S, (32.5, 35.5); clim_q))
+    u_lims, u_src = resolve_lims("U_LIMS", scan_sym_lims(valid_u, (-0.5, 0.5); clim_q))
+    v_lims, v_src = resolve_lims("V_LIMS", scan_sym_lims(valid_v, (-0.3, 0.3); clim_q))
+
+    report_limits((("Temperature (T)", "°C", T_lims, T_src),
+            ("Salinity (S)", "PSU", S_lims, S_src),
+            ("Zonal vel (u)", "m/s", u_lims, u_src),
+            ("Merid vel (v)", "m/s", v_lims, v_src)), clim_q)
+    report_speeds(valid_u, valid_v, u_src == "scanned" || v_src == "scanned")
+
+    fig = Figure(size=(1400, 950), fontsize=14)
+    t_idx = Observable(1)
+
+    time_str = @lift(@sprintf("Model Simulation: Day %.1f / %.1f (Step %d / %d)",
+        times[$t_idx] / 86400, times[end] / 86400, $t_idx, Nt))
+    Label(fig[0, 1:4], time_str, fontsize=22, font=:bold)
+
+    bounds = (minimum(lon), maximum(lon), minimum(lat), maximum(lat))
+
+    panels = (("Surface Temperature", T_data, :thermal, T_lims, "°C", 1, 1),
+        ("Surface Salinity", S_data, :haline, S_lims, "PSU", 1, 3),
+        ("Surface Zonal Velocity (u)", u_data, :balance, u_lims, "m/s", 2, 1),
+        ("Surface Meridional Velocity (v)", v_data, :balance, v_lims, "m/s", 2, 3))
+
+    for (title, data, cmap, lims, unit, row, col) in panels
+        slice = @lift(data[:, :, $t_idx])
+        ax = Axis(fig[row, col]; title, xlabel="Longitude (°E)", ylabel="Latitude (°N)", limits=bounds)
+        hm = heatmap!(ax, lon, lat, slice, colormap=cmap, colorrange=lims, nan_color=:gray30,
+            lowclip=clip_lo(cmap), highclip=clip_hi(cmap))
+        Colorbar(fig[row, col+1], hm, label=unit)
+    end
+
+    println("Recording surface animation to $output (framerate = $framerate fps)...")
+    record(fig, output, 1:Nt; framerate, video...) do t
+        t_idx[] = t
+    end
+    println(@sprintf("Done! Saved to %s (%.1f MB)", output, filesize(output) / 1024^2))
+end
+
+# ── Mid-longitude transects ───────────────────────────────────────────────────
+
+function animate_midlon(midlon_file, output, output_focus; framerate, clim_q, focus_depth, video...)
+    println("\nLoading mid-longitude fields from: ", midlon_file)
+    ds = Dataset(midlon_file)
+    lat = Float64.(ds["φ_aca"][:])
+    z = Float64.(ds["z_aac"][:])
+    times = Float64.(ds["time"][:])
+    mid_lon = haskey(ds, "λ_caa") ? ds["λ_caa"][1] : 120.0
+    Nt, Ny, Nz = length(times), length(lat), length(z)
+
+    bottom_h = haskey(ds, "bottom_height") ? Float64.(ds["bottom_height"][1, :]) : fill(-5000.0, Ny)
+    mask_2d = haskey(ds, "inactive_nodes_ccc") ? (ds["inactive_nodes_ccc"][1, :, :] .!= 0) : falses(Ny, Nz)
+
+    println(@sprintf("  - Slice location: mid-longitude = %.2f°E", mid_lon))
+    println(@sprintf("  - Grid: Ny = %d, Nz = %d, %d snapshots", Ny, Nz, Nt))
+    println(@sprintf("  - Latitude range: [%.2f°N, %.2f°N]", minimum(lat), maximum(lat)))
+    println(@sprintf("  - Depth range   : [%.1f m, %.1f m]", minimum(z), maximum(z)))
+
+    T_data = Array{Float32}(undef, Ny, Nz, Nt)
+    S_data = Array{Float32}(undef, Ny, Nz, Nt)
+    u_data = Array{Float32}(undef, Ny, Nz, Nt)
+    v_data = Array{Float32}(undef, Ny, Nz, Nt)
+
+    for t in 1:Nt
+        Tt = Float32.(ds["T"][1, :, :, t])
+        St = Float32.(ds["S"][1, :, :, t])
+        ut = Float32.(ds["u"][1, :, :, t])
+        v_raw = Float32.(ds["v"][1, :, :, t])
+
+        # v lives on φ_afa faces; centre it on φ_aca
+        vc = 0.5f0 .* (v_raw[1:end-1, :] .+ v_raw[2:end, :])
+
+        Tt[mask_2d] .= NaN32
+        St[mask_2d] .= NaN32
+        ut[mask_2d] .= NaN32
+        vc[mask_2d] .= NaN32
+
+        T_data[:, :, t] = Tt
+        S_data[:, :, t] = St
+        u_data[:, :, t] = ut
+        v_data[:, :, t] = vc
+    end
+    close(ds)
+
+    lat_bounds = (minimum(lat), maximum(lat))
+
+    # One animation per depth range: the full water column, then the upper ocean with
+    # its limits rescanned over just that band, where the seasonal signal lives.
+    function transect_animation(out, depth_mask, z_bounds, tag)
+        valid(d) = filter(!isnan, d[:, depth_mask, :])
+        valid_T, valid_S = valid(T_data), valid(S_data)
+        valid_u, valid_v = valid(u_data), valid(v_data)
+
+        T_lims, T_src = resolve_lims("T_LIMS", scan_lims(valid_T, (-2.0, 15.0); clim_q))
+        S_lims, S_src = resolve_lims("S_LIMS", scan_lims(valid_S, (33.0, 35.5); clim_q))
+        u_lims, u_src = resolve_lims("U_LIMS", scan_sym_lims(valid_u, (-0.5, 0.5); clim_q))
+        v_lims, v_src = resolve_lims("V_LIMS", scan_sym_lims(valid_v, (-0.3, 0.3); clim_q))
+
+        println("\n$tag:")
+        report_limits((("Temperature (T)", "°C", T_lims, T_src),
+                ("Salinity (S)", "PSU", S_lims, S_src),
+                ("Zonal vel (u)", "m/s", u_lims, u_src),
+                ("Merid vel (v)", "m/s", v_lims, v_src)), clim_q)
+        report_speeds(valid_u, valid_v, u_src == "scanned" || v_src == "scanned")
+
+        fig = Figure(size=(1400, 950), fontsize=14)
+        t_idx = Observable(1)
+
+        time_str = @lift(@sprintf("Mid-Longitude (λ = %.1f°E, %s): Day %.1f / %.1f (Step %d / %d)",
+            mid_lon, tag, times[$t_idx] / 86400, times[end] / 86400, $t_idx, Nt))
+        Label(fig[0, 1:4], time_str, fontsize=22, font=:bold)
+
+        bounds = (lat_bounds[1], lat_bounds[2], z_bounds[1], z_bounds[2])
+        panels = (("Temperature (T)", T_data, :thermal, T_lims, "°C", 1, 1),
+            ("Salinity (S)", S_data, :haline, S_lims, "PSU", 1, 3),
+            ("Zonal Velocity (u)", u_data, :balance, u_lims, "m/s", 2, 1),
+            ("Meridional Velocity (v)", v_data, :balance, v_lims, "m/s", 2, 3))
+
+        for (title, data, cmap, lims, unit, row, col) in panels
+            slice = @lift(data[:, :, $t_idx])
+            ax = Axis(fig[row, col]; title, xlabel="Latitude (°N)", ylabel="Depth (m)", limits=bounds)
+            hm = heatmap!(ax, lat, z, slice, colormap=cmap, colorrange=lims, nan_color=:gray30,
+                lowclip=clip_lo(cmap), highclip=clip_hi(cmap))
+            lines!(ax, lat, bottom_h, color=:black, linewidth=2.0)
+            Colorbar(fig[row, col+1], hm, label=unit)
+        end
+
+        println("Recording $tag animation to $out (framerate = $framerate fps)...")
+        record(fig, out, 1:Nt; framerate, video...) do t
+            t_idx[] = t
+        end
+        println(@sprintf("Done! Saved to %s (%.1f MB)", out, filesize(out) / 1024^2))
+    end
+
+    transect_animation(output, trues(Nz), (minimum(z), 0.0), "full depth")
+    transect_animation(output_focus, z .>= -focus_depth, (-focus_depth, 0.0),
+        @sprintf("upper %.0f m", focus_depth))
+end
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+
+"""
+    animate_simulation(run_name; kwargs...)
+
+Animate the run written under `run_name`, reading `\$(run_name)_surface.nc` and
+`\$(run_name)_midlon.nc` and writing three videos into `output_dir`. A missing input
+file is reported and its animations skipped, so this works on a run that wrote
+only one of the two.
+
+Keyword arguments (each defaults to an environment variable, then to a literal):
+`surface_file`, `midlon_file`, `output_dir`, `framerate` (`FRAMERATE`),
+`focus_depth` (`FOCUS_DEPTH`), `clim_quantile` (`CLIM_QUANTILE`),
+`format` (`VIDEO_FORMAT`, "mp4" or "gif") and `compression` (`VIDEO_COMPRESSION`,
+ffmpeg's -crf: lower is better quality and a bigger file, 20 by default, mp4 only).
+"""
+function animate_simulation(run_name;
+    surface_file=get(ENV, "SURFACE_FILE", "$(run_name)_surface.nc"),
+    midlon_file=get(ENV, "MIDLON_FILE", "$(run_name)_midlon.nc"),
+    output_dir=get(ENV, "ANIMATION_DIR", "animations"),
+    framerate=parse(Int, get(ENV, "FRAMERATE", "8")),
+    focus_depth=parse(Float64, get(ENV, "FOCUS_DEPTH", "500")),
+    clim_quantile=parse(Float64, get(ENV, "CLIM_QUANTILE", "1.0")),
+    format=get(ENV, "VIDEO_FORMAT", "mp4"),
+    compression=parse(Int, get(ENV, "VIDEO_COMPRESSION", "20")))
+
+    # `compression` is an ffmpeg -crf value and only applies to mp4; passing it for a gif
+    # is harmless but pointless, so only send it where it does something.
+    video = format == "mp4" ? (; compression) : (;)
+
+    mkpath(output_dir)
+    println("Animating run \"$run_name\" into $output_dir/")
+
+    found = false
+
+    if isfile(surface_file)
+        animate_surface(surface_file, joinpath(output_dir, "$(run_name)_surface.$(format)");
+            framerate, clim_q=clim_quantile, video...)
+        found = true
+    else
+        println("\nSkipping surface animation: '$surface_file' not found.")
+    end
+
+    if isfile(midlon_file)
+        animate_midlon(midlon_file,
+            joinpath(output_dir, "$(run_name)_midlon.$(format)"),
+            joinpath(output_dir, "$(run_name)_midlon_focus.$(format)");
+            framerate, clim_q=clim_quantile, focus_depth, video...)
+        found = true
+    else
+        println("\nSkipping mid-longitude animations: '$midlon_file' not found.")
+    end
+
+    found || error("Neither '$surface_file' nor '$midlon_file' exists — nothing to animate.")
+    println("\nAll done.")
+    return nothing
+end

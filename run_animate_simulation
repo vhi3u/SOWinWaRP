@@ -1,0 +1,72 @@
+#!/bin/bash
+#SBATCH --job-name=animate              # Job name (overridden per run below)
+#SBATCH --account=gts-ldove6-paid       # Account to be paid
+#SBATCH --output=logs/%x-%j.out         # Standard output log (%x=job name, %j=job id)
+#SBATCH --error=logs/%x-%j.err          # Standard error log
+#SBATCH --time=02:00:00                 # Max run time (hh:mm:ss)
+#SBATCH --ntasks=1                      # Number of tasks (processes)
+#SBATCH --cpus-per-task=4               # Number of CPUs per task
+#SBATCH --mem=64G                       # Whole run is held in memory while plotting
+#SBATCH --mail-type=END,FAIL
+#SBATCH --mail-user=vnguyen480@gatech.edu
+#
+# Animate a finished model run on a CPU node:
+#
+#     ./run_animate_simulation FILENAME
+#
+# reads FILENAME_surface.nc and FILENAME_midlon.nc (the files RUN_NAME in
+# src/model.jl writes) and produces, in animations/:
+#
+#     FILENAME_surface.mp4
+#     FILENAME_midlon.mp4
+#     FILENAME_midlon_focus.mp4
+#
+# Run directly, it submits itself to a CPU node with sbatch. Colour limits, framerate
+# and video settings can be set through the environment, which sbatch carries over:
+#
+#     CLIM_QUANTILE=0.995 FRAMERATE=12 ./run_animate_simulation FILENAME
+#     VIDEO_COMPRESSION=28 ./run_animate_simulation FILENAME   # smaller, lower quality
+#     VIDEO_FORMAT=gif ./run_animate_simulation FILENAME       # if something needs a gif
+
+set -euo pipefail
+
+# Not inside a job yet: validate, then resubmit ourselves to a CPU node.
+if [ -z "${SLURM_JOB_ID:-}" ]; then
+    if [ $# -lt 1 ]; then
+        echo "usage: $0 FILENAME" >&2
+        echo "  reads FILENAME_surface.nc and FILENAME_midlon.nc from $(pwd)" >&2
+        exit 1
+    fi
+
+    if [ ! -f "$1_surface.nc" ] && [ ! -f "$1_midlon.nc" ]; then
+        echo "error: neither $1_surface.nc nor $1_midlon.nc exists in $(pwd)" >&2
+        exit 1
+    fi
+
+    mkdir -p logs animations
+    exec sbatch --job-name="animate_$1" "$0" "$@"
+fi
+
+RUN_NAME="$1"
+
+echo "=========================================================="
+echo " Job ID     : $SLURM_JOB_ID"
+echo " Job Name   : $SLURM_JOB_NAME"
+echo " Node       : $(hostname)"
+echo " Run name   : $RUN_NAME"
+echo " Start Time : $(date)"
+echo "=========================================================="
+
+module purge
+module load julia/1.12.5
+unset LD_LIBRARY_PATH
+
+echo "--- Loaded Modules ---"
+module list
+
+echo "--- Animating ---"
+julia --project=. -e 'include("tools/animate_simulation.jl"); animate_simulation(ARGS[1])' "$RUN_NAME"
+
+echo "=========================================================="
+echo " Job Finished: $(date)"
+echo "=========================================================="

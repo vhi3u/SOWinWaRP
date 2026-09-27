@@ -36,11 +36,30 @@ else
     error("CUDA is not functional on this node! If you are running via sbatch, check your GPU allocation or logs. To force CPU testing, export FORCE_CPU=1.")
 end
 
+# ==============================================================================
+# Run name
+#
+# Every file this run writes is prefixed with it:
+#
+#     RUN_NAME_surface.nc        surface fields, daily
+#     RUN_NAME_midlon.nc         mid-longitude transect, daily
+#     RUN_NAME_free_surface.nc   free-surface height, daily          (BOUNDARY_DIAGNOSTICS)
+#     RUN_NAME_face_west.nc  …   the four boundary faces, 5-daily    (BOUNDARY_DIAGNOSTICS)
+#
+# Change it for each experiment so runs do not overwrite one another, then animate
+# the result with `./run_animate_simulation RUN_NAME`.
+# ==============================================================================
+const RUN_NAME = "model"
+
 # flags
 
 const OBCS = true # open boundary conditions (NormalFlow with PerturbationAdvection)
 const SPONGE_LAYERS = true # sponge layer restoring (DatasetRestoring) near open boundary edges
 const WINDS = true # time-varying surface wind forcing from BSOSE data (oceTAUX and oceTAUY)
+# Surface heat and salt fluxes from BSOSE (TFLUX and SFLUX). Without these the ocean exchanges
+# nothing with the atmosphere but momentum: it cannot cool in winter or warm in summer, and its
+# surface temperature drifts away from BSOSE as water crosses the domain.
+const SURFACE_FLUXES = true
 const CHECKPOINTS = false # save state and restart if the model crashes. If false, the model will start from scratch. 
 const BOUNDARY_DIAGNOSTICS = true # write free-surface height, boundary-face slices, and a per-face volume transport log
 
@@ -216,7 +235,8 @@ if OBCS && DATASET == "BSOSE"
     end
     @info "  -> OBC Scheme: $(obc_scheme === nothing ? "Clamped Dirichlet" : summary(obc_scheme))"
 
-    boundary_conditions = bsose_open_boundary_conditions(grid; dataset=dataset, dates=bc_dates, winds=WINDS, scheme=obc_scheme, reference_date=start_date)
+    boundary_conditions = bsose_open_boundary_conditions(grid; dataset=dataset, dates=bc_dates,
+        winds=WINDS, surface_fluxes=SURFACE_FLUXES, scheme=obc_scheme, reference_date=start_date)
 
     if SPONGE_LAYERS
         sponge_timescale = 30days
@@ -401,7 +421,7 @@ T, S = ocean.model.tracers
 simulation.output_writers[:surface] = NetCDFWriter(
     ocean.model,
     (; u, v, T, S),
-    filename="model_surface_fields.nc",
+    filename="$(RUN_NAME)_surface.nc",
     schedule=TimeInterval(output_interval),
     indices=(:, :, grid.Nz),
     overwrite_existing=true
@@ -411,7 +431,7 @@ mid_lon_idx = div(grid.Nx, 2)
 simulation.output_writers[:mid_lon] = NetCDFWriter(
     ocean.model,
     (; u, v, T, S),
-    filename="model_mid_lon.nc",
+    filename="$(RUN_NAME)_midlon.nc",
     schedule=TimeInterval(output_interval),
     indices=(mid_lon_idx, :, :),
     overwrite_existing=true
@@ -441,7 +461,7 @@ if BOUNDARY_DIAGNOSTICS
     simulation.output_writers[:free_surface] = NetCDFWriter(
         ocean.model,
         (; η=η_2d),
-        filename="model_free_surface.nc",
+        filename="$(RUN_NAME)_free_surface.nc",
         schedule=TimeInterval(output_interval),
         overwrite_existing=true
     )
@@ -459,7 +479,7 @@ if BOUNDARY_DIAGNOSTICS
         simulation.output_writers[Symbol(:face_, face)] = NetCDFWriter(
             ocean.model,
             (; u, v, T, S),
-            filename="model_face_$(face).nc",
+            filename="$(RUN_NAME)_face_$(face).nc",
             schedule=TimeInterval(boundary_interval),
             indices=indices,
             overwrite_existing=true
@@ -511,7 +531,7 @@ end
 
 @info "--- Model Setup Complete ---"
 @info "Grid Resolution: Nx=$(grid.Nx), Ny=$(grid.Ny), Nz=$(grid.Nz)"
-@info "OBCS: $OBCS | WINDS: $WINDS | DATASET: $DATASET"
+@info "OBCS: $OBCS | WINDS: $WINDS | SURFACE_FLUXES: $SURFACE_FLUXES | DATASET: $DATASET"
 
 # red button 
 

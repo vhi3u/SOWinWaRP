@@ -18,7 +18,7 @@ using CairoMakie
 using Printf
 using Dates
 
-midlon_file = get(ENV, "MIDLON_FILE", "model_mid_lon.nc")
+midlon_file = get(ENV, "MIDLON_FILE", "model_midlon.nc")
 output = get(ENV, "SEASONAL_OUTPUT", "plots/seasonal_midlon.png")
 output_focus = get(ENV, "SEASONAL_FOCUS_OUTPUT", "plots/seasonal_midlon_focus.png")
 start_date = DateTime(get(ENV, "START_DATE", "2014-01-01"))

@@ -25,7 +25,7 @@ using Printf
 using Dates
 using Statistics
 
-surface_file = get(ENV, "SURFACE_FILE", "model_surface_fields.nc")
+surface_file = get(ENV, "SURFACE_FILE", "model_surface.nc")
 plot_dir = get(ENV, "OBC_PLOT_DIR", "plots")
 start_date = DateTime(get(ENV, "START_DATE", "2014-01-01"))
 sponge_width = parse(Float64, get(ENV, "SPONGE_WIDTH", "3.0"))   # degrees, to mark on the profiles
@@ -205,7 +205,9 @@ for f in active_faces
     ratio = tangential_std[f][1] / inner
     verdict = ratio < 0.25 ? "CLAMPED: edge variability is a fraction of the interior" :
               ratio < 0.6 ? "damped at the edge (sponge, or a stiff boundary)" :
-              "free: edge variability matches the interior"
+              ratio < 1.5 ? "free: edge variability matches the interior" :
+              ratio < 2.5 ? "NOISY EDGE: the outermost cells are more variable than the interior" :
+              "NOISY EDGE: the outermost cells are far more variable than the interior"
     println(@sprintf("  %-7s tangential std: edge %.4f m/s, %d cells in %.4f m/s, ratio %.2f  ->  %s",
         f, tangential_std[f][1], np, inner, ratio, verdict))
 end

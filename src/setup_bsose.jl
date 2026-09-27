@@ -122,6 +122,7 @@ const BSOSE_VARIABLE_NAMES = Dict(
     :zonal_wind_stress => "oceTAUX",
     :meridional_wind_stress => "oceTAUY",
     :surface_heat_flux => "TFLUX",
+    :surface_salt_flux => "SFLUX",
     # Aliases
     :Theta => "THETA",
     :Salt => "SALT",
@@ -130,10 +131,20 @@ const BSOSE_VARIABLE_NAMES = Dict(
     :oceTAUX => "oceTAUX",
     :oceTAUY => "oceTAUY",
     :surfTflx => "TFLUX",
+    :surfSflx => "SFLUX",
     :T => "THETA",
     :S => "SALT",
     :u => "UVEL",
     :v => "VVEL"
+)
+
+# Some BSOSE products name their file with a token that differs from the variable inside it:
+# the surface flux files are `surfTflx`/`surfSflx` while the variables they hold are TFLUX/SFLUX.
+const BSOSE_FILE_TOKENS = Dict(
+    :surface_heat_flux => "surfTflx",
+    :surface_salt_flux => "surfSflx",
+    :surfTflx => "surfTflx",
+    :surfSflx => "surfSflx",
 )
 
 # Variable spatial locations on Arakawa C-grid
@@ -145,6 +156,7 @@ const BSOSE_LOCATIONS = Dict(
     :zonal_wind_stress => (Face, Center, Nothing),
     :meridional_wind_stress => (Center, Face, Nothing),
     :surface_heat_flux => (Center, Center, Nothing),
+    :surface_salt_flux => (Center, Center, Nothing),
     :Theta => (Center, Center, Center),
     :Salt => (Center, Center, Center),
     :Uvel => (Face, Center, Center),
@@ -152,6 +164,7 @@ const BSOSE_LOCATIONS = Dict(
     :oceTAUX => (Face, Center, Nothing),
     :oceTAUY => (Center, Face, Nothing),
     :surfTflx => (Center, Center, Nothing),
+    :surfSflx => (Center, Center, Nothing),
     :T => (Center, Center, Center),
     :S => (Center, Center, Center),
     :u => (Face, Center, Center),
@@ -172,6 +185,7 @@ bsose_names_iteration(filename, iteration::Int) =
 
 function resolve_bsose_filename(dir::String, var_name::Symbol, iteration::Int)
     shortname = get(BSOSE_VARIABLE_NAMES, var_name, string(var_name))
+    filetoken = get(BSOSE_FILE_TOKENS, var_name, shortname)
 
     # Candidate filename patterns for Iteration 156 (2013-2024)
     cands_156 = [
@@ -181,6 +195,7 @@ function resolve_bsose_filename(dir::String, var_name::Symbol, iteration::Int)
         "$(lowercase(shortname))_bsoseI156_2013to2024_monthly.nc",
         "bsose_i156_2013to2024_monthly_$(shortname).nc",
         "bsose_i156_2013to2024_monthly_$(titlecase(shortname)).nc",
+        "$(filetoken)_bsoseI156_2013to2024_monthly.nc",
     ]
 
     # Candidate filename patterns for Iteration 105 (2008-2012)
@@ -190,6 +205,7 @@ function resolve_bsose_filename(dir::String, var_name::Symbol, iteration::Int)
         "bsose_i105_2008to2012_monthly_$(uppercase(shortname)).nc",
         "$(titlecase(shortname))_bsoseI105_2008to2012_monthly.nc",
         "$(shortname)_bsoseI105_2008to2012_monthly.nc",
+        "bsose_i105_2008to2012_monthly_$(filetoken).nc",
     ]
 
     candidates = iteration == 156 ? vcat(cands_156, cands_105) : vcat(cands_105, cands_156)
@@ -205,7 +221,7 @@ function resolve_bsose_filename(dir::String, var_name::Symbol, iteration::Int)
     # holding both iterations would silently serve iteration 105 data to an
     # iteration 156 run.
     if isdir(dir)
-        t_low = lowercase(shortname)
+        t_low = lowercase(filetoken)
         matches = filter(readdir(dir)) do f
             endswith(f, ".nc") && occursin(t_low, lowercase(f))
         end
@@ -1128,6 +1144,64 @@ function bsose_surface_wind_stress(grid;
         v=FluxBoundaryCondition(top_v_slice))
 end
 
+"""
+    bsose_surface_tracer_fluxes(grid;
+                                dataset = BSOSEMonthly(),
+                                dates = nothing,
+                                ρ₀ = 1026.0,
+                                cₚ = 3991.86795711963,
+                                reference_date = nothing)
+
+Load the BSOSE surface heat and salt fluxes (`TFLUX` and `SFLUX`), convert them to the
+kinematic fluxes Oceananigans takes at a top boundary, and return a `NamedTuple` of top
+`FluxBoundaryCondition`s: `(; T = FluxBoundaryCondition(Jᵀ), S = FluxBoundaryCondition(Jˢ))`.
+
+Without these the ocean exchanges no heat or freshwater with the atmosphere at all: it cannot
+cool in winter or warm in summer, and its surface temperature is left to advection and mixing.
+
+`reference_date` is the calendar date of model time zero; see [`model_clock_offset`](@ref).
+"""
+function bsose_surface_tracer_fluxes(grid;
+    dataset=BSOSEMonthly(),
+    dates=nothing,
+    ρ₀=1026.0,
+    cₚ=3991.86795711963,   # TEOS-10 reference heat capacity, J kg⁻¹ °C⁻¹
+    reference_date=nothing)
+
+    if isnothing(dates)
+        available = all_dates(dataset, :surface_heat_flux)
+        dates = available[1:min(12, length(available))]
+    end
+
+    @info "Loading surface heat and salt fluxes ($(summary(dataset)))..."
+    region = bsose_region(grid)
+    heat_metadata = Metadata(:surface_heat_flux; dataset, dates, region)
+    salt_metadata = Metadata(:surface_salt_flux; dataset, dates, region)
+    heat_fts = FieldTimeSeries(heat_metadata, grid)
+    salt_fts = FieldTimeSeries(salt_metadata, grid)
+
+    time_offset = model_clock_offset(heat_metadata, reference_date)
+    top_T_slice = boundary_slice_time_series(heat_fts, :top; time_offset)
+    top_S_slice = boundary_slice_time_series(salt_fts, :top; time_offset)
+
+    # BSOSE follows the MITgcm convention, stated in the files themselves: TFLUX "> 0
+    # increases theta" and SFLUX "> 0 increases salt". An Oceananigans top flux is positive
+    # UPWARD, out of the domain, so both enter with a minus sign. TFLUX is W m⁻², which
+    # becomes the °C m s⁻¹ a temperature flux condition takes after dividing by ρ₀cₚ; SFLUX
+    # is g m⁻² s⁻¹, which becomes psu m s⁻¹ after dividing by ρ₀.
+    #
+    # As with the wind stress, the scaling has to happen here, on the sliced series. The
+    # series `FieldTimeSeries(::Metadata, grid)` returns holds only two snapshots in memory
+    # and reloads them from disk, so scaling it in place is silently discarded.
+    for t in 1:length(top_T_slice.times)
+        parent(top_T_slice[t]) .*= -1 / (ρ₀ * cₚ)
+        parent(top_S_slice[t]) .*= -1 / ρ₀
+    end
+
+    return (T=FluxBoundaryCondition(top_T_slice),
+        S=FluxBoundaryCondition(top_S_slice))
+end
+
 
 # ==============================================================================
 # 4. Open Boundary Conditions (OBCs)
@@ -1168,6 +1242,7 @@ function bsose_open_boundary_conditions(grid;
     dates=all_dates(dataset, :temperature)[1:12],
     scheme=nothing,
     winds=nothing,
+    surface_fluxes=false,
     ρ₀=1026.0,
     reference_date=nothing,
     cache=true,
@@ -1372,6 +1447,21 @@ function bsose_open_boundary_conditions(grid;
         @info " -> Surface wind stress is DISABLED (top boundary is no-flux)."
     end
 
+    # Surface heat and salt fluxes
+    top_T_bc = FluxBoundaryCondition(nothing)
+    top_S_bc = FluxBoundaryCondition(nothing)
+
+    if surface_fluxes === true
+        tracer_flux_bcs = bsose_surface_tracer_fluxes(grid; dataset, dates, ρ₀, reference_date)
+        top_T_bc = tracer_flux_bcs.T
+        top_S_bc = tracer_flux_bcs.S
+    elseif surface_fluxes isa NamedTuple
+        top_T_bc = get(surface_fluxes, :T, FluxBoundaryCondition(nothing))
+        top_S_bc = get(surface_fluxes, :S, FluxBoundaryCondition(nothing))
+    else
+        @info " -> Surface heat and salt fluxes are DISABLED (no air-sea exchange)."
+    end
+
 
     # 4. Construct FieldBoundaryConditions
     # Note: On East/West boundaries, normal velocity is u (NormalFlow), tangential is v (Value).
@@ -1413,12 +1503,14 @@ function bsose_open_boundary_conditions(grid;
 
         T_bcs = FieldBoundaryConditions(
             south=ValueBoundaryCondition(T_south; scheme),
-            north=ValueBoundaryCondition(T_north; scheme)
+            north=ValueBoundaryCondition(T_north; scheme),
+            top=top_T_bc
         )
 
         S_bcs = FieldBoundaryConditions(
             south=ValueBoundaryCondition(S_south; scheme),
-            north=ValueBoundaryCondition(S_north; scheme)
+            north=ValueBoundaryCondition(S_north; scheme),
+            top=top_S_bc
         )
 
     else
@@ -1443,14 +1535,16 @@ function bsose_open_boundary_conditions(grid;
             west=ValueBoundaryCondition(T_west; scheme),
             east=ValueBoundaryCondition(T_east; scheme),
             south=ValueBoundaryCondition(T_south; scheme),
-            north=ValueBoundaryCondition(T_north; scheme)
+            north=ValueBoundaryCondition(T_north; scheme),
+            top=top_T_bc
         )
 
         S_bcs = FieldBoundaryConditions(
             west=ValueBoundaryCondition(S_west; scheme),
             east=ValueBoundaryCondition(S_east; scheme),
             south=ValueBoundaryCondition(S_south; scheme),
-            north=ValueBoundaryCondition(S_north; scheme)
+            north=ValueBoundaryCondition(S_north; scheme),
+            top=top_S_bc
         )
     end
 
