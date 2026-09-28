@@ -1686,7 +1686,13 @@ reads the same calendar date as the open boundaries and the wind stress at any m
 function restore_on_model_clock!(restoring, reference_date)
     isnothing(reference_date) && return restoring
     fts = restoring.field_time_series
-    fts.times .+= model_clock_offset(fts.backend.metadata, reference_date)
+
+    # Rebind rather than broadcast in place. `FieldTimeSeries` is a mutable struct, but its
+    # `times` are not always a Vector — for uniformly spaced records they can be an
+    # immutable range, and `.+=` on one of those throws `CanonicalIndexError: setindex!
+    # not defined for StepRangeLen`. Adding a scalar to a range returns a range, so the
+    # rebinding form works for either.
+    fts.times = fts.times .+ model_clock_offset(fts.backend.metadata, reference_date)
     return restoring
 end
 
