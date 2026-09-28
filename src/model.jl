@@ -63,8 +63,15 @@ const SURFACE_FLUXES = true
 const CHECKPOINTS = false # save state and restart if the model crashes. If false, the model will start from scratch. 
 const BOUNDARY_DIAGNOSTICS = true # write free-surface height, boundary-face slices, and a per-face volume transport log
 
-# Open boundary matching scheme: "PerturbationAdvection", "NormalRadiation", or "clamped".
+# Open boundary matching scheme for the NORMAL flow: "PerturbationAdvection",
+# "NormalRadiation", or "clamped".
 const OBC_SCHEME = "PerturbationAdvection"
+
+# Condition for the TANGENTIAL velocity (u on south/north, v on west/east) — the setting
+# that governs the meridional jet pinned along the western boundary. One of :gradient,
+# :clamped, :radiation, :radiation_boundary_velocity, :perturbation_advection or
+# :perturbation_advection_gravity; see `bsose_tangential_boundary_condition`.
+const TANGENTIAL_BC = :gradient
 
 # Turbulence closure set: "ito", "bsose", "henyey_gm", "biharmonic", or "none". Each is
 # described where the closures are built below.
@@ -235,8 +242,11 @@ if OBCS && DATASET == "BSOSE"
     end
     @info "  -> OBC Scheme: $(obc_scheme === nothing ? "Clamped Dirichlet" : summary(obc_scheme))"
 
+    @info "  -> Tangential velocity condition: $TANGENTIAL_BC"
+
     boundary_conditions = bsose_open_boundary_conditions(grid; dataset=dataset, dates=bc_dates,
-        winds=WINDS, surface_fluxes=SURFACE_FLUXES, scheme=obc_scheme, reference_date=start_date)
+        winds=WINDS, surface_fluxes=SURFACE_FLUXES, scheme=obc_scheme,
+        tangential_bc_kind=TANGENTIAL_BC, reference_date=start_date)
 
     if SPONGE_LAYERS
         sponge_timescale = 30days

@@ -1208,6 +1208,59 @@ end
 # ==============================================================================
 
 """
+    bsose_tangential_boundary_condition(value, kind; gravity_wave_speed = 210.0)
+
+The boundary condition for the velocity component *tangential* to a face — `u` on
+south/north, `v` on west/east — given the BSOSE `value` there.
+
+This is the setting that governs the meridional jet pinned along the western boundary. A
+tangential velocity is Center-located in the boundary-normal direction, so it is the same
+case the schemes document for tracers, and the split-explicit free surface gives the
+barotropic tangential velocity a zero-gradient (NoFlux) condition at these faces whatever
+the 3D field uses.
+
+- `:gradient` — `∂v/∂x = 0`, imposing nothing. Cannot pin the flow, matches what the
+  barotropic mode does, and is the conventional tangential treatment in regional models.
+  The BSOSE value still reaches the boundary through the sponge layer.
+- `:clamped` — plain Dirichlet to the BSOSE value. Fills the halo by mirroring the interior
+  about it (`v_halo = 2 v̄ - v_interior`), which over-specifies outflow and drives a
+  boundary overshoot against the biharmonic viscosity.
+- `:radiation` — `NormalRadiation`, an Orlanski phase-speed condition. Documented for
+  tangential velocities, and it takes its advecting velocity one cell into the interior and
+  checks for immersed nodes, neither of which the PerturbationAdvection `Value` path does.
+- `:radiation_boundary_velocity` — the same, advecting with the boundary-face velocity.
+- `:perturbation_advection` — `PerturbationAdvection` as-is. Known to diverge on a
+  tangential component within ~5 time steps; kept so a test matrix can show that.
+- `:perturbation_advection_gravity` — `PerturbationAdvection` with a nonzero
+  `gravity_wave_speed`. The phase speed then saturates the scheme's `Ũ` at 1 rather than
+  the ~10⁻³ a 0.1 m/s tangential flow gives, so the halo relaxes toward the interior
+  instead of holding its own stale value. This is the form most likely to make
+  PerturbationAdvection usable here; √(gH) ≈ 210 m/s for a 4.5 km water column.
+"""
+function bsose_tangential_boundary_condition(value, kind; gravity_wave_speed=210.0)
+    kind === :gradient && return GradientBoundaryCondition(0)
+    kind === :clamped && return ValueBoundaryCondition(value)
+
+    kind === :radiation && return ValueBoundaryCondition(value;
+        scheme=NormalRadiation(inflow_timescale=1days, outflow_timescale=Inf))
+
+    kind === :radiation_boundary_velocity && return ValueBoundaryCondition(value;
+        scheme=NormalRadiation(inflow_timescale=1days, outflow_timescale=Inf,
+            use_boundary_velocity=true))
+
+    kind === :perturbation_advection && return ValueBoundaryCondition(value;
+        scheme=PerturbationAdvection(inflow_timescale=1days, outflow_timescale=Inf))
+
+    kind === :perturbation_advection_gravity && return ValueBoundaryCondition(value;
+        scheme=PerturbationAdvection(inflow_timescale=1days, outflow_timescale=Inf,
+            gravity_wave_speed=gravity_wave_speed))
+
+    error("Unknown tangential_bc_kind: $kind. Choose :gradient, :clamped, :radiation, " *
+          ":radiation_boundary_velocity, :perturbation_advection or " *
+          ":perturbation_advection_gravity.")
+end
+
+"""
     bsose_open_boundary_conditions(grid;
                                    dataset = BSOSEMonthly(),
                                    dates = all_dates(dataset, :temperature)[1:12],
@@ -1243,6 +1296,8 @@ function bsose_open_boundary_conditions(grid;
     scheme=nothing,
     winds=nothing,
     surface_fluxes=false,
+    tangential_bc_kind=:gradient,
+    tangential_gravity_wave_speed=210.0,
     ρ₀=1026.0,
     reference_date=nothing,
     cache=true,
@@ -1468,30 +1523,17 @@ function bsose_open_boundary_conditions(grid;
     #       On South/North boundaries, normal velocity is v (NormalFlow), tangential is u (Value).
     # If the domain is longitudinally periodic (e.g. Circumpolar), only South and North BCs are applied.
     #
-    # The tangential components get a zero-gradient condition rather than a prescribed value.
-    #
-    # Two things motivate this. First, a `Value` condition fills the halo by mirroring the
-    # interior about the prescribed value (`v_halo = 2 v̄ - v_interior`), so any departure of
-    # the interior from the monthly mean is reflected back with the opposite sign; against a
-    # biharmonic viscosity that produces a boundary overshoot, which is the meridional velocity
-    # visibly pinned along the western edge. Second, the split-explicit free surface gives the
-    # BAROTROPIC tangential velocity a zero-gradient (NoFlux) condition at these faces whatever
-    # the 3D field uses, so a prescribed value here also leaves the baroclinic and barotropic
-    # halves of the same face disagreeing. Zero gradient removes both: nothing is pinned, and
-    # the 3D condition matches the barotropic one.
-    #
-    # `Value(PerturbationAdvection)` is NOT the alternative — it diverges within ~5 time steps
-    # (v on west/east to NaN, surfacing as `InexactError: Int64(NaN)` in `step_free_surface!`),
-    # confirmed at eight inflow/outflow timescale pairs at 1 degree and at 1/6 degree on GPU.
-    #
-    # The BSOSE tangential velocity is not lost: the sponge layer restores u and v toward it
-    # across the outer `sponge_width` degrees.
-    tangential_bc() = GradientBoundaryCondition(0)
+    # The tangential condition is selected by `tangential_bc_kind`; see
+    # [`bsose_tangential_boundary_condition`](@ref) for what each option does and why it
+    # matters. Clamping to a prescribed value over-specifies an outflow boundary and leaves
+    # a fast meridional jet pinned along the western edge.
+    tangential_bc(value) = bsose_tangential_boundary_condition(value, tangential_bc_kind;
+        gravity_wave_speed=tangential_gravity_wave_speed)
     if is_x_periodic
         @info " -> Longitude is Periodic (circumpolar): applying South & North boundary conditions."
         u_bcs = FieldBoundaryConditions(
-            south=tangential_bc(),
-            north=tangential_bc(),
+            south=tangential_bc(u_south),
+            north=tangential_bc(u_north),
             top=top_u_bc
         )
 
@@ -1518,14 +1560,14 @@ function bsose_open_boundary_conditions(grid;
         u_bcs = FieldBoundaryConditions(
             west=NormalFlowBoundaryCondition(u_west; scheme),
             east=NormalFlowBoundaryCondition(u_east; scheme),
-            south=tangential_bc(),
-            north=tangential_bc(),
+            south=tangential_bc(u_south),
+            north=tangential_bc(u_north),
             top=top_u_bc
         )
 
         v_bcs = FieldBoundaryConditions(
-            west=tangential_bc(),
-            east=tangential_bc(),
+            west=tangential_bc(v_west),
+            east=tangential_bc(v_east),
             south=NormalFlowBoundaryCondition(v_south; scheme),
             north=NormalFlowBoundaryCondition(v_north; scheme),
             top=top_v_bc
