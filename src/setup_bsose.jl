@@ -1279,6 +1279,26 @@ function bsose_tangential_boundary_condition(value, kind; gravity_wave_speed=210
 end
 
 """
+    usable_boundary_cache(path)
+
+Whether the unified boundary-condition dataset at `path` can be opened and holds a complete
+set of slices. A job killed partway through writing one leaves a file that exists but cannot
+be read, and several jobs submitted together share this path, so an existing file is not by
+itself evidence of a good one.
+"""
+function usable_boundary_cache(path)
+    try
+        return JLD2.jldopen(path, "r") do f
+            all(haskey(f, k) for k in ("u_west", "u_east", "v_south", "v_north",
+                "T_west", "T_east", "S_south", "S_north"))
+        end
+    catch err
+        @warn "Boundary condition cache $path could not be read ($(typeof(err))); rebuilding it."
+        return false
+    end
+end
+
+"""
     bsose_open_boundary_conditions(grid;
                                    dataset = BSOSEMonthly(),
                                    dates = all_dates(dataset, :temperature)[1:12],
@@ -1340,7 +1360,7 @@ function bsose_open_boundary_conditions(grid;
     dataset_path = cache_file !== nothing ? cache_file : joinpath(dataset.dir, default_dataset_name)
 
     # 1. Attempt loading from single unified dataset
-    if cache && isfile(dataset_path)
+    if cache && isfile(dataset_path) && usable_boundary_cache(dataset_path)
         @info "Loading all BSOSE boundary conditions from single unified dataset: $dataset_path"
         cached = JLD2.jldopen(dataset_path, "r") do f
             (
@@ -1440,10 +1460,19 @@ function bsose_open_boundary_conditions(grid;
             end
         end
 
-        # Save all boundary conditions together into ONE single dataset
+        # Save all boundary conditions together into ONE single dataset.
+        #
+        # Written to a private temporary file and renamed into place. Jobs submitted together
+        # share this path — it is keyed on the dataset, the dates and the grid size, none of
+        # which vary between boundary-condition experiments — and JLD2 writes through an
+        # mmap, so two processes creating the same file at once die with SIGBUS rather than
+        # raising an error. A rename within one filesystem is atomic, so each writer builds
+        # its own copy and the last to finish wins, while a reader sees either the previous
+        # complete file or the new one, never a half-written mapping.
         if cache
             @info "Saving all boundary conditions together into single dataset: $dataset_path"
-            JLD2.jldopen(dataset_path, "w") do f
+            tmp_path = string(dataset_path, ".tmp.", getpid(), ".", string(rand(UInt32), base=16))
+            JLD2.jldopen(tmp_path, "w") do f
                 f["start_date"] = string(start_d)
                 f["end_date"] = string(end_d)
                 f["u_west"] = u_west
@@ -1467,6 +1496,7 @@ function bsose_open_boundary_conditions(grid;
                     f["wind_v"] = top_v_cached
                 end
             end
+            mv(tmp_path, dataset_path; force=true)
         end
     end
 

@@ -257,7 +257,7 @@ simulation.output_writers[:surface] = NetCDFWriter(
     filename="surface_fields.nc",
     schedule=TimeInterval(1days),
     indices=(:, :, grid.Nz), # Extract the top layer only
-    overwrite_existing=true
+    overwrite_files=true
 )
 
 # Mid-longitude slice
@@ -268,7 +268,7 @@ simulation.output_writers[:mid_lon] = NetCDFWriter(
     filename="mid_lon.nc",
     schedule=TimeInterval(1days),
     indices=(mid_lon_idx, :, :),
-    overwrite_existing=true
+    overwrite_files=true
 )
 
 @info "Starting simulation..."

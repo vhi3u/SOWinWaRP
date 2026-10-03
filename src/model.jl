@@ -445,7 +445,7 @@ simulation.output_writers[:surface] = NetCDFWriter(
     filename="$(RUN_NAME)_surface.nc",
     schedule=TimeInterval(output_interval),
     indices=(:, :, grid.Nz),
-    overwrite_existing=true
+    overwrite_files=true
 )
 
 mid_lon_idx = div(grid.Nx, 2)
@@ -455,7 +455,7 @@ simulation.output_writers[:mid_lon] = NetCDFWriter(
     filename="$(RUN_NAME)_midlon.nc",
     schedule=TimeInterval(output_interval),
     indices=(mid_lon_idx, :, :),
-    overwrite_existing=true
+    overwrite_files=true
 )
 
 # ==============================================================================
@@ -484,7 +484,7 @@ if BOUNDARY_DIAGNOSTICS
         (; η=η_2d),
         filename="$(RUN_NAME)_free_surface.nc",
         schedule=TimeInterval(output_interval),
-        overwrite_existing=true
+        overwrite_files=true
     )
 
     # Outermost cell of each face, full depth. The writer takes a single `indices` tuple,
@@ -503,7 +503,7 @@ if BOUNDARY_DIAGNOSTICS
             filename="$(RUN_NAME)_face_$(face).nc",
             schedule=TimeInterval(boundary_interval),
             indices=indices,
-            overwrite_existing=true
+            overwrite_files=true
         )
     end
 
@@ -546,7 +546,7 @@ if CHECKPOINTS
         ocean.model,
         schedule=TimeInterval(30days),
         prefix="checkpoint",
-        overwrite_existing=true
+        overwrite_files=true
     )
 end
 
