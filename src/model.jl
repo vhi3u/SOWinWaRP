@@ -16,7 +16,7 @@ using SeawaterPolynomials
 using Oceananigans.TurbulenceClosures
 using Oceananigans.Grids: φnode
 using Oceananigans.Operators: Azᶜᶜᶜ, Ax_qᶠᶜᶜ, Ay_qᶜᶠᶜ
-using Oceananigans.BoundaryConditions: PerturbationAdvection, NormalRadiation
+using Oceananigans.BoundaryConditions: PerturbationAdvection, NormalRadiation, ObliqueRadiation
 using Oceanostics.ProgressMessengers: TimedMessenger
 
 # Include our BSOSE helper module
@@ -63,15 +63,23 @@ const SURFACE_FLUXES = true
 const CHECKPOINTS = false # save state and restart if the model crashes. If false, the model will start from scratch. 
 const BOUNDARY_DIAGNOSTICS = true # write free-surface height, boundary-face slices, and a per-face volume transport log
 
-# Open boundary matching scheme for the NORMAL flow: "PerturbationAdvection",
-# "NormalRadiation", or "clamped".
-const OBC_SCHEME = "PerturbationAdvection"
+# Open boundary matching scheme for the NORMAL flow: "ObliqueRadiation",
+# "PerturbationAdvection", "NormalRadiation", or "clamped".
+const OBC_SCHEME = "ObliqueRadiation"
 
-# Condition for the TANGENTIAL velocity (u on south/north, v on west/east) — the setting
-# that governs the meridional jet pinned along the western boundary. One of :gradient,
-# :clamped, :radiation, :radiation_boundary_velocity, :perturbation_advection or
-# :perturbation_advection_gravity; see `bsose_tangential_boundary_condition`.
-const TANGENTIAL_BC = :gradient
+# Condition for the TANGENTIAL velocity (u on south/north, v on west/east). One of :oblique,
+# :oblique_boundary_velocity, :gradient, :clamped, :radiation, :radiation_boundary_velocity,
+# :perturbation_advection or :perturbation_advection_gravity; see
+# `bsose_tangential_boundary_condition`.
+#
+# :oblique with OBC_SCHEME = "ObliqueRadiation" is the configuration the MAB sandbox runs —
+# the same two-dimensional radiation on the normal flow and the tangential component alike.
+const TANGENTIAL_BC = :oblique
+
+# Nudging timescales for ObliqueRadiation, on inflow and on outflow (MAB's values). The
+# other schemes below use 1 day and Inf; the difference is deliberate.
+const OBLIQUE_TAU_IN = 3days
+const OBLIQUE_TAU_OUT = 360days
 
 # Turbulence closure set: "ito", "bsose", "henyey_gm", "biharmonic", or "none". Each is
 # described where the closures are built below.
@@ -231,14 +239,16 @@ if OBCS && DATASET == "BSOSE"
     # rigid Dirichlet boundaries reflect outgoing eddies and waves, leading to tracer blowup at the boundary.
     # PerturbationAdvection / NormalRadiation with outflow_timescale=Inf allows internal waves/eddies to freely
     # radiate out of the domain, while inflow_timescale=1days nudges incoming boundary flow (West) smoothly to BSOSE.
-    obc_scheme = if OBC_SCHEME == "PerturbationAdvection"
+    obc_scheme = if OBC_SCHEME == "ObliqueRadiation"
+        ObliqueRadiation(inflow_timescale=OBLIQUE_TAU_IN, outflow_timescale=OBLIQUE_TAU_OUT)
+    elseif OBC_SCHEME == "PerturbationAdvection"
         PerturbationAdvection(inflow_timescale=1days, outflow_timescale=Inf)
     elseif OBC_SCHEME == "NormalRadiation"
         NormalRadiation(inflow_timescale=1days, outflow_timescale=Inf)
     elseif OBC_SCHEME == "clamped" || OBC_SCHEME == "none"
         nothing
     else
-        error("Unknown OBC_SCHEME: $OBC_SCHEME. Choose 'PerturbationAdvection', 'NormalRadiation', or 'clamped'.")
+        error("Unknown OBC_SCHEME: $OBC_SCHEME. Choose 'ObliqueRadiation', 'PerturbationAdvection', 'NormalRadiation', or 'clamped'.")
     end
     @info "  -> OBC Scheme: $(obc_scheme === nothing ? "Clamped Dirichlet" : summary(obc_scheme))"
 
@@ -246,7 +256,8 @@ if OBCS && DATASET == "BSOSE"
 
     boundary_conditions = bsose_open_boundary_conditions(grid; dataset=dataset, dates=bc_dates,
         winds=WINDS, surface_fluxes=SURFACE_FLUXES, scheme=obc_scheme,
-        tangential_bc_kind=TANGENTIAL_BC, reference_date=start_date)
+        tangential_bc_kind=TANGENTIAL_BC, oblique_inflow_timescale=OBLIQUE_TAU_IN,
+        oblique_outflow_timescale=OBLIQUE_TAU_OUT, reference_date=start_date)
 
     if SPONGE_LAYERS
         sponge_timescale = 30days

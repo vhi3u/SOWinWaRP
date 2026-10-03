@@ -2,12 +2,16 @@
 #
 # Short GPU tests of open boundary condition configurations.
 #
-#     ./run_obc_tests                    # submit every configuration
-#     ./run_obc_tests gradient radiation # submit only these
-#     ./run_obc_tests --days 5 --list    # show what would be submitted
+#     ./run_obc_tests                             # every configuration, 90 days
+#     ./run_obc_tests clamped radiation gradient  # only these
+#     ./run_obc_tests --days 10 --list            # show what would be submitted
 #
-# Each configuration is one 10-day job at the production resolution, writing to
-# obc_tests/NAME_surface.nc, obc_tests/NAME_midlon.nc and the boundary diagnostics.
+# Each configuration is one job at the production resolution, writing to
+# obc_tests/NAME_DAYSd_surface.nc and the matching midlon and boundary diagnostics.
+#
+# 90 days is the default because 10 is not long enough to tell these apart: the western
+# boundary jet builds over a ~20-day cycle, and at 10 days every configuration is still in
+# its spin-up transient. Use --days 10 only to check that a configuration runs at all.
 # Compare them afterwards with:
 #
 #     julia --project=. tools/compare_obc_tests.jl
@@ -19,7 +23,7 @@
 
 set -euo pipefail
 
-DAYS=10
+DAYS=90
 LIST_ONLY=0
 SELECTED=()
 
@@ -31,6 +35,9 @@ CONFIGS=(
     "radiation_bv|radiation_boundary_velocity|PerturbationAdvection"
     "pa_gravity|perturbation_advection_gravity|PerturbationAdvection"
     "pa_plain|perturbation_advection|PerturbationAdvection"
+    "oblique|oblique|ObliqueRadiation"
+    "oblique_bv|oblique_boundary_velocity|ObliqueRadiation"
+    "oblique_normal|radiation|ObliqueRadiation"
     "radiation_both|radiation|NormalRadiation"
     "gradient_radnormal|gradient|NormalRadiation"
 )
@@ -45,7 +52,13 @@ while [ $# -gt 0 ]; do
     esac
 done
 
+# ~30 simulated days per wall hour once running, plus an hour for setup and the first
+# boundary-condition build.
+WALLTIME=$(printf '%02d:00:00' $(( 1 + (DAYS + 24) / 25 )))
+
 mkdir -p obc_tests logs
+echo "Wall time per job: $WALLTIME for $DAYS simulated days"
+
 
 for entry in "${CONFIGS[@]}"; do
     IFS='|' read -r name tangential normal <<< "$entry"
@@ -57,12 +70,13 @@ for entry in "${CONFIGS[@]}"; do
         [ $wanted -eq 1 ] || continue
     fi
 
-    variant="obc_tests/model_${name}.jl"
+    run_name="${name}_${DAYS}d"
+    variant="obc_tests/model_${run_name}.jl"
 
     # Rewrite the configuration literals. `include("setup_bsose.jl")` is resolved relative
     # to the including file, so it has to be redirected now that the variant lives in
     # obc_tests/ rather than src/.
-    sed -e "s|^const RUN_NAME = .*|const RUN_NAME = \"obc_tests/${name}\"|" \
+    sed -e "s|^const RUN_NAME = .*|const RUN_NAME = \"obc_tests/${run_name}\"|" \
         -e "s|^const TANGENTIAL_BC = .*|const TANGENTIAL_BC = :${tangential}|" \
         -e "s|^const OBC_SCHEME = .*|const OBC_SCHEME = \"${normal}\"|" \
         -e "s|^end_date = .*|end_date = start_date + Day(${DAYS})|" \
@@ -75,15 +89,16 @@ for entry in "${CONFIGS[@]}"; do
     grep -q "^end_date = start_date + Day(${DAYS})\$" "$variant" || {
         echo "error: could not set end_date in $variant" >&2; exit 1; }
 
-    printf '%-20s tangential=%-32s normal=%-22s -> %s\n' "$name" "$tangential" "$normal" "$variant"
+    printf '%-20s tangential=%-32s normal=%-22s %3sd -> %s\n' \
+        "$name" "$tangential" "$normal" "$DAYS" "$variant"
     [ $LIST_ONLY -eq 1 ] && continue
 
-    sbatch --job-name="obc_${name}" <<EOF
+    sbatch --job-name="obc_${run_name}" <<EOF
 #!/bin/bash
 #SBATCH --account=gts-ldove6-paid
 #SBATCH --output=logs/%x-%j.out
 #SBATCH --error=logs/%x-%j.err
-#SBATCH --time=03:00:00
+#SBATCH --time=${WALLTIME}
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
 #SBATCH --gres=gpu:V100:1
@@ -92,7 +107,7 @@ for entry in "${CONFIGS[@]}"; do
 set -euo pipefail
 
 echo "=========================================================="
-echo " Config     : ${name}"
+echo " Config     : ${run_name}"
 echo " Tangential : ${tangential}"
 echo " Normal     : ${normal}"
 echo " Days       : ${DAYS}"
@@ -107,9 +122,9 @@ unset LD_LIBRARY_PATH
 # A configuration that diverges does so in the first minute, so a failure here is a
 # result, not an error: record it and let the other configurations carry on.
 if julia --project=. "${variant}"; then
-    echo "RESULT ${name}: completed ${DAYS} days"
+    echo "RESULT ${run_name}: completed ${DAYS} days"
 else
-    echo "RESULT ${name}: FAILED (exit \$?) — see the log above for where it diverged"
+    echo "RESULT ${run_name}: FAILED (exit \$?) — see the log above for where it diverged"
 fi
 
 echo " Finished   : \$(date)"

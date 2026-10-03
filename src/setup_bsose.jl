@@ -18,7 +18,7 @@ using Oceananigans.Units
 using Oceananigans.Grids
 using Oceananigans.Grids: topology
 using Oceananigans.BoundaryConditions
-using Oceananigans.BoundaryConditions: PerturbationAdvection, NormalRadiation
+using Oceananigans.BoundaryConditions: PerturbationAdvection, NormalRadiation, ObliqueRadiation
 using Oceananigans.OutputReaders: FieldTimeSeries, Cyclical
 using Oceananigans.Architectures: architecture, CPU, GPU, on_architecture
 using Oceananigans.Fields: interior, location, fill_halo_regions!
@@ -1231,15 +1231,33 @@ the 3D field uses.
 - `:radiation_boundary_velocity` — the same, advecting with the boundary-face velocity.
 - `:perturbation_advection` — `PerturbationAdvection` as-is. Known to diverge on a
   tangential component within ~5 time steps; kept so a test matrix can show that.
+- `:oblique` — `ObliqueRadiation`, the Raymond & Kuo (1984) two-dimensional radiation
+  condition. Unlike the one-dimensional schemes it carries a boundary-tangential phase speed
+  as well as a normal one, so a feature crossing the boundary obliquely — which is most of
+  them at a corner — is radiated along its own direction of travel rather than only normal to
+  the face. This is the configuration the MAB sandbox runs: oblique on the normal flow and on
+  the tangential component alike, nudged over `oblique_inflow_timescale` on inflow and
+  `oblique_outflow_timescale` on outflow.
+- `:oblique_boundary_velocity` — the same, deciding inflow from the boundary-face velocity
+  rather than one cell in.
 - `:perturbation_advection_gravity` — `PerturbationAdvection` with a nonzero
   `gravity_wave_speed`. The phase speed then saturates the scheme's `Ũ` at 1 rather than
   the ~10⁻³ a 0.1 m/s tangential flow gives, so the halo relaxes toward the interior
   instead of holding its own stale value. This is the form most likely to make
   PerturbationAdvection usable here; √(gH) ≈ 210 m/s for a 4.5 km water column.
 """
-function bsose_tangential_boundary_condition(value, kind; gravity_wave_speed=210.0)
+function bsose_tangential_boundary_condition(value, kind; gravity_wave_speed=210.0,
+    oblique_inflow_timescale=3days, oblique_outflow_timescale=360days)
     kind === :gradient && return GradientBoundaryCondition(0)
     kind === :clamped && return ValueBoundaryCondition(value)
+
+    kind === :oblique && return ValueBoundaryCondition(value;
+        scheme=ObliqueRadiation(inflow_timescale=oblique_inflow_timescale,
+            outflow_timescale=oblique_outflow_timescale))
+
+    kind === :oblique_boundary_velocity && return ValueBoundaryCondition(value;
+        scheme=ObliqueRadiation(inflow_timescale=oblique_inflow_timescale,
+            outflow_timescale=oblique_outflow_timescale, use_boundary_velocity=true))
 
     kind === :radiation && return ValueBoundaryCondition(value;
         scheme=NormalRadiation(inflow_timescale=1days, outflow_timescale=Inf))
@@ -1256,8 +1274,8 @@ function bsose_tangential_boundary_condition(value, kind; gravity_wave_speed=210
             gravity_wave_speed=gravity_wave_speed))
 
     error("Unknown tangential_bc_kind: $kind. Choose :gradient, :clamped, :radiation, " *
-          ":radiation_boundary_velocity, :perturbation_advection or " *
-          ":perturbation_advection_gravity.")
+          ":radiation_boundary_velocity, :oblique, :oblique_boundary_velocity, " *
+          ":perturbation_advection or :perturbation_advection_gravity.")
 end
 
 """
@@ -1298,6 +1316,8 @@ function bsose_open_boundary_conditions(grid;
     surface_fluxes=false,
     tangential_bc_kind=:gradient,
     tangential_gravity_wave_speed=210.0,
+    oblique_inflow_timescale=3days,
+    oblique_outflow_timescale=360days,
     ρ₀=1026.0,
     reference_date=nothing,
     cache=true,
@@ -1528,7 +1548,8 @@ function bsose_open_boundary_conditions(grid;
     # matters. Clamping to a prescribed value over-specifies an outflow boundary and leaves
     # a fast meridional jet pinned along the western edge.
     tangential_bc(value) = bsose_tangential_boundary_condition(value, tangential_bc_kind;
-        gravity_wave_speed=tangential_gravity_wave_speed)
+        gravity_wave_speed=tangential_gravity_wave_speed,
+        oblique_inflow_timescale, oblique_outflow_timescale)
     if is_x_periodic
         @info " -> Longitude is Periodic (circumpolar): applying South & North boundary conditions."
         u_bcs = FieldBoundaryConditions(

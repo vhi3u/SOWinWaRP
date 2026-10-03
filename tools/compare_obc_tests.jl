@@ -17,13 +17,20 @@ using Printf
 using Statistics
 
 const EDGE_CELLS = 2   # cells counted as "the boundary"
-const SKIN = 5         # cells excluded around the edge when measuring the interior
+const SKIN = 5         # cells excluded around the edge when measuring the whole interior
+const REF_OFFSET = 24  # distance in from the west face of the latitude-matched reference strip
 
 """
     summarise(surface_file)
 
 Boundary-versus-interior velocity statistics for one run's surface output.
 Returns `nothing` if the file cannot be read.
+
+The headline comparison is against a reference strip the same shape as the edge strip and
+at the same latitudes, `REF_OFFSET` cells further in — just outside the sponge. Comparing
+the edge against the whole interior instead would confound the boundary with geography,
+since the west face spans the energetic ACC band and the quiet south together while a
+domain-wide average is dominated by the quiet part.
 """
 function summarise(surface_file)
     ds = Dataset(surface_file)
@@ -34,7 +41,8 @@ function summarise(surface_file)
         Nx, Ny = size(mask)
 
         edge_v = 0.0; edge_u = 0.0; inner_v = 0.0; inner_u = 0.0
-        edge_v_sum = 0.0; inner_v_sum = 0.0; n = 0
+        ref_v = 0.0
+        edge_v_sum = 0.0; ref_v_sum = 0.0; inner_v_sum = 0.0; n = 0
 
         for t in 1:Nt
             u_raw = Float64.(ds["u"][:, :, 1, t])
@@ -47,22 +55,25 @@ function summarise(surface_file)
             nanmax(a) = (b = filter(isfinite, a); isempty(b) ? 0.0 : maximum(abs, b))
             nanmean(a) = (b = filter(isfinite, a); isempty(b) ? 0.0 : mean(abs, b))
 
-            # the western edge is where the jet sits; keep it separate from the interior
-            ev = nanmax(vc[1:EDGE_CELLS, :])
-            iv = nanmax(vc[SKIN+1:Nx-SKIN, SKIN+1:Ny-SKIN])
-            edge_v = max(edge_v, ev)
-            inner_v = max(inner_v, iv)
+            # the western edge is where the jet sits
+            edge = vc[1:EDGE_CELLS, :]
+            ref = vc[REF_OFFSET+1:REF_OFFSET+EDGE_CELLS, :]   # same latitudes, further in
+            edge_v = max(edge_v, nanmax(edge))
+            ref_v = max(ref_v, nanmax(ref))
+            inner_v = max(inner_v, nanmax(vc[SKIN+1:Nx-SKIN, SKIN+1:Ny-SKIN]))
             edge_u = max(edge_u, nanmax(uc[:, Ny-EDGE_CELLS+1:Ny]))
             inner_u = max(inner_u, nanmax(uc[SKIN+1:Nx-SKIN, SKIN+1:Ny-SKIN]))
-            edge_v_sum += nanmean(vc[1:EDGE_CELLS, :])
+            edge_v_sum += nanmean(edge)
+            ref_v_sum += nanmean(ref)
             inner_v_sum += nanmean(vc[SKIN+1:Nx-SKIN, SKIN+1:Ny-SKIN])
             n += 1
         end
 
         return (; days=times[end] / 86400, snapshots=Nt,
-            edge_v, inner_v, edge_u, inner_u,
-            ratio_max=inner_v == 0 ? NaN : edge_v / inner_v,
-            ratio_mean=inner_v_sum == 0 ? NaN : (edge_v_sum / n) / (inner_v_sum / n))
+            edge_v, ref_v, inner_v, edge_u, inner_u,
+            ratio_max=ref_v == 0 ? NaN : edge_v / ref_v,
+            ratio_mean=ref_v_sum == 0 ? NaN : (edge_v_sum / n) / (ref_v_sum / n),
+            ratio_domain=inner_v == 0 ? NaN : edge_v / inner_v)
     catch e
         @warn "could not read $surface_file" exception = e
         return nothing
@@ -72,7 +83,15 @@ function summarise(surface_file)
 end
 
 function compare_obc_tests(dir="obc_tests")
-    files = sort(filter(f -> endswith(f, "_surface.nc"), readdir(dir; join=true)))
+    if !isdir(dir)
+        println("No $dir/ directory here — run this from the repository root, or pass the ",
+            "directory holding the *_surface.nc files.")
+        return nothing
+    end
+
+    files = sort(filter(readdir(dir; join=true)) do f
+        endswith(f, "_surface.nc") && !endswith(f, "_free_surface.nc")
+    end)
 
     if isempty(files)
         println("No *_surface.nc files in $dir/ yet.")
@@ -81,11 +100,12 @@ function compare_obc_tests(dir="obc_tests")
     end
 
     println("Open boundary configurations in $dir/")
-    println("  west edge = outermost $EDGE_CELLS cells; interior excludes $SKIN cells all round.")
-    println("  A configuration that is not pinning the flow has ratios near 1.\n")
+    println("  edge   = west face, outermost $EDGE_CELLS columns")
+    println("  ref    = same latitudes, $REF_OFFSET cells further in (just outside the sponge)")
+    println("  ratios compare edge to ref, so geography cancels. Near 1 = nothing pinned.\n")
     @printf("%-22s %6s %9s %9s %9s %9s %9s\n",
-        "config", "days", "edge|v|", "int|v|", "max ratio", "mean rat", "edge|u| N")
-    println("-"^80)
+        "config", "days", "edge|v|", "ref|v|", "max ratio", "mean rat", "vs domain")
+    println("-"^86)
 
     rows = []
     for f in files
@@ -93,31 +113,34 @@ function compare_obc_tests(dir="obc_tests")
         s = summarise(f)
         s === nothing && continue
         push!(rows, (name, s))
-        @printf("%-22s %6.1f %9.3f %9.3f %9.2f %9.2f %9.3f\n",
-            name, s.days, s.edge_v, s.inner_v, s.ratio_max, s.ratio_mean, s.edge_u)
     end
 
     isempty(rows) && return nothing
 
-    println()
-    ok = filter(r -> isfinite(r[2].ratio_max), rows)
-    if !isempty(ok)
-        best = argmin(r -> r[2].ratio_max, ok)
-        @printf("Least boundary-pinned: %s (peak west |v| is %.2fx the interior peak)\n",
-            best[1], best[2].ratio_max)
+    # A diverged run stops early, so anything well short of the longest run is incomplete.
+    full = maximum(r -> r[2].days, rows)
+    complete(r) = r[2].snapshots > 1 && r[2].days >= 0.9 * full
+
+    for (name, s) in rows
+        @printf("%-22s %6.1f %9.3f %9.3f %9.2f %9.2f %9.2f %s\n",
+            name, s.days, s.edge_v, s.ref_v, s.ratio_max, s.ratio_mean, s.ratio_domain,
+            complete((name, s)) ? "" : "  DIVERGED — numbers are the initial state, ignore")
     end
 
-    expected = ["gradient", "clamped", "radiation", "radiation_bv",
-        "pa_gravity", "pa_plain", "radiation_both", "gradient_radnormal"]
-    missing = filter(n -> !any(r -> r[1] == n, rows), expected)
-    isempty(missing) ||
-        println("No output from: ", join(missing, ", "),
-            " — check logs/obc_*.out; a configuration that diverges writes nothing.")
+    println()
+    ok = filter(r -> complete(r) && isfinite(r[2].ratio_max), rows)
+    if isempty(ok)
+        println("No configuration ran to completion — nothing to rank.")
+    else
+        best = argmin(r -> r[2].ratio_max, ok)
+        @printf("Least boundary-pinned of the %d that completed: %s (peak west |v| is %.2fx the interior peak)\n",
+            length(ok), best[1], best[2].ratio_max)
+    end
 
     return rows
 end
 
-# Run it when the file is executed directly, so `julia tools/compare_obc_tests.jl` works.
-if abspath(PROGRAM_FILE) == @__FILE__
-    compare_obc_tests(isempty(ARGS) ? "obc_tests" : ARGS[1])
-end
+# Run on include as well as from the command line, matching the other analysis scripts in
+# tools/ — `include("tools/compare_obc_tests.jl")` is how these are usually invoked here.
+# Call `compare_obc_tests(dir)` directly to point it somewhere else.
+compare_obc_tests(isempty(ARGS) ? "obc_tests" : ARGS[1])
