@@ -1,0 +1,14 @@
+# Template for .copernicus_env (which is gitignored and holds the real credentials).
+#
+#     cp .copernicus_env.example .copernicus_env
+#     chmod 600 .copernicus_env
+#     $EDITOR .copernicus_env
+#
+# Then, before any run that downloads GLORYS:
+#
+#     source .copernicus_env
+#
+# A Copernicus Marine account is free: https://data.marine.copernicus.eu/register
+
+export COPERNICUSMARINE_SERVICE_USERNAME='your-cmems-username'
+export COPERNICUSMARINE_SERVICE_PASSWORD='your-cmems-password'

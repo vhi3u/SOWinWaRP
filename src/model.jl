@@ -63,6 +63,16 @@ const SURFACE_FLUXES = true
 const CHECKPOINTS = false # save state and restart if the model crashes. If false, the model will start from scratch. 
 const BOUNDARY_DIAGNOSTICS = true # write free-surface height, boundary-face slices, and a per-face volume transport log
 
+# Barotropic (depth-integrated) open boundary conditions: Flather on U and V, fed the BSOSE
+# depth-integrated transport, with the companion Chapman condition added to η automatically.
+#
+# Without this the split-explicit corrector overwrites the depth mean of the prescribed u/v at
+# every face with the default impenetrable barotropic solution, so no net transport can cross
+# the boundary no matter which scheme OBC_SCHEME selects — which is why every face transport
+# reads 0.00 Sv and a jet sits on the western edge. ηᵉˣᵗ is 0 for now: BSOSE's ETAN is not in
+# data/, so the Flather condition currently carries transport only.
+const BAROTROPIC_OBC = true
+
 # Open boundary matching scheme for the NORMAL flow: "ObliqueRadiation",
 # "PerturbationAdvection", "NormalRadiation", or "clamped".
 const OBC_SCHEME = "ObliqueRadiation"
@@ -257,7 +267,8 @@ if OBCS && DATASET == "BSOSE"
     boundary_conditions = bsose_open_boundary_conditions(grid; dataset=dataset, dates=bc_dates,
         winds=WINDS, surface_fluxes=SURFACE_FLUXES, scheme=obc_scheme,
         tangential_bc_kind=TANGENTIAL_BC, oblique_inflow_timescale=OBLIQUE_TAU_IN,
-        oblique_outflow_timescale=OBLIQUE_TAU_OUT, reference_date=start_date)
+        oblique_outflow_timescale=OBLIQUE_TAU_OUT, reference_date=start_date,
+        barotropic=BAROTROPIC_OBC)
 
     if SPONGE_LAYERS
         sponge_timescale = 30days

@@ -27,19 +27,28 @@ DAYS=90
 LIST_ONLY=0
 SELECTED=()
 
-# name              tangential BC                      normal-flow scheme
+# name              tangential BC                      normal-flow scheme        barotropic
+#
+# `barotropic` adds Flather conditions on the depth-integrated transport U and V. With it
+# false, the split-explicit corrector holds the net transport through every face at zero
+# regardless of the other two columns, so the *_bt pairs below are the A/B that matters:
+# compare clamped against clamped_bt before reading anything into the rest.
 CONFIGS=(
-    "gradient|gradient|PerturbationAdvection"
-    "clamped|clamped|PerturbationAdvection"
-    "radiation|radiation|PerturbationAdvection"
-    "radiation_bv|radiation_boundary_velocity|PerturbationAdvection"
-    "pa_gravity|perturbation_advection_gravity|PerturbationAdvection"
-    "pa_plain|perturbation_advection|PerturbationAdvection"
-    "oblique|oblique|ObliqueRadiation"
-    "oblique_bv|oblique_boundary_velocity|ObliqueRadiation"
-    "oblique_normal|radiation|ObliqueRadiation"
-    "radiation_both|radiation|NormalRadiation"
-    "gradient_radnormal|gradient|NormalRadiation"
+    "clamped|clamped|PerturbationAdvection|false"
+    "clamped_bt|clamped|PerturbationAdvection|true"
+    "oblique|oblique|ObliqueRadiation|false"
+    "oblique_bt|oblique|ObliqueRadiation|true"
+    "pa_bt|gradient|PerturbationAdvection|true"
+    "oblique_normal_bt|radiation|ObliqueRadiation|true"
+    "gradient|gradient|PerturbationAdvection|false"
+    "radiation|radiation|PerturbationAdvection|false"
+    "radiation_bv|radiation_boundary_velocity|PerturbationAdvection|false"
+    "pa_gravity|perturbation_advection_gravity|PerturbationAdvection|false"
+    "pa_plain|perturbation_advection|PerturbationAdvection|false"
+    "oblique_bv|oblique_boundary_velocity|ObliqueRadiation|false"
+    "oblique_normal|radiation|ObliqueRadiation|false"
+    "radiation_both|radiation|NormalRadiation|false"
+    "gradient_radnormal|gradient|NormalRadiation|false"
 )
 
 while [ $# -gt 0 ]; do
@@ -61,7 +70,7 @@ echo "Wall time per job: $WALLTIME for $DAYS simulated days"
 
 
 for entry in "${CONFIGS[@]}"; do
-    IFS='|' read -r name tangential normal <<< "$entry"
+    IFS='|' read -r name tangential normal barotropic <<< "$entry"
 
     # skip anything not asked for, when a subset was given
     if [ ${#SELECTED[@]} -gt 0 ]; then
@@ -79,6 +88,7 @@ for entry in "${CONFIGS[@]}"; do
     sed -e "s|^const RUN_NAME = .*|const RUN_NAME = \"obc_tests/${run_name}\"|" \
         -e "s|^const TANGENTIAL_BC = .*|const TANGENTIAL_BC = :${tangential}|" \
         -e "s|^const OBC_SCHEME = .*|const OBC_SCHEME = \"${normal}\"|" \
+        -e "s|^const BAROTROPIC_OBC = .*|const BAROTROPIC_OBC = ${barotropic}|" \
         -e "s|^end_date = .*|end_date = start_date + Day(${DAYS})|" \
         -e "s|^include(\"setup_bsose.jl\")|include(joinpath(@__DIR__, \"..\", \"src\", \"setup_bsose.jl\"))|" \
         src/model.jl > "$variant"
@@ -88,9 +98,11 @@ for entry in "${CONFIGS[@]}"; do
         echo "error: could not set TANGENTIAL_BC in $variant" >&2; exit 1; }
     grep -q "^end_date = start_date + Day(${DAYS})\$" "$variant" || {
         echo "error: could not set end_date in $variant" >&2; exit 1; }
+    grep -q "^const BAROTROPIC_OBC = ${barotropic}\$" "$variant" || {
+        echo "error: could not set BAROTROPIC_OBC in $variant" >&2; exit 1; }
 
-    printf '%-20s tangential=%-32s normal=%-22s %3sd -> %s\n' \
-        "$name" "$tangential" "$normal" "$DAYS" "$variant"
+    printf '%-20s tangential=%-32s normal=%-22s barotropic=%-5s %3sd -> %s\n' \
+        "$name" "$tangential" "$normal" "$barotropic" "$DAYS" "$variant"
     [ $LIST_ONLY -eq 1 ] && continue
 
     sbatch --job-name="obc_${run_name}" <<EOF
@@ -110,6 +122,7 @@ echo "=========================================================="
 echo " Config     : ${run_name}"
 echo " Tangential : ${tangential}"
 echo " Normal     : ${normal}"
+echo " Barotropic : ${barotropic}"
 echo " Days       : ${DAYS}"
 echo " Node       : \$(hostname)"
 echo " Start Time : \$(date)"

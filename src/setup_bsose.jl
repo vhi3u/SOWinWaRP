@@ -16,9 +16,10 @@
 using Oceananigans
 using Oceananigans.Units
 using Oceananigans.Grids
-using Oceananigans.Grids: topology
+using Oceananigans.Grids: topology, znodes
 using Oceananigans.BoundaryConditions
-using Oceananigans.BoundaryConditions: PerturbationAdvection, NormalRadiation, ObliqueRadiation
+using Oceananigans.BoundaryConditions: PerturbationAdvection, NormalRadiation, ObliqueRadiation,
+                                       GravityWaveRadiationBoundaryCondition
 using Oceananigans.OutputReaders: FieldTimeSeries, Cyclical
 using Oceananigans.Architectures: architecture, CPU, GPU, on_architecture
 using Oceananigans.Fields: interior, location, fill_halo_regions!
@@ -1087,6 +1088,121 @@ function mask_immersed_boundary_normal_flow!(bts, side, grid)
 end
 
 # ==============================================================================
+# 2d. Barotropic transport for the Flather open boundary conditions
+#
+# The split-explicit free surface solves separately for the depth-integrated
+# transport (U, V) and the surface displacement η, and its corrector REPLACES the
+# depth mean of u and v at the boundary with whatever the barotropic solver says.
+# A NormalFlow condition on `u` is therefore only half an open boundary: while `U`
+# keeps its default impenetrable `NormalFlow(nothing)`, the depth mean of any
+# prescribed inflow is driven back to zero, and the baroclinic condition can only
+# redistribute flow in the vertical — never let a net transport cross the face.
+# That is what pins a jet along the western edge and holds every face transport at
+# 0.00 Sv no matter which scheme `u` carries.
+#
+# Flather supplies the missing half,
+#
+#     Uᵇ = Uᵉˣᵗ ± √(gH) (ηᵇ − ηᵉˣᵗ)
+#
+# and is the only place data enters the barotropic mode: the companion Chapman
+# condition on η radiates but carries no data, and Oceananigans 0.113 pairs it onto
+# η automatically from the `U`/`V` conditions (see
+# `implicit_gravity_wave_companion_boundary_conditions`), so η needs nothing here.
+# ==============================================================================
+
+"""
+    boundary_vertical_spacing(grid)
+
+Cell vertical spacings `Δz[k]` of `grid`, as a plain CPU vector.
+
+The vertical discretization of a `LatitudeLongitudeGrid` does not vary horizontally, and
+`GridFittedBottom` leaves each cell wholly wet or wholly dry rather than partially filled,
+so a single column of spacings describes every boundary cell.
+"""
+function boundary_vertical_spacing(grid)
+    underlying = grid isa ImmersedBoundaryGrid ? grid.underlying_grid : grid
+    cpu_grid = architecture(underlying) isa GPU ? on_architecture(CPU(), underlying) : underlying
+    return diff(collect(znodes(cpu_grid, Face())))
+end
+
+"""
+    bsose_barotropic_transport(bts, side, grid)
+
+Depth-integrated transport `Uᵉˣᵗ = ∫ u·dz` (m² s⁻¹) along one open boundary, returned as a
+`FieldTimeSeries` shaped for the barotropic velocity's halo on that side — `(Nothing,
+Center, Nothing)` on west/east, `(Center, Nothing, Nothing)` on south/north.
+
+`bts` must be the boundary slice of the *normal* velocity for `side` **after**
+[`mask_immersed_boundary_normal_flow!`](@ref) has zeroed its dry cells, so that summing the
+whole column already gives the transport through the model's wet column alone.
+
+That ordering is what keeps this integral honest, and it is the easiest thing to get wrong.
+BSOSE land is inpainted with nearest-neighbour ocean values
+(`DataWrangling.default_inpainting`), so the raw slice carries plausible-looking velocity in
+cells below the sea floor; integrating those and then dividing by a shallow shelf depth is
+how a boundary comes to demand metres per second of depth-mean inflow. The reported
+`max |Uᵉˣᵗ|/H` makes that visible — it should be a sane depth-mean velocity (order
+0.1 m/s here), not order 1.
+"""
+function bsose_barotropic_transport(bts, side, grid)
+    bts === nothing && return nothing
+
+    Δz = boundary_vertical_spacing(grid)
+    cpu_bts = architecture(bts) isa GPU ? on_architecture(CPU(), bts) : bts
+    cpu_grid = architecture(grid) isa GPU ? on_architecture(CPU(), grid) : grid
+    underlying = grid isa ImmersedBoundaryGrid ? grid.underlying_grid : grid
+    Nx, Ny, Nz = size(underlying)
+
+    times = cpu_bts.times
+    time_indexing = cpu_bts.time_indexing
+
+    along_x = side === :south || side === :north   # transport varies along i, not j
+    N = along_x ? Nx : Ny
+
+    # Wet depth of each boundary column. Only used to report the implied depth-mean
+    # velocity: Flather forms √(gH) from the model's own H, not from this.
+    H = zeros(N)
+    for n in 1:N, k in 1:Nz
+        if cpu_grid isa ImmersedBoundaryGrid
+            i = along_x ? n : (side === :west ? 1 : Nx)
+            j = along_x ? (side === :south ? 1 : Ny) : n
+            immersed_cell(i, j, k, cpu_grid) && continue
+        end
+        H[n] += Δz[k]
+    end
+
+    Uts = along_x ?
+          FieldTimeSeries{Center,Nothing,Nothing}(cpu_bts.grid, times; indices=(:, 1, 1), time_indexing) :
+          FieldTimeSeries{Nothing,Center,Nothing}(cpu_bts.grid, times; indices=(1, :, 1), time_indexing)
+
+    peak = 0.0
+    for t in 1:length(times)
+        slice = along_x ? interior(cpu_bts[t], :, 1, :) : interior(cpu_bts[t], 1, :, :)
+        U = zeros(N)
+        for n in 1:N, k in 1:Nz
+            U[n] += Δz[k] * slice[n, k]
+        end
+
+        if along_x
+            interior(Uts[t], :, 1, 1) .= U
+        else
+            interior(Uts[t], 1, :, 1) .= U
+        end
+        fill_halo_regions!(Uts[t])
+
+        for n in 1:N
+            H[n] > 0 && (peak = max(peak, abs(U[n]) / H[n]))
+        end
+    end
+
+    @info @sprintf(" -> %-5s Uᵉˣᵗ: max |U|/H = %.3f m/s over %d wet columns",
+        string(side), peak, count(>(0), H))
+
+    arch = architecture(grid)
+    return arch isa GPU ? on_architecture(arch, Uts) : Uts
+end
+
+# ==============================================================================
 # 3. Surface Wind Stress Helper (Standalone)
 # ==============================================================================
 
@@ -1307,7 +1423,7 @@ end
                                    ρ₀ = 1026.0)
 
 Construct a `NamedTuple` of `FieldBoundaryConditions` `(; u, v, T, S)` configured with
-open boundary conditions from BSOSE.
+open boundary conditions from BSOSE — plus `(; U, V)` when `barotropic = true`.
 
 # Arguments
 - `grid`: The simulation `LatitudeLongitudeGrid`.
@@ -1325,7 +1441,21 @@ open boundary conditions from BSOSE.
 - `reference_date`: Calendar date of model time zero, so that the boundary and wind series are
                     stepped on the model clock; see [`model_clock_offset`](@ref). `nothing`
                     (default) leaves them on the dataset's own clock.
+- `barotropic`: If `true`, also returns Flather conditions on the depth-integrated transport
+                `U` and `V`, fed the BSOSE transport through each face, and lets Oceananigans
+                pair the companion Chapman condition onto `η`. **This is not an optional
+                refinement.** The split-explicit corrector replaces the depth mean of `u` and
+                `v` at the boundary with the barotropic solution, so while `U`/`V` keep their
+                default impenetrable `NormalFlow(nothing)` the net transport through every face
+                is held at zero whatever `scheme` is doing — see the section comment above
+                [`bsose_barotropic_transport`](@ref).
+- `exterior_free_surface`: `ηᵉˣᵗ` in the Flather condition. `0` (default) drives the barotropic
+                mode by transport alone, which is all BSOSE can do here: its `ETAN` is not among
+                the files this module reads. A `FieldTimeSeries` of exterior sea surface height
+                (GLORYS `zos`, say) can be passed instead.
 - `cache`: If `true`, saves and loads all boundary conditions to/from a SINGLE unified dataset file.
+           The barotropic transports are derived from the cached slices rather than stored, so
+           turning `barotropic` on does not invalidate an existing cache.
 - `cache_file`: Optional custom file path for the unified dataset file.
 """
 function bsose_open_boundary_conditions(grid;
@@ -1335,6 +1465,8 @@ function bsose_open_boundary_conditions(grid;
     winds=nothing,
     surface_fluxes=false,
     tangential_bc_kind=:gradient,
+    barotropic=false,
+    exterior_free_surface=0,
     tangential_gravity_wave_speed=210.0,
     oblique_inflow_timescale=3days,
     oblique_outflow_timescale=360days,
@@ -1532,6 +1664,42 @@ function bsose_open_boundary_conditions(grid;
     S_south = S_south isa FieldTimeSeries ? on_architecture(arch, S_south) : S_south
     S_north = S_north isa FieldTimeSeries ? on_architecture(arch, S_north) : S_north
 
+    # 2d. Barotropic (depth-integrated) open boundary conditions.
+    #
+    # Without these the split-explicit corrector overwrites the depth mean of the
+    # prescribed u/v at every face with the impenetrable barotropic solution, so no net
+    # transport can cross the boundary however the baroclinic condition is configured.
+    # Built from the slices AFTER immersed masking, so each integral already covers only
+    # the model's wet column — see `bsose_barotropic_transport`.
+    U_bcs = nothing
+    V_bcs = nothing
+
+    if barotropic === true
+        @info "Building barotropic (Flather) boundary conditions for U and V..."
+        ηᵉˣᵗ = exterior_free_surface
+
+        V_south_transport = bsose_barotropic_transport(v_south, :south, grid)
+        V_north_transport = bsose_barotropic_transport(v_north, :north, grid)
+
+        V_bcs = FieldBoundaryConditions(grid, (Center(), Face(), nothing);
+            south=GravityWaveRadiationBoundaryCondition((V_south_transport, ηᵉˣᵗ)),
+            north=GravityWaveRadiationBoundaryCondition((V_north_transport, ηᵉˣᵗ)))
+
+        if !is_x_periodic
+            U_west_transport = bsose_barotropic_transport(u_west, :west, grid)
+            U_east_transport = bsose_barotropic_transport(u_east, :east, grid)
+
+            U_bcs = FieldBoundaryConditions(grid, (Face(), Center(), nothing);
+                west=GravityWaveRadiationBoundaryCondition((U_west_transport, ηᵉˣᵗ)),
+                east=GravityWaveRadiationBoundaryCondition((U_east_transport, ηᵉˣᵗ)))
+        end
+
+        @info " -> η gets its companion Chapman condition automatically from U/V."
+    else
+        @info " -> Barotropic boundary conditions are DISABLED: the depth-integrated " *
+              "transport through every face is held at zero by the default impenetrable U/V."
+    end
+
     # 3. Top boundary condition (surface wind stress)
     top_u_bc = FluxBoundaryCondition(nothing)
     top_v_bc = FluxBoundaryCondition(nothing)
@@ -1642,7 +1810,10 @@ function bsose_open_boundary_conditions(grid;
     end
 
     @info "BSOSE Open Boundary Conditions setup complete."
-    return (u=u_bcs, v=v_bcs, T=T_bcs, S=S_bcs)
+    bcs = (u=u_bcs, v=v_bcs, T=T_bcs, S=S_bcs)
+    V_bcs !== nothing && (bcs = merge(bcs, (; V=V_bcs)))
+    U_bcs !== nothing && (bcs = merge(bcs, (; U=U_bcs)))
+    return bcs
 end
 
 # ==============================================================================
