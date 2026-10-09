@@ -27,10 +27,12 @@
 #     FRAMERATE          frames per second (4 — one frame is a whole month)
 #     VIDEO_FORMAT       "mp4" or "gif"
 #     VIDEO_COMPRESSION  ffmpeg -crf, mp4 only (20)
-#     T_LIMS S_LIMS U_LIMS V_LIMS CLIM_QUANTILE
+#     T_LIMS S_LIMS U_LIMS V_LIMS
 #                        colour limits, read exactly as animate_simulation.jl
-#                        reads them. Set the same values in both to compare the
-#                        model against BSOSE on a shared scale.
+#                        reads them. Unset, the panels use the model animation's
+#                        limits pinned below rather than BSOSE's own range.
+#     CLIM_QUANTILE      affects only the BSOSE range reported for comparison;
+#                        the panels themselves use the pinned limits.
 #
 # Iteration 156's monthly Theta/Salt/Uvel/Vvel files live on the cluster, not in
 # the repo's data/, so this normally runs on a CPU node with BSOSE_DIR pointing at
@@ -307,23 +309,60 @@ close(ds_S)
 close(ds_U)
 close(ds_V)
 
-# ── Colour limits ─────────────────────────────────────────────────────────────
+# ── Colour limits: pinned to the model animation ──────────────────────────────
+#
+# TEMPORARY, and the one place to edit. These are the limits the 2YS6_surface_flux
+# surface animation scanned for itself, so the two movies can be read side by side
+# on one scale instead of each picking its own.
+#
+# They were read off that movie's colorbars. The velocity ends are exact (its end
+# ticks are labelled ±2.5 and ±3); the temperature and salinity ends are
+# extrapolated from the tick spacing and are good to about a tenth. The exact
+# numbers are printed in that run's animation log, under "Colorbar limits" —
+# paste them in here.
+#
+# Note what pinning costs: the model's velocity range is roughly four times
+# BSOSE's (BSOSE peaks near 0.8 m/s here), so the BSOSE u and v panels are nearly
+# flat at this scale. That is the comparison rather than a fault in the plot — the
+# model's extremes sit far outside anything BSOSE produces in this domain, as does
+# a surface temperature below seawater's freezing point. BSOSE's own range is
+# printed below for reference.
+const MODEL_T_LIMS = (-6.1, 25.1)   # °C
+const MODEL_S_LIMS = (32.4, 35.5)   # PSU
+const MODEL_U_LIMS = (-2.5, 2.5)    # m/s
+const MODEL_V_LIMS = (-3.0, 3.0)    # m/s
+
+"The limits from `ENV[key]` if it is set, otherwise the model animation's."
+function pinned_lims(key, model_lims)
+    given = env_lims(key)
+    return given === nothing ? (model_lims, "matched to the model animation") : (given, "set via $key")
+end
 
 valid_T = filter(!isnan, T_data)
 valid_S = filter(!isnan, S_data)
 valid_u = filter(!isnan, u_data)
 valid_v = filter(!isnan, v_data)
 
-T_lims, T_src = resolve_lims("T_LIMS", scan_lims(valid_T, (-2.0, 20.0); clim_q=CLIM_QUANTILE))
-S_lims, S_src = resolve_lims("S_LIMS", scan_lims(valid_S, (32.5, 35.5); clim_q=CLIM_QUANTILE))
-u_lims, u_src = resolve_lims("U_LIMS", scan_sym_lims(valid_u, (-0.5, 0.5); clim_q=CLIM_QUANTILE))
-v_lims, v_src = resolve_lims("V_LIMS", scan_sym_lims(valid_v, (-0.3, 0.3); clim_q=CLIM_QUANTILE))
+T_lims, T_src = pinned_lims("T_LIMS", MODEL_T_LIMS)
+S_lims, S_src = pinned_lims("S_LIMS", MODEL_S_LIMS)
+u_lims, u_src = pinned_lims("U_LIMS", MODEL_U_LIMS)
+v_lims, v_src = pinned_lims("V_LIMS", MODEL_V_LIMS)
 
 report_limits((("Temperature (T)", "°C", T_lims, T_src),
         ("Salinity (S)", "PSU", S_lims, S_src),
         ("Zonal vel (u)", "m/s", u_lims, u_src),
         ("Merid vel (v)", "m/s", v_lims, v_src)), CLIM_QUANTILE)
-report_speeds(valid_u, valid_v, u_src == "scanned" || v_src == "scanned")
+
+# What BSOSE on its own would have asked for. Printed, not used: seeing how much
+# narrower it is explains at a glance why the pinned panels look washed out.
+println("BSOSE's own range over these months (not used for the panels):")
+for (name, unit, lims) in (("Temperature (T)", "°C", scan_lims(valid_T, MODEL_T_LIMS; clim_q=CLIM_QUANTILE)),
+    ("Salinity (S)", "PSU", scan_lims(valid_S, MODEL_S_LIMS; clim_q=CLIM_QUANTILE)),
+    ("Zonal vel (u)", "m/s", scan_sym_lims(valid_u, MODEL_U_LIMS; clim_q=CLIM_QUANTILE)),
+    ("Merid vel (v)", "m/s", scan_sym_lims(valid_v, MODEL_V_LIMS; clim_q=CLIM_QUANTILE)))
+    @printf("  - %-17s : %8.2f .. %8.2f %s\n", name, lims..., unit)
+end
+report_speeds(valid_u, valid_v, false)
 
 # ── Animate ───────────────────────────────────────────────────────────────────
 
