@@ -49,7 +49,7 @@ end
 # Change it for each experiment so runs do not overwrite one another, then animate
 # the result with `./run_animate_simulation RUN_NAME`.
 # ==============================================================================
-const RUN_NAME = "2YS6_surface_flux"
+const RUN_NAME = "2YS6_new_shortwave"
 
 # flags
 
@@ -60,7 +60,23 @@ const WINDS = true # time-varying surface wind forcing from BSOSE data (oceTAUX 
 # nothing with the atmosphere but momentum: it cannot cool in winter or warm in summer, and its
 # surface temperature drifts away from BSOSE as water crosses the domain.
 const SURFACE_FLUXES = true
-const CHECKPOINTS = false # save state and restart if the model crashes. If false, the model will start from scratch. 
+
+# Distribute the solar part of the surface heat flux through the water column by Beer's law
+# instead of depositing all of it in the top cell.
+#
+# BSOSE's TFLUX is the TOTAL heat flux, sunlight included. Sunlight is not absorbed at the
+# surface: 58% of it goes within 0.35 m but the blue-green remainder decays over 23 m, so for
+# the 5 m top cell here a third of it belongs deeper. Applying TFLUX whole as a top flux puts
+# all of it in that one cell. Over Nov-Feb at 60-65S that is +344 W m⁻² into the top 5 m where
+# it should be +97, and in February it heats a cell that ought to be cooling. The run that
+# produced 2YS6_surface_flux did exactly this: a summer SST 7-9 C too warm over a mixed layer
+# 3 m deep against BSOSE's 22 m, with the heat missing from 25-120 m underneath.
+#
+# `true` splits TFLUX into its solar and non-solar parts: oceQsw goes to a TwoColorRadiation
+# forcing and TFLUX - oceQsw stays on the top boundary. Needs oceQsw in data/.
+const PENETRATING_SHORTWAVE = true
+
+const CHECKPOINTS = false # save state and restart if the model crashes. If false, the model will start from scratch.
 const BOUNDARY_DIAGNOSTICS = true # write free-surface height, boundary-face slices, and a per-face volume transport log
 
 # Barotropic (depth-integrated) open boundary conditions: Flather on U and V, fed the BSOSE
@@ -265,7 +281,8 @@ if OBCS && DATASET == "BSOSE"
     @info "  -> Tangential velocity condition: $TANGENTIAL_BC"
 
     boundary_conditions = bsose_open_boundary_conditions(grid; dataset=dataset, dates=bc_dates,
-        winds=WINDS, surface_fluxes=SURFACE_FLUXES, scheme=obc_scheme,
+        winds=WINDS, surface_fluxes=SURFACE_FLUXES,
+        penetrating_shortwave=SURFACE_FLUXES && PENETRATING_SHORTWAVE, scheme=obc_scheme,
         tangential_bc_kind=TANGENTIAL_BC, oblique_inflow_timescale=OBLIQUE_TAU_IN,
         oblique_outflow_timescale=OBLIQUE_TAU_OUT, reference_date=start_date,
         barotropic=BAROTROPIC_OBC)
@@ -370,11 +387,34 @@ end
 
 # build the ocean model
 
+# Penetrating solar radiation.
+#
+# `ocean_simulation` builds a TwoColorRadiation by default, so passing one changes nothing on
+# its own -- what matters is whether its surface flux is ever filled. Outside a coupled
+# EarthSystemModel nothing fills it, so the default scheme sits at zero and does nothing.
+# `bsose_penetrating_shortwave` returns one together with the callback that feeds it oceQsw,
+# and the callback is registered on the simulation below.
+radiation = TwoColorRadiation(grid)
+update_shortwave! = nothing
+
+if PENETRATING_SHORTWAVE
+    if DATASET != "BSOSE"
+        @warn "PENETRATING_SHORTWAVE is only wired up for BSOSE; ignoring it for $DATASET."
+    elseif !SURFACE_FLUXES
+        @warn """PENETRATING_SHORTWAVE has no effect while SURFACE_FLUXES is false: with no \
+                 surface heat flux there is no solar part to separate out."""
+    else
+        radiation, update_shortwave! = bsose_penetrating_shortwave(grid; dataset=dataset,
+            dates=bc_dates, reference_date=start_date)
+    end
+end
+
 @info "Constructing ocean simulation model..."
 ocean = ocean_simulation(grid;
     boundary_conditions=boundary_conditions,
     forcing=forcings,
-    closure=closures
+    closure=closures,
+    radiative_forcing=radiation
 )
 
 # initial conditions based on either BSOSE or the other datasets
@@ -415,6 +455,22 @@ simulation = Simulation(ocean.model, Δt=1seconds,
 # adaptive timestep wizard based on CFL (following mediterranean.jl: cfl=0.2, max_change=1.1)
 wizard = TimeStepWizard(cfl=0.6, max_change=1.1, min_Δt=0.1)
 simulation.callbacks[:wizard] = Callback(wizard, IterationInterval(10))
+
+# Feed oceQsw to the radiation scheme. Without this callback the TwoColorRadiation attached to
+# the model above keeps a zero surface flux and contributes nothing, which is the bug being
+# fixed -- so register it whenever one was built.
+#
+# The callback fires after each time step, so the radiation runs one Δt behind the clock. Δt
+# here is minutes and the series it interpolates is monthly, which makes the lag about four
+# parts in 10⁴ of one month-to-month change. The one step that would matter is the first,
+# before any callback has run, so prime the field now rather than let it start from zero.
+if update_shortwave! !== nothing
+    update_shortwave!(simulation)
+    simulation.callbacks[:shortwave] = Callback(update_shortwave!, IterationInterval(1))
+    @info "Penetrating shortwave is ON: oceQsw drives TwoColorRadiation, top T flux is TFLUX - oceQsw."
+else
+    @info "Penetrating shortwave is OFF: the whole surface heat flux lands in the top cell."
+end
 
 # Safety callback: clamp salinity/temperature to physically valid ranges before each time step.
 # Operates on parent() to cover all cells including halos and immersed cells.
@@ -579,6 +635,7 @@ end
 @info "--- Model Setup Complete ---"
 @info "Grid Resolution: Nx=$(grid.Nx), Ny=$(grid.Ny), Nz=$(grid.Nz)"
 @info "OBCS: $OBCS | WINDS: $WINDS | SURFACE_FLUXES: $SURFACE_FLUXES | DATASET: $DATASET"
+@info "PENETRATING_SHORTWAVE: $PENETRATING_SHORTWAVE (active: $(update_shortwave! !== nothing))"
 
 # red button 
 

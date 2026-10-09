@@ -20,7 +20,7 @@ using Oceananigans.Grids: topology, znodes
 using Oceananigans.BoundaryConditions
 using Oceananigans.BoundaryConditions: PerturbationAdvection, NormalRadiation, ObliqueRadiation,
                                        GravityWaveRadiationBoundaryCondition
-using Oceananigans.OutputReaders: FieldTimeSeries, Cyclical
+using Oceananigans.OutputReaders: FieldTimeSeries, Cyclical, TimeSeriesInterpolation
 using Oceananigans.Architectures: architecture, CPU, GPU, on_architecture
 using Oceananigans.Fields: interior, location, fill_halo_regions!
 using Oceananigans.ImmersedBoundaries: immersed_peripheral_node, immersed_cell
@@ -30,6 +30,7 @@ using NCDatasets
 using Dates
 using CFTime
 using Printf: @sprintf
+using Statistics: mean
 using Downloads
 using NumericalEarth.DataWrangling: JLD2
 
@@ -124,7 +125,12 @@ const BSOSE_VARIABLE_NAMES = Dict(
     :meridional_wind_stress => "oceTAUY",
     :surface_heat_flux => "TFLUX",
     :surface_salt_flux => "SFLUX",
+    # `oceQsw` is the solar part of `TFLUX`, not a flux in addition to it. Both follow the
+    # same MITgcm convention ("net Short-Wave radiation (+=down), >0 increases theta"), so
+    # TFLUX - oceQsw is the non-solar remainder; see `bsose_penetrating_shortwave`.
+    :surface_shortwave => "oceQsw",
     # Aliases
+    :oceQsw => "oceQsw",
     :Theta => "THETA",
     :Salt => "SALT",
     :Uvel => "UVEL",
@@ -158,6 +164,8 @@ const BSOSE_LOCATIONS = Dict(
     :meridional_wind_stress => (Center, Face, Nothing),
     :surface_heat_flux => (Center, Center, Nothing),
     :surface_salt_flux => (Center, Center, Nothing),
+    :surface_shortwave => (Center, Center, Nothing),
+    :oceQsw => (Center, Center, Nothing),
     :Theta => (Center, Center, Center),
     :Salt => (Center, Center, Center),
     :Uvel => (Face, Center, Center),
@@ -1282,6 +1290,7 @@ function bsose_surface_tracer_fluxes(grid;
     dates=nothing,
     ρ₀=1026.0,
     cₚ=3991.86795711963,   # TEOS-10 reference heat capacity, J kg⁻¹ °C⁻¹
+    subtract_shortwave=false,
     reference_date=nothing)
 
     if isnothing(dates)
@@ -1300,6 +1309,27 @@ function bsose_surface_tracer_fluxes(grid;
     top_T_slice = boundary_slice_time_series(heat_fts, :top; time_offset)
     top_S_slice = boundary_slice_time_series(salt_fts, :top; time_offset)
 
+    # With `subtract_shortwave`, what stays at the surface is the NON-SOLAR part of the heat
+    # flux. TFLUX is the total and already contains the solar part, so handing the whole of it
+    # to the top boundary while `bsose_penetrating_shortwave` also distributes oceQsw through
+    # the column would count the sunlight twice. The two fields share the MITgcm ">0 increases
+    # theta" convention, so the remainder is a plain difference, taken before the sign flip
+    # below and on the sliced series for the reason given there.
+    if subtract_shortwave
+        shortwave_metadata = Metadata(:surface_shortwave; dataset, dates, region)
+        shortwave_fts = FieldTimeSeries(shortwave_metadata, grid)
+        top_Q_slice = boundary_slice_time_series(shortwave_fts, :top; time_offset)
+
+        for t in 1:length(top_T_slice.times)
+            parent(top_T_slice[t]) .-= parent(top_Q_slice[t])
+        end
+
+        @info @sprintf(" -> Non-solar surface heat flux (TFLUX - oceQsw): mean %+.1f W m⁻², range %+.1f to %+.1f",
+            mean(mean(interior(top_T_slice[t])) for t in 1:length(top_T_slice.times)),
+            minimum(minimum(interior(top_T_slice[t])) for t in 1:length(top_T_slice.times)),
+            maximum(maximum(interior(top_T_slice[t])) for t in 1:length(top_T_slice.times)))
+    end
+
     # BSOSE follows the MITgcm convention, stated in the files themselves: TFLUX "> 0
     # increases theta" and SFLUX "> 0 increases salt". An Oceananigans top flux is positive
     # UPWARD, out of the domain, so both enter with a minus sign. TFLUX is W m⁻², which
@@ -1316,6 +1346,119 @@ function bsose_surface_tracer_fluxes(grid;
 
     return (T=FluxBoundaryCondition(top_T_slice),
         S=FluxBoundaryCondition(top_S_slice))
+end
+
+
+"""
+    bsose_penetrating_shortwave(grid;
+                                dataset = BSOSEMonthly(),
+                                dates = nothing,
+                                ρ₀ = 1026.0,
+                                cₚ = 3991.86795711963,
+                                reference_date = nothing)
+
+Penetrating solar radiation from BSOSE's `oceQsw`, as `(radiation, update_shortwave!)`.
+
+`radiation` is a `TwoColorRadiation` to hand to `ocean_simulation(grid; radiative_forcing)`.
+It spreads the surface shortwave through the column by Beer's law in two bands — red, 58% of
+it absorbed within 0.35 m, and blue-green, the other 42%, decaying over 23 m — the Paulson
+and Simpson (1977) Jerlov Type I constants that MITgcm's `SWFRAC` also defaults to. For the
+5 m top cell here that leaves 66% of the sunlight in the first cell and sends 34% deeper,
+against the 100% a plain surface flux deposits.
+
+`update_shortwave!(sim)` interpolates `oceQsw` onto the model clock and writes it into
+`radiation.surface_flux`. **It has to be registered as a callback.** `ocean_simulation`
+already builds a `TwoColorRadiation` by default, but nothing fills its surface flux outside a
+coupled `EarthSystemModel`, so the field sits at zero and the scheme silently does nothing —
+which is the state this function exists to correct.
+
+    radiation, update_shortwave! = bsose_penetrating_shortwave(grid; dataset, dates)
+    ocean = ocean_simulation(grid; radiative_forcing=radiation, ...)
+    simulation.callbacks[:shortwave] = Callback(update_shortwave!, IterationInterval(1))
+
+Pair it with `bsose_surface_tracer_fluxes(...; subtract_shortwave=true)`, which takes the
+solar part back out of the top boundary condition. `oceQsw` is a *component* of `TFLUX`, not
+a flux in addition to it, so using one without the other either counts the sunlight twice or
+drops it entirely.
+
+### Sign convention
+
+`surface_flux` takes the opposite sign to a top `FluxBoundaryCondition`, which is the easiest
+thing to get wrong here. An Oceananigans top flux is positive UPWARD, out of the ocean. The
+radiation integrates its own flux divergence back to `J₀`, so it wants a kinematic flux
+positive DOWNWARD, into the ocean. BSOSE's oceQsw is already "+= down", so it enters as
+`+oceQsw / (ρ₀ cₚ)` where TFLUX enters as `-TFLUX / (ρ₀ cₚ)`.
+"""
+function bsose_penetrating_shortwave(grid;
+    dataset=BSOSEMonthly(),
+    dates=nothing,
+    ρ₀=1026.0,
+    cₚ=3991.86795711963,
+    reference_date=nothing)
+
+    if isnothing(dates)
+        available = all_dates(dataset, :surface_shortwave)
+        dates = available[1:min(12, length(available))]
+    end
+
+    @info "Loading penetrating shortwave radiation (oceQsw, $(summary(dataset)))..."
+    region = bsose_region(grid)
+    shortwave_metadata = Metadata(:surface_shortwave; dataset, dates, region)
+    shortwave_fts = FieldTimeSeries(shortwave_metadata, grid)
+
+    time_offset = model_clock_offset(shortwave_metadata, reference_date)
+    Qsw = boundary_slice_time_series(shortwave_fts, :top; time_offset)
+
+    # Kinematic and positive DOWNWARD; see the sign note above. As with the wind stress and the
+    # tracer fluxes the scaling goes on the slice, because the dataset-backed series that
+    # `FieldTimeSeries(::Metadata, grid)` returns holds two snapshots and reloads them from
+    # disk, so scaling that one is silently discarded.
+    for t in 1:length(Qsw.times)
+        parent(Qsw[t]) .*= 1 / (ρ₀ * cₚ)
+    end
+
+    W(x) = x * ρ₀ * cₚ   # back to W m⁻² for the messages
+    Q̄ = mean(mean(interior(Qsw[t])) for t in 1:length(Qsw.times))
+    Qmin = minimum(minimum(interior(Qsw[t])) for t in 1:length(Qsw.times))
+    Qmax = maximum(maximum(interior(Qsw[t])) for t in 1:length(Qsw.times))
+
+    # Net shortwave into the ocean cannot be negative. If it is, the file's convention is not
+    # the one assumed above, and the run would heat the ocean in winter and cool it in summer.
+    # Cheaper to find out here than twelve hours into a job.
+    if Q̄ <= 0
+        error("""BSOSE oceQsw averages $(@sprintf("%.1f", W(Q̄))) W m⁻² over this domain and period, which is not \
+                 positive. `bsose_penetrating_shortwave` assumes the MITgcm convention the file \
+                 states for itself ("net Short-Wave radiation (+=down), >0 increases theta"); \
+                 check oceQsw's `long_name` attribute before going further.""")
+    end
+    Qmin < 0 && @warn @sprintf("BSOSE oceQsw dips to %.2f W m⁻²; net shortwave into the ocean should not go below zero.", W(Qmin))
+
+    @info @sprintf(" -> Penetrating shortwave: mean %+.1f W m⁻², peak %+.1f W m⁻²", W(Q̄), W(Qmax))
+
+    radiation = TwoColorRadiation(grid)
+    @info " -> $(sprint(show, radiation))"
+
+    # Interpolating the series onto the model clock looks like it should be
+    # `Qsw[Time(clock.time)]`, but that path is unavailable here: the sliced series is
+    # `Nothing`-located in z while carrying a non-colon z index, and Oceananigans'
+    # `restrict_index_on_location` has no method for that pair, so building the lazy
+    # interpolation throws. `TimeSeriesInterpolation` reaches the same result through
+    # `getindex(i, j, k)`, honours the same `Cyclical` time indexing, and adapts to the GPU.
+    #
+    # It needs the model's clock, which does not exist until `ocean_simulation` has been
+    # called, so it is built on the first invocation and held. The clock is mutable and
+    # updated in place, so one interpolator serves the whole run.
+    interpolator = Ref{Any}(nothing)
+
+    function update_shortwave!(sim)
+        if interpolator[] === nothing
+            interpolator[] = TimeSeriesInterpolation(Qsw, grid; clock=sim.model.clock)
+        end
+        set!(radiation.surface_flux, interpolator[])
+        return nothing
+    end
+
+    return radiation, update_shortwave!
 end
 
 
@@ -1437,6 +1580,13 @@ open boundary conditions from BSOSE — plus `(; U, V)` when `barotropic = true`
            - `nothing` or `false` (default): Disables surface wind forcing (no-flux top boundary).
            - `true`: Automatically calls `bsose_surface_wind_stress` and applies top flux.
            - A `NamedTuple` `(; u, v)` returned from `bsose_surface_wind_stress(grid; ...)`.
+- `penetrating_shortwave`: With `surface_fluxes = true`, whether the solar part of the heat
+                flux is being distributed through the column by
+                [`bsose_penetrating_shortwave`](@ref) rather than applied at the surface. When
+                `true` the top temperature flux is built from `TFLUX - oceQsw` instead of
+                `TFLUX`, so the sunlight is not counted twice. Setting this without also
+                constructing the radiation, or the reverse, silently drops or doubles the
+                shortwave — they are two halves of one change.
 - `ρ₀`: Seawater density for wind stress conversion (kg/m³). Default: 1026.0.
 - `reference_date`: Calendar date of model time zero, so that the boundary and wind series are
                     stepped on the model clock; see [`model_clock_offset`](@ref). `nothing`
@@ -1464,6 +1614,7 @@ function bsose_open_boundary_conditions(grid;
     scheme=nothing,
     winds=nothing,
     surface_fluxes=false,
+    penetrating_shortwave=false,
     tangential_bc_kind=:gradient,
     barotropic=false,
     exterior_free_surface=0,
@@ -1725,7 +1876,8 @@ function bsose_open_boundary_conditions(grid;
     top_S_bc = FluxBoundaryCondition(nothing)
 
     if surface_fluxes === true
-        tracer_flux_bcs = bsose_surface_tracer_fluxes(grid; dataset, dates, ρ₀, reference_date)
+        tracer_flux_bcs = bsose_surface_tracer_fluxes(grid; dataset, dates, ρ₀, reference_date,
+            subtract_shortwave=penetrating_shortwave)
         top_T_bc = tracer_flux_bcs.T
         top_S_bc = tracer_flux_bcs.S
     elseif surface_fluxes isa NamedTuple
