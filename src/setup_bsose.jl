@@ -30,7 +30,6 @@ using NCDatasets
 using Dates
 using CFTime
 using Printf: @sprintf
-using Statistics: mean
 using Downloads
 using NumericalEarth.DataWrangling: JLD2
 
@@ -1324,10 +1323,9 @@ function bsose_surface_tracer_fluxes(grid;
             parent(top_T_slice[t]) .-= parent(top_Q_slice[t])
         end
 
+        Nlo, Nbar, Nhi = series_statistics(top_T_slice)
         @info @sprintf(" -> Non-solar surface heat flux (TFLUX - oceQsw): mean %+.1f W m⁻², range %+.1f to %+.1f",
-            mean(mean(interior(top_T_slice[t])) for t in 1:length(top_T_slice.times)),
-            minimum(minimum(interior(top_T_slice[t])) for t in 1:length(top_T_slice.times)),
-            maximum(maximum(interior(top_T_slice[t])) for t in 1:length(top_T_slice.times)))
+            Nbar, Nlo, Nhi)
     end
 
     # BSOSE follows the MITgcm convention, stated in the files themselves: TFLUX "> 0
@@ -1346,6 +1344,30 @@ function bsose_surface_tracer_fluxes(grid;
 
     return (T=FluxBoundaryCondition(top_T_slice),
         S=FluxBoundaryCondition(top_S_slice))
+end
+
+
+"""
+    series_statistics(fts)
+
+`(minimum, mean, maximum)` over every snapshot of `fts`, for reporting.
+
+Each slice is copied to the host before being reduced. `interior` hands back a view of an
+`OffsetArray` wrapping the underlying array, and on the GPU those wrappers defeat the CUDA
+reduction methods: `Statistics._mean` falls through to the generic implementation, which
+begins with `first(A)` and so trips the scalar-indexing guard. The slices are single surface
+levels read once at setup, so the copy costs nothing worth measuring.
+"""
+function series_statistics(fts)
+    lo, hi, total, n = Inf, -Inf, 0.0, 0
+    for t in 1:length(fts.times)
+        a = Array(interior(fts[t]))
+        lo = min(lo, minimum(a))
+        hi = max(hi, maximum(a))
+        total += sum(a)
+        n += length(a)
+    end
+    return lo, total / n, hi
 end
 
 
@@ -1418,9 +1440,7 @@ function bsose_penetrating_shortwave(grid;
     end
 
     W(x) = x * ρ₀ * cₚ   # back to W m⁻² for the messages
-    Q̄ = mean(mean(interior(Qsw[t])) for t in 1:length(Qsw.times))
-    Qmin = minimum(minimum(interior(Qsw[t])) for t in 1:length(Qsw.times))
-    Qmax = maximum(maximum(interior(Qsw[t])) for t in 1:length(Qsw.times))
+    Qmin, Q̄, Qmax = series_statistics(Qsw)
 
     # Net shortwave into the ocean cannot be negative. If it is, the file's convention is not
     # the one assumed above, and the run would heat the ocean in winter and cool it in summer.
