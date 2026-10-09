@@ -450,12 +450,24 @@ simulation.callbacks[:progress] = Callback(progress, TimeInterval(output_interva
 
 u, v, w = ocean.model.velocities
 T, S = ocean.model.tracers
+
+# Every writer below records a `time` axis in seconds from model time zero and nothing
+# else, so the file itself cannot say which calendar date time zero is -- the only date
+# NetCDF adds on its own is when the file was written. Stamping the run's dates on as
+# global attributes is what lets tools/animate_simulation.jl caption a frame with a real
+# date instead of an elapsed day count.
+output_metadata = Dict("run_name" => RUN_NAME,
+    "start_date" => string(start_date),
+    "end_date" => string(end_date),
+    "dataset" => DATASET)
+
 simulation.output_writers[:surface] = NetCDFWriter(
     ocean.model,
     (; u, v, T, S),
     filename="$(RUN_NAME)_surface.nc",
     schedule=TimeInterval(output_interval),
     indices=(:, :, grid.Nz),
+    global_attributes=output_metadata,
     overwrite_files=true
 )
 
@@ -466,6 +478,7 @@ simulation.output_writers[:mid_lon] = NetCDFWriter(
     filename="$(RUN_NAME)_midlon.nc",
     schedule=TimeInterval(output_interval),
     indices=(mid_lon_idx, :, :),
+    global_attributes=output_metadata,
     overwrite_files=true
 )
 
@@ -495,6 +508,7 @@ if BOUNDARY_DIAGNOSTICS
         (; η=η_2d),
         filename="$(RUN_NAME)_free_surface.nc",
         schedule=TimeInterval(output_interval),
+        global_attributes=output_metadata,
         overwrite_files=true
     )
 
@@ -514,6 +528,7 @@ if BOUNDARY_DIAGNOSTICS
             filename="$(RUN_NAME)_face_$(face).nc",
             schedule=TimeInterval(boundary_interval),
             indices=indices,
+            global_attributes=output_metadata,
             overwrite_files=true
         )
     end

@@ -15,11 +15,16 @@
 #     julia> animate_simulation("model")
 #
 # or, on a CPU node, `./run_animate_simulation model`.
+#
+# Frames are captioned with their calendar date when the run's start date can be
+# resolved; see "Calendar dates" below for where that comes from and how to set it
+# by hand for a file that predates it.
 # ==============================================================================
 
 using NCDatasets
 using CairoMakie
 using Printf
+using Dates
 
 # ── Colour limits: explicit if given, otherwise scanned from the data ──────────
 #
@@ -126,15 +131,114 @@ function report_speeds(valid_u, valid_v, scanning)
     end
 end
 
+# ── Calendar dates ────────────────────────────────────────────────────────────
+#
+# A model NetCDF records `time` as seconds from model time zero and carries no
+# reference date of its own -- the only date NetCDF adds is when the file was
+# written. Model time zero is `start_date` in src/model.jl, so a calendar caption
+# needs that date from outside the time axis. In order of preference:
+#
+#   1. the `start_date` keyword argument,
+#   2. the START_DATE environment variable,
+#   3. the file's own `start_date` global attribute, written by src/model.jl,
+#   4. the `start_date` currently set in src/model.jl.
+#
+# Only (3) is tied to the run being animated, so the source is always printed: a
+# wrong reference mislabels every frame, and (4) in particular goes stale as soon
+# as src/model.jl is edited for the next experiment. Files written before the
+# attribute existed fall through to (4); pass `start_date` to pin them. When none
+# of the four resolves, captions fall back to the elapsed-day counter alone.
+
+"The run's start date from the file's global attributes, or `nothing`."
+function attribute_start_date(ds)
+    haskey(ds.attrib, "start_date") || return nothing
+    raw = string(ds.attrib["start_date"])
+    try
+        return DateTime(raw)
+    catch
+        @warn "Ignoring unparseable start_date attribute \"$raw\"."
+        return nothing
+    end
+end
+
+"""
+    model_jl_start_date(path)
+
+The `start_date` assignment currently in src/model.jl, or `nothing` if the file is
+missing or sets it some other way. The pattern is anchored at the start of a line so
+the commented-out CPU-test dates just below it are not picked up.
+"""
+function model_jl_start_date(path=normpath(joinpath(@__DIR__, "..", "src", "model.jl")))
+    isfile(path) || return nothing
+    m = match(r"^[ \t]*start_date[ \t]*=[ \t]*DateTime\(\"([^\"]+)\"\)"m, read(path, String))
+    m === nothing && return nothing
+    try
+        return DateTime(m.captures[1])
+    catch
+        return nothing
+    end
+end
+
+"""
+    resolve_start_date(ds, given)
+
+`(start_date, source)` for the file open as `ds`, following the order above.
+`start_date` is `nothing` when no source resolves.
+"""
+function resolve_start_date(ds, given)
+    given !== nothing && return DateTime(given), "given as start_date"
+
+    env = strip(get(ENV, "START_DATE", ""))
+    if !isempty(env)
+        return DateTime(env), "set via START_DATE"
+    end
+
+    from_file = attribute_start_date(ds)
+    from_file !== nothing && return from_file, "from the file's start_date attribute"
+
+    from_source = model_jl_start_date()
+    from_source !== nothing &&
+        return from_source, "parsed from src/model.jl — verify it is this run's start date"
+
+    return nothing, "unresolved — captioning by elapsed day only"
+end
+
+"Report the reference date a set of captions will be built on."
+function report_start_date(start_date, source)
+    if start_date === nothing
+        println("  - Calendar : ", source)
+    else
+        println("  - Calendar : model time zero = ",
+            Dates.format(start_date, "yyyy-mm-dd"), " [", source, "]")
+    end
+end
+
+"""
+    time_caption(start_date, t, t_end, n, Nt)
+
+The caption for model time `t` seconds: the calendar date followed by the elapsed-day
+and step counters, or the counters alone when there is no reference date. Fractional
+seconds are kept, so a sub-daily output interval still lands on the right day.
+"""
+function time_caption(start_date, t, t_end, n, Nt)
+    counters = @sprintf("Day %.1f / %.1f (Step %d / %d)", t / 86400, t_end / 86400, n, Nt)
+    start_date === nothing && return counters
+    date = Dates.format(start_date + Millisecond(round(Int, 1000t)), "d U yyyy")
+    return string(date, "  —  ", counters)
+end
+
 # ── Surface maps ──────────────────────────────────────────────────────────────
 
-function animate_surface(surface_file, output; framerate, clim_q, video...)
+function animate_surface(surface_file, output; framerate, clim_q, start_date=nothing, video...)
     println("\nLoading surface fields from: ", surface_file)
     ds = Dataset(surface_file)
     lon = Float64.(ds["λ_caa"][:])
     lat = Float64.(ds["φ_aca"][:])
     times = Float64.(ds["time"][:])
     Nt = length(times)
+
+    start_date, date_source = resolve_start_date(ds, start_date)
+    report_start_date(start_date, date_source)
 
     mask = ds["inactive_nodes_ccc"][:, :, 1] .!= 0
 
@@ -184,8 +288,8 @@ function animate_surface(surface_file, output; framerate, clim_q, video...)
     fig = Figure(size=(1400, 950), fontsize=14)
     t_idx = Observable(1)
 
-    time_str = @lift(@sprintf("Model Simulation: Day %.1f / %.1f (Step %d / %d)",
-        times[$t_idx] / 86400, times[end] / 86400, $t_idx, Nt))
+    time_str = @lift(string("Model Simulation: ",
+        time_caption(start_date, times[$t_idx], times[end], $t_idx, Nt)))
     Label(fig[0, 1:4], time_str, fontsize=22, font=:bold)
 
     bounds = (minimum(lon), maximum(lon), minimum(lat), maximum(lat))
@@ -212,7 +316,8 @@ end
 
 # ── Mid-longitude transects ───────────────────────────────────────────────────
 
-function animate_midlon(midlon_file, output, output_focus; framerate, clim_q, focus_depth, video...)
+function animate_midlon(midlon_file, output, output_focus; framerate, clim_q, focus_depth,
+    start_date=nothing, video...)
     println("\nLoading mid-longitude fields from: ", midlon_file)
     ds = Dataset(midlon_file)
     lat = Float64.(ds["φ_aca"][:])
@@ -221,6 +326,8 @@ function animate_midlon(midlon_file, output, output_focus; framerate, clim_q, fo
     mid_lon = haskey(ds, "λ_caa") ? ds["λ_caa"][1] : 120.0
     Nt, Ny, Nz = length(times), length(lat), length(z)
 
+    start_date, date_source = resolve_start_date(ds, start_date)
+
     bottom_h = haskey(ds, "bottom_height") ? Float64.(ds["bottom_height"][1, :]) : fill(-5000.0, Ny)
     mask_2d = haskey(ds, "inactive_nodes_ccc") ? (ds["inactive_nodes_ccc"][1, :, :] .!= 0) : falses(Ny, Nz)
 
@@ -228,6 +335,7 @@ function animate_midlon(midlon_file, output, output_focus; framerate, clim_q, fo
     println(@sprintf("  - Grid: Ny = %d, Nz = %d, %d snapshots", Ny, Nz, Nt))
     println(@sprintf("  - Latitude range: [%.2f°N, %.2f°N]", minimum(lat), maximum(lat)))
     println(@sprintf("  - Depth range   : [%.1f m, %.1f m]", minimum(z), maximum(z)))
+    report_start_date(start_date, date_source)
 
     T_data = Array{Float32}(undef, Ny, Nz, Nt)
     S_data = Array{Float32}(undef, Ny, Nz, Nt)
@@ -279,8 +387,8 @@ function animate_midlon(midlon_file, output, output_focus; framerate, clim_q, fo
         fig = Figure(size=(1400, 950), fontsize=14)
         t_idx = Observable(1)
 
-        time_str = @lift(@sprintf("Mid-Longitude (λ = %.1f°E, %s): Day %.1f / %.1f (Step %d / %d)",
-            mid_lon, tag, times[$t_idx] / 86400, times[end] / 86400, $t_idx, Nt))
+        time_str = @lift(string(@sprintf("Mid-Longitude (λ = %.1f°E, %s): ", mid_lon, tag),
+            time_caption(start_date, times[$t_idx], times[end], $t_idx, Nt)))
         Label(fig[0, 1:4], time_str, fontsize=22, font=:bold)
 
         bounds = (lat_bounds[1], lat_bounds[2], z_bounds[1], z_bounds[2])
@@ -325,6 +433,10 @@ Keyword arguments (each defaults to an environment variable, then to a literal):
 `focus_depth` (`FOCUS_DEPTH`), `clim_quantile` (`CLIM_QUANTILE`),
 `format` (`VIDEO_FORMAT`, "mp4" or "gif") and `compression` (`VIDEO_COMPRESSION`,
 ffmpeg's -crf: lower is better quality and a bigger file, 20 by default, mp4 only).
+
+`start_date` (`START_DATE`) is the calendar date of model time zero, used to caption
+each frame with its date. It defaults to `nothing`, which lets each file resolve its
+own — see "Calendar dates" above. Pass it only to override what the files say.
 """
 function animate_simulation(run_name;
     surface_file=get(ENV, "SURFACE_FILE", "$(run_name)_surface.nc"),
@@ -333,6 +445,7 @@ function animate_simulation(run_name;
     framerate=parse(Int, get(ENV, "FRAMERATE", "8")),
     focus_depth=parse(Float64, get(ENV, "FOCUS_DEPTH", "500")),
     clim_quantile=parse(Float64, get(ENV, "CLIM_QUANTILE", "1.0")),
+    start_date=nothing,
     format=get(ENV, "VIDEO_FORMAT", "mp4"),
     compression=parse(Int, get(ENV, "VIDEO_COMPRESSION", "20")))
 
@@ -347,7 +460,7 @@ function animate_simulation(run_name;
 
     if isfile(surface_file)
         animate_surface(surface_file, joinpath(output_dir, "$(run_name)_surface.$(format)");
-            framerate, clim_q=clim_quantile, video...)
+            framerate, clim_q=clim_quantile, start_date, video...)
         found = true
     else
         println("\nSkipping surface animation: '$surface_file' not found.")
@@ -357,7 +470,7 @@ function animate_simulation(run_name;
         animate_midlon(midlon_file,
             joinpath(output_dir, "$(run_name)_midlon.$(format)"),
             joinpath(output_dir, "$(run_name)_midlon_focus.$(format)");
-            framerate, clim_q=clim_quantile, focus_depth, video...)
+            framerate, clim_q=clim_quantile, focus_depth, start_date, video...)
         found = true
     else
         println("\nSkipping mid-longitude animations: '$midlon_file' not found.")

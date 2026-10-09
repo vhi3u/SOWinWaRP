@@ -27,6 +27,12 @@
 #     CLIM_QUANTILE=0.995 FRAMERATE=12 ./run_animate_simulation FILENAME
 #     VIDEO_COMPRESSION=28 ./run_animate_simulation FILENAME   # smaller, lower quality
 #     VIDEO_FORMAT=gif ./run_animate_simulation FILENAME       # if something needs a gif
+#
+# Frames are captioned with their calendar date, taken from START_DATE below, which is
+# pinned to the date the runs now on disk started. Override it for a run that started
+# somewhere else:
+#
+#     START_DATE=2009-06-01 ./run_animate_simulation FILENAME
 
 set -euo pipefail
 
@@ -49,11 +55,23 @@ fi
 
 RUN_NAME="$1"
 
+# Calendar date of model time zero, i.e. `start_date` in src/model.jl.
+#
+# TEMPORARY. The runs on disk were written before the output writers stamped their dates
+# onto the NetCDF, so their files cannot say when they started and the animation would
+# fall back to whatever src/model.jl happens to say at the time it is animated. Pinning
+# it here keeps the captions right for those runs.
+#
+# Delete this line once you are animating a run written by the current src/model.jl: the
+# file carries its own start_date then, and this would override it with a stale value.
+export START_DATE="${START_DATE:-2014-06-01}"
+
 echo "=========================================================="
 echo " Job ID     : $SLURM_JOB_ID"
 echo " Job Name   : $SLURM_JOB_NAME"
 echo " Node       : $(hostname)"
 echo " Run name   : $RUN_NAME"
+echo " Start date : $START_DATE"
 echo " Start Time : $(date)"
 echo "=========================================================="
 
