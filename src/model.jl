@@ -87,7 +87,7 @@ const BOUNDARY_DIAGNOSTICS = true # write free-surface height, boundary-face sli
 # the boundary no matter which scheme OBC_SCHEME selects — which is why every face transport
 # reads 0.00 Sv and a jet sits on the western edge. ηᵉˣᵗ is 0 for now: BSOSE's ETAN is not in
 # data/, so the Flather condition currently carries transport only.
-const BAROTROPIC_OBC = true
+const BAROTROPIC_OBC = false
 
 # Open boundary matching scheme for the NORMAL flow: "ObliqueRadiation",
 # "PerturbationAdvection", "NormalRadiation", or "clamped".
