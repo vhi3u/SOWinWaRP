@@ -17,6 +17,7 @@ using Oceananigans.TurbulenceClosures
 using Oceananigans.Grids: φnode
 using Oceananigans.Operators: Azᶜᶜᶜ, Ax_qᶠᶜᶜ, Ay_qᶜᶠᶜ
 using Oceananigans.BoundaryConditions: PerturbationAdvection, NormalRadiation, ObliqueRadiation
+using Oceananigans.Diagnostics: NaNChecker
 using Oceanostics.ProgressMessengers: TimedMessenger
 
 # Include our BSOSE helper module
@@ -49,7 +50,7 @@ end
 # Change it for each experiment so runs do not overwrite one another, then animate
 # the result with `./run_animate_simulation RUN_NAME`.
 # ==============================================================================
-const RUN_NAME = "2YS6_new_shortwave"
+const RUN_NAME = "8M_flather_sw"
 
 # flags
 
@@ -74,6 +75,10 @@ const SURFACE_FLUXES = true
 #
 # `true` splits TFLUX into its solar and non-solar parts: oceQsw goes to a TwoColorRadiation
 # forcing and TFLUX - oceQsw stays on the top boundary. Needs oceQsw in data/.
+# ON, because the run now reaches December-January and the point is to see whether the warm
+# bloom is gone. The |w| tripwire at day 1 keeps this from being a confounded test: with the
+# split on and everything else at baseline, |w| grew 6x over day 1 (0.012 -> 0.073) where the
+# baseline decayed it to 0.0076. That number arrives on day 1, long before the bloom does.
 const PENETRATING_SHORTWAVE = true
 
 const CHECKPOINTS = false # save state and restart if the model crashes. If false, the model will start from scratch.
@@ -85,9 +90,14 @@ const BOUNDARY_DIAGNOSTICS = true # write free-surface height, boundary-face sli
 # Without this the split-explicit corrector overwrites the depth mean of the prescribed u/v at
 # every face with the default impenetrable barotropic solution, so no net transport can cross
 # the boundary no matter which scheme OBC_SCHEME selects — which is why every face transport
-# reads 0.00 Sv and a jet sits on the western edge. ηᵉˣᵗ is 0 for now: BSOSE's ETAN is not in
-# data/, so the Flather condition currently carries transport only.
-const BAROTROPIC_OBC = false
+# reads 0.00 Sv and a jet sits on the western edge.
+#
+# ηᵉˣᵗ is still 0, so the Flather condition carries transport only. That is a placeholder, not
+# a neutral choice: the real sea surface drops of order a metre between 45S and the Antarctic
+# margin, and a zero tells the boundary it is flat. SSH_bsoseI156_2013to2024_monthly.nc is the
+# fix and is not yet wired in. Read the face transports the barotropic setup now logs before
+# reading anything into the run: they should be west +180, east +205, north -25 Sv.
+const BAROTROPIC_OBC = true
 
 # Open boundary matching scheme for the NORMAL flow: "ObliqueRadiation",
 # "PerturbationAdvection", "NormalRadiation", or "clamped".
@@ -201,8 +211,13 @@ end
 # BSOSE iteration 156 (HPC) covers 2013-2024; iteration 105 (local CPU) covers
 # 2008-2012, so a local test run needs dates inside that earlier range.
 # ==============================================================================
+# Eight months, June 2014 to February 2015. The start matches 2YS6_surface_flux so that |u|,
+# |v|, |w| and Δt compare day-for-day against the log of a run that stayed stable, and the end
+# reaches past the warm bloom: January 2015 is where the baseline ran SST +7.02 C too warm
+# over a 3.1 m mixed layer against BSOSE's 21.8 m. Three questions, one run -- face transports
+# at startup, the |w| tripwire on day 1, the bloom around day 200.
 start_date = DateTime("2014-06-01")
-end_date = DateTime("2016-06-01")
+end_date = DateTime("2015-02-01")
 
 # option if need to do tests on CPU
 # start_date = DateTime("2009-06-01")
@@ -455,6 +470,16 @@ simulation = Simulation(ocean.model, Δt=1seconds,
 # adaptive timestep wizard based on CFL (following mediterranean.jl: cfl=0.2, max_change=1.1)
 wizard = TimeStepWizard(cfl=0.6, max_change=1.1, min_Δt=0.1)
 simulation.callbacks[:wizard] = Callback(wizard, IterationInterval(10))
+
+# Fail loudly and early on NaN. Oceananigans attaches its own checker, but it watches only the
+# first prognostic field, runs every 100 iterations and does not throw -- at the Δt a blow-up
+# produces that is 25 minutes of model time, and the last run outran it. The NaN then reached
+# the wizard, and the run died as `InexactError: Int64(NaN)` inside the free-surface substep
+# calculation, which names neither the field nor the time. This one checks every field every
+# step and throws, so the error says what went wrong.
+simulation.callbacks[:nan_checker] =
+    Callback(NaNChecker(fields=merge(ocean.model.velocities, ocean.model.tracers), erroring=true),
+        IterationInterval(1))
 
 # Feed oceQsw to the radiation scheme. Without this callback the TwoColorRadiation attached to
 # the model above keeps a zero surface flux and contributes nothing, which is the bug being

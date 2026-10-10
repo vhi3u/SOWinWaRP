@@ -23,6 +23,7 @@ using Oceananigans.BoundaryConditions: PerturbationAdvection, NormalRadiation, O
 using Oceananigans.OutputReaders: FieldTimeSeries, Cyclical, TimeSeriesInterpolation
 using Oceananigans.Architectures: architecture, CPU, GPU, on_architecture
 using Oceananigans.Fields: interior, location, fill_halo_regions!
+using Oceananigans.Operators: Δyᶠᶜᶜ, Δxᶜᶠᶜ
 using Oceananigans.ImmersedBoundaries: immersed_peripheral_node, immersed_cell
 using NumericalEarth
 using NumericalEarth.DataWrangling
@@ -1182,7 +1183,16 @@ function bsose_barotropic_transport(bts, side, grid)
           FieldTimeSeries{Center,Nothing,Nothing}(cpu_bts.grid, times; indices=(:, 1, 1), time_indexing) :
           FieldTimeSeries{Nothing,Center,Nothing}(cpu_bts.grid, times; indices=(1, :, 1), time_indexing)
 
+    # Width of each boundary column, for the face integral reported below. The barotropic
+    # transport lives at (Face, Center) on west/east and (Center, Face) on south/north, so
+    # the spacing accessor differs between them. Spacings are geometric, so they come from
+    # the underlying grid on the host.
+    cpu_underlying = cpu_grid isa ImmersedBoundaryGrid ? cpu_grid.underlying_grid : cpu_grid
+    column_width(n) = along_x ? Δxᶜᶠᶜ(n, side === :south ? 1 : Ny + 1, 1, cpu_underlying) :
+                      Δyᶠᶜᶜ(side === :west ? 1 : Nx + 1, n, 1, cpu_underlying)
+
     peak = 0.0
+    face_transports = Float64[]
     for t in 1:length(times)
         slice = along_x ? interior(cpu_bts[t], :, 1, :) : interior(cpu_bts[t], 1, :, :)
         U = zeros(N)
@@ -1200,10 +1210,20 @@ function bsose_barotropic_transport(bts, side, grid)
         for n in 1:N
             H[n] > 0 && (peak = max(peak, abs(U[n]) / H[n]))
         end
+
+        # Face total, which is the number the Flather condition is actually being asked to
+        # drive. `max |U|/H` only says that no single column is absurd; it says nothing about
+        # whether the face carries the right transport, and that distinction cost a lot of
+        # debugging. Verified targets for the 90-150E / 70-45S domain, from BSOSE integrated
+        # directly and from the model's own iteration-0 diagnostic independently:
+        # west +180 Sv, east +205 Sv, north -25 Sv.
+        push!(face_transports, sum(U[n] * column_width(n) for n in 1:N) / 1e6)
     end
 
-    @info @sprintf(" -> %-5s Uᵉˣᵗ: max |U|/H = %.3f m/s over %d wet columns",
-        string(side), peak, count(>(0), H))
+    T̄ = sum(face_transports) / length(face_transports)
+    @info @sprintf(" -> %-5s Uᵉˣᵗ: %+7.1f Sv (range %+.1f to %+.1f), max |U|/H = %.3f m/s over %d wet columns",
+        string(side), T̄, minimum(face_transports), maximum(face_transports),
+        peak, count(>(0), H))
 
     arch = architecture(grid)
     return arch isa GPU ? on_architecture(arch, Uts) : Uts
