@@ -129,6 +129,10 @@ const BSOSE_VARIABLE_NAMES = Dict(
     # same MITgcm convention ("net Short-Wave radiation (+=down), >0 increases theta"), so
     # TFLUX - oceQsw is the non-solar remainder; see `bsose_penetrating_shortwave`.
     :surface_shortwave => "oceQsw",
+    # The variable inside SSH_bsoseI156_*.nc is ETAN, not SSH; see BSOSE_FILE_TOKENS below.
+    # Unlike every other field here it marks land with 0.0 rather than NaN -- see
+    # `bsose_exterior_free_surface`, which masks from Depth before using it.
+    :sea_surface_height => "ETAN",
     # Aliases
     :oceQsw => "oceQsw",
     :Theta => "THETA",
@@ -152,6 +156,7 @@ const BSOSE_FILE_TOKENS = Dict(
     :surface_salt_flux => "surfSflx",
     :surfTflx => "surfTflx",
     :surfSflx => "surfSflx",
+    :sea_surface_height => "SSH",
 )
 
 # Variable spatial locations on Arakawa C-grid
@@ -165,6 +170,7 @@ const BSOSE_LOCATIONS = Dict(
     :surface_heat_flux => (Center, Center, Nothing),
     :surface_salt_flux => (Center, Center, Nothing),
     :surface_shortwave => (Center, Center, Nothing),
+    :sea_surface_height => (Center, Center, Nothing),
     :oceQsw => (Center, Center, Nothing),
     :Theta => (Center, Center, Center),
     :Salt => (Center, Center, Center),
@@ -1392,6 +1398,159 @@ end
 
 
 """
+    bsose_exterior_free_surface(grid; dataset, dates, reference_date, remove_datum = true)
+
+External sea surface `ηᵉˣᵗ` for the Flather condition, as a `NamedTuple` of per-face
+`FieldTimeSeries` shaped to match what [`bsose_barotropic_transport`](@ref) returns.
+
+Flather does not prescribe the transport. Rearranged,
+
+    Uᵇ - √(gH) ηᵇ  =  Uᵉˣᵗ - √(gH) ηᵉˣᵗ
+
+it prescribes the incoming Riemann invariant, a *combination* of transport and sea level.
+Passing `ηᵉˣᵗ = 0` therefore does not omit a refinement, it specifies a different invariant:
+√(gH) is 198 m/s here, so a half-metre of neglected sea surface is 99 m² s⁻¹ against a
+prescribed transport of 81 m² s⁻¹ per unit length. The term dropped is larger than the signal
+kept, which is why a face asked for +203 Sv of outflow delivered -176 Sv of inflow.
+
+### Why this reads the file directly
+
+BSOSE's `ETAN` is the one field in this module that does **not** mark land with NaN. It
+declares `_FillValue = NaN` and then never uses it: land is stored as exactly `0.0`, matching
+`Depth == 0` point for point. The inpainting the other variables rely on would see those
+zeros as valid data, and zero is a *plausible* sea level sitting next to ocean values near
+-2 m. Land is therefore masked here, from `Depth`, before anything else happens.
+
+### Datum
+
+`ETAN` is an anomaly about BSOSE's own reference, and over this domain its ocean-only mean is
+about -1 m, while the model's `η` starts at zero domain mean. Fed in raw, Flather would spend
+the first days of the run dragging the free surface down to BSOSE's datum. `remove_datum`
+subtracts a single scalar — the mean over every wet boundary point and every record — so the
+spatial structure and the seasonal variation survive and only the offset goes. Removing a
+time-varying mean instead would also remove the seasonal barotropic signal, which is real.
+"""
+function bsose_exterior_free_surface(grid;
+    dataset=BSOSEMonthly(),
+    dates=nothing,
+    reference_date=nothing,
+    remove_datum=true)
+
+    underlying = grid isa ImmersedBoundaryGrid ? grid.underlying_grid : grid
+    cpu_grid = architecture(underlying) isa GPU ? on_architecture(CPU(), underlying) : underlying
+    Nx, Ny, _ = size(cpu_grid)
+
+    λc = collect(λnodes(cpu_grid, Center()))
+    φc = collect(φnodes(cpu_grid, Center()))
+    λf = collect(λnodes(cpu_grid, Face()))
+    φf = collect(φnodes(cpu_grid, Face()))
+
+    # `resolve_bsose_filename` returns a bare filename; callers join it with the directory.
+    path = joinpath(dataset.dir, resolve_bsose_filename(dataset.dir, :sea_surface_height, dataset.iteration))
+    @info "Loading exterior free surface (ETAN, $(basename(path)))..."
+
+    faces, times = NCDataset(path) do ds
+        XC = Float64.(ds["XC"][:])
+        YC = Float64.(ds["YC"][:])
+        stamps = DateTime.(ds["time"][:])
+        Depth = Float64.(coalesce.(ds["Depth"][:, :], 0.0))
+
+        want = dates === nothing ? collect(eachindex(stamps)) :
+               [argmin(abs.(Dates.value.(Millisecond.(stamps .- DateTime(d))))) for d in dates]
+        nearest(xs, x) = argmin(abs.(xs .- x))
+
+        # Source index lists for each face: the BSOSE cell under every model boundary column.
+        # The boundary sits on a Face in the normal direction and on Centers along it.
+        src = (west  = ([nearest(XC, λf[1])],      [nearest(YC, φ) for φ in φc]),
+               east  = ([nearest(XC, λf[Nx+1])],   [nearest(YC, φ) for φ in φc]),
+               south = ([nearest(XC, λ) for λ in λc], [nearest(YC, φf[1])]),
+               north = ([nearest(XC, λ) for λ in λc], [nearest(YC, φf[Ny+1])]))
+
+        out = Dict{Symbol,Matrix{Float64}}()
+        for (side, (is, js)) in pairs(src)
+            n = max(length(is), length(js))
+            η = fill(NaN, n, length(want))
+            for (t, rec) in enumerate(want)
+                block = Float64.(coalesce.(ds["ETAN"][is, js, rec], NaN))
+                for m in 1:n
+                    i = length(is) == 1 ? 1 : m
+                    j = length(js) == 1 ? 1 : m
+                    I = length(is) == 1 ? is[1] : is[m]
+                    J = length(js) == 1 ? js[1] : js[m]
+                    # ETAN stores land as exactly 0.0, not NaN; Depth is the truth.
+                    η[m, t] = Depth[I, J] == 0 ? NaN : block[i, j]
+                end
+            end
+            out[side] = η
+        end
+        (out, [Dates.value(Second(stamps[rec] - (reference_date === nothing ? stamps[want[1]] :
+                                                 DateTime(reference_date)))) for rec in want])
+    end
+
+    # Fill the columns where BSOSE is land but the model is wet, from the nearest valid
+    # neighbour along the face. Leaving them NaN would poison the whole barotropic solve.
+    # A face can be entirely land -- the southern boundary at 70S is Antarctica from end to
+    # end, which is why `bsose_barotropic_transport` reports 0 wet columns there. Such a face
+    # gets zeros: it is never used, no transport crosses it, and leaving NaN would propagate
+    # into the datum and from there into every other face.
+    dry_faces = Symbol[]
+    gaps = 0
+    for (side, η) in faces
+        if all(isnan, η)
+            η .= 0
+            push!(dry_faces, side)
+            continue
+        end
+        for t in axes(η, 2)
+            col = @view η[:, t]
+            valid = findall(!isnan, col)
+            isempty(valid) && continue
+            for m in axes(η, 1)
+                isnan(col[m]) || continue
+                col[m] = col[valid[argmin(abs.(valid .- m))]]
+                gaps += 1
+            end
+        end
+    end
+    isempty(dry_faces) || @info " -> $(join(dry_faces, ", ")) boundary is entirely land; ηᵉˣᵗ there is zero and unused."
+    gaps > 0 && @info @sprintf(" -> filled %d land-masked boundary points from nearest wet neighbour", gaps)
+
+    wet_faces = [η for (side, η) in faces if !(side in dry_faces)]
+
+    datum = 0.0
+    if remove_datum
+        allη = vcat((vec(η) for η in wet_faces)...)
+        datum = sum(allη) / length(allη)
+        for η in wet_faces
+            η .-= datum
+        end
+    end
+
+    lo = minimum(minimum(η) for η in wet_faces)
+    hi = maximum(maximum(η) for η in wet_faces)
+    @info @sprintf(" -> ηᵉˣᵗ: datum %+.3f m removed, residual range %+.3f to %+.3f m (span %.3f m)",
+        datum, lo, hi, hi - lo)
+
+    # Shaped to match `bsose_barotropic_transport`, so Flather receives a consistent pair.
+    arch = architecture(grid)
+    series(side) = begin
+        along_x = side === :south || side === :north
+        fts = along_x ?
+              FieldTimeSeries{Center,Nothing,Nothing}(cpu_grid, times; indices=(:, 1, 1), time_indexing=Cyclical()) :
+              FieldTimeSeries{Nothing,Center,Nothing}(cpu_grid, times; indices=(1, :, 1), time_indexing=Cyclical())
+        for t in eachindex(times)
+            along_x ? (interior(fts[t], :, 1, 1) .= faces[side][:, t]) :
+                      (interior(fts[t], 1, :, 1) .= faces[side][:, t])
+            fill_halo_regions!(fts[t])
+        end
+        arch isa GPU ? on_architecture(arch, fts) : fts
+    end
+
+    return (west=series(:west), east=series(:east), south=series(:south), north=series(:north))
+end
+
+
+"""
     bsose_penetrating_shortwave(grid;
                                 dataset = BSOSEMonthly(),
                                 dates = nothing,
@@ -1867,22 +2026,35 @@ function bsose_open_boundary_conditions(grid;
 
     if barotropic === true
         @info "Building barotropic (Flather) boundary conditions for U and V..."
-        ηᵉˣᵗ = exterior_free_surface
+
+        # Flather prescribes the incoming Riemann invariant U - √(gH)η, so Uᵉˣᵗ and ηᵉˣᵗ are
+        # one pair, not two settings. A per-face `NamedTuple` from
+        # `bsose_exterior_free_surface` supplies the real sea surface; a bare number (the old
+        # default of 0) asserts a flat boundary, which contradicts any prescribed transport --
+        # at √(gH) = 198 m/s the neglected term outweighs the transport itself.
+        η_at(side) = exterior_free_surface isa NamedTuple ?
+                     getproperty(exterior_free_surface, side) : exterior_free_surface
+
+        if !(exterior_free_surface isa NamedTuple)
+            @warn """ηᵉˣᵗ is a bare $(typeof(exterior_free_surface)), so every open face is told its sea \
+                     surface is flat. That is inconsistent with a prescribed transport and drives the \
+                     free surface away rather than holding it; pass `bsose_exterior_free_surface(grid; ...)`."""
+        end
 
         V_south_transport = bsose_barotropic_transport(v_south, :south, grid)
         V_north_transport = bsose_barotropic_transport(v_north, :north, grid)
 
         V_bcs = FieldBoundaryConditions(grid, (Center(), Face(), nothing);
-            south=GravityWaveRadiationBoundaryCondition((V_south_transport, ηᵉˣᵗ)),
-            north=GravityWaveRadiationBoundaryCondition((V_north_transport, ηᵉˣᵗ)))
+            south=GravityWaveRadiationBoundaryCondition((V_south_transport, η_at(:south))),
+            north=GravityWaveRadiationBoundaryCondition((V_north_transport, η_at(:north))))
 
         if !is_x_periodic
             U_west_transport = bsose_barotropic_transport(u_west, :west, grid)
             U_east_transport = bsose_barotropic_transport(u_east, :east, grid)
 
             U_bcs = FieldBoundaryConditions(grid, (Face(), Center(), nothing);
-                west=GravityWaveRadiationBoundaryCondition((U_west_transport, ηᵉˣᵗ)),
-                east=GravityWaveRadiationBoundaryCondition((U_east_transport, ηᵉˣᵗ)))
+                west=GravityWaveRadiationBoundaryCondition((U_west_transport, η_at(:west))),
+                east=GravityWaveRadiationBoundaryCondition((U_east_transport, η_at(:east))))
         end
 
         @info " -> η gets its companion Chapman condition automatically from U/V."

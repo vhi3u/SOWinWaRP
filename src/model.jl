@@ -50,7 +50,7 @@ end
 # Change it for each experiment so runs do not overwrite one another, then animate
 # the result with `./run_animate_simulation RUN_NAME`.
 # ==============================================================================
-const RUN_NAME = "8M_flather_sw"
+const RUN_NAME = "8M_flather_ssh"
 
 # flags
 
@@ -295,7 +295,16 @@ if OBCS && DATASET == "BSOSE"
 
     @info "  -> Tangential velocity condition: $TANGENTIAL_BC"
 
+    # Exterior sea surface for the Flather condition. Without it ηᵉˣᵗ is 0, which tells every
+    # open face the sea surface is flat -- inconsistent with the 200 Sv of geostrophic
+    # transport the same condition prescribes, and the reason the east face delivered -176 Sv
+    # of inflow where +203 Sv of outflow was asked for.
+    exterior_η = BAROTROPIC_OBC && DATASET == "BSOSE" ?
+                 bsose_exterior_free_surface(grid; dataset=dataset, dates=bc_dates,
+                     reference_date=start_date) : 0
+
     boundary_conditions = bsose_open_boundary_conditions(grid; dataset=dataset, dates=bc_dates,
+        exterior_free_surface=exterior_η,
         winds=WINDS, surface_fluxes=SURFACE_FLUXES,
         penetrating_shortwave=SURFACE_FLUXES && PENETRATING_SHORTWAVE, scheme=obc_scheme,
         tangential_bc_kind=TANGENTIAL_BC, oblique_inflow_timescale=OBLIQUE_TAU_IN,
