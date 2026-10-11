@@ -1449,7 +1449,7 @@ function bsose_exterior_free_surface(grid;
     path = joinpath(dataset.dir, resolve_bsose_filename(dataset.dir, :sea_surface_height, dataset.iteration))
     @info "Loading exterior free surface (ETAN, $(basename(path)))..."
 
-    faces, times = NCDataset(path) do ds
+    stack, times = NCDataset(path) do ds
         XC = Float64.(ds["XC"][:])
         YC = Float64.(ds["YC"][:])
         stamps = DateTime.(ds["time"][:])
@@ -1459,80 +1459,63 @@ function bsose_exterior_free_surface(grid;
                [argmin(abs.(Dates.value.(Millisecond.(stamps .- DateTime(d))))) for d in dates]
         nearest(xs, x) = argmin(abs.(xs .- x))
 
-        # Source index lists for each face: the BSOSE cell under every model boundary column.
-        # The boundary sits on a Face in the normal direction and on Centers along it.
-        src = (west  = ([nearest(XC, λf[1])],      [nearest(YC, φ) for φ in φc]),
-               east  = ([nearest(XC, λf[Nx+1])],   [nearest(YC, φ) for φ in φc]),
-               south = ([nearest(XC, λ) for λ in λc], [nearest(YC, φf[1])]),
-               north = ([nearest(XC, λ) for λ in λc], [nearest(YC, φf[Ny+1])]))
+        # One source for everything. The faces are sliced out of this below rather than read
+        # separately: reading the west face at λf and the interior at λc put them in
+        # neighbouring BSOSE columns with different coastlines, and the land fill then chose
+        # different neighbours, leaving ηᵇ and ηᵉˣᵗ disagreeing by up to 0.12 m near Antarctica
+        # -- 58 Sv through √(gH). Half a cell of a smooth field is worth about a millimetre;
+        # a fill discontinuity is worth a hundred times that, so consistency wins.
+        iall = [nearest(XC, λ) for λ in λc]
+        jall = [nearest(YC, φ) for φ in φc]
 
-        out = Dict{Symbol,Matrix{Float64}}()
-        for (side, (is, js)) in pairs(src)
-            n = max(length(is), length(js))
-            η = fill(NaN, n, length(want))
-            for (t, rec) in enumerate(want)
-                block = Float64.(coalesce.(ds["ETAN"][is, js, rec], NaN))
-                for m in 1:n
-                    i = length(is) == 1 ? 1 : m
-                    j = length(js) == 1 ? 1 : m
-                    I = length(is) == 1 ? is[1] : is[m]
-                    J = length(js) == 1 ? js[1] : js[m]
-                    # ETAN stores land as exactly 0.0, not NaN; Depth is the truth.
-                    η[m, t] = Depth[I, J] == 0 ? NaN : block[i, j]
-                end
+        η = fill(NaN, Nx, Ny, length(want))
+        for (t, rec) in enumerate(want)
+            blk = Float64.(coalesce.(ds["ETAN"][iall, jall, rec], NaN))
+            for i in 1:Nx, j in 1:Ny
+                # ETAN marks land with exactly 0.0, never NaN; Depth is the truth.
+                η[i, j, t] = Depth[iall[i], jall[j]] == 0 ? NaN : blk[i, j]
             end
-            out[side] = η
         end
-        (out, [Dates.value(Second(stamps[rec] - (reference_date === nothing ? stamps[want[1]] :
-                                                 DateTime(reference_date)))) for rec in want])
+
+        (η, [Dates.value(Second(stamps[rec] - (reference_date === nothing ? stamps[want[1]] :
+                                               DateTime(reference_date)))) for rec in want])
     end
 
-    # Fill the columns where BSOSE is land but the model is wet, from the nearest valid
-    # neighbour along the face. Leaving them NaN would poison the whole barotropic solve.
-    # A face can be entirely land -- the southern boundary at 70S is Antarctica from end to
-    # end, which is why `bsose_barotropic_transport` reports 0 wet columns there. Such a face
-    # gets zeros: it is never used, no transport crosses it, and leaving NaN would propagate
-    # into the datum and from there into every other face.
-    dry_faces = Symbol[]
+    # Datum, from ocean points only and before any filling. ETAN is an anomaly about BSOSE's
+    # own reference; the model's η starts at zero domain mean. Removing the domain mean lines
+    # the two up while leaving the spatial structure and the seasonal variation intact.
+    datum = 0.0
+    if remove_datum
+        wet = filter(!isnan, vec(stack))
+        datum = sum(wet) / length(wet)
+        stack .-= datum
+    end
+
+    # Fill land along latitude. These points are inside the immersed boundary and never enter
+    # the dynamics, but a NaN would propagate through `set!` and a zero would stand a 2 m
+    # cliff against the neighbouring ocean.
     gaps = 0
-    for (side, η) in faces
-        if all(isnan, η)
-            η .= 0
-            push!(dry_faces, side)
-            continue
-        end
-        for t in axes(η, 2)
-            col = @view η[:, t]
-            valid = findall(!isnan, col)
-            isempty(valid) && continue
-            for m in axes(η, 1)
-                isnan(col[m]) || continue
-                col[m] = col[valid[argmin(abs.(valid .- m))]]
+    for t in axes(stack, 3), i in axes(stack, 1)
+        col = @view stack[i, :, t]
+        valid = findall(!isnan, col)
+        if isempty(valid)
+            col .= 0
+        else
+            for j in eachindex(col)
+                isnan(col[j]) || continue
+                col[j] = col[valid[argmin(abs.(valid .- j))]]
                 gaps += 1
             end
         end
     end
-    isempty(dry_faces) || @info " -> $(join(dry_faces, ", ")) boundary is entirely land; ηᵉˣᵗ there is zero and unused."
-    gaps > 0 && @info @sprintf(" -> filled %d land-masked boundary points from nearest wet neighbour", gaps)
-
-    wet_faces = [η for (side, η) in faces if !(side in dry_faces)]
-
-    datum = 0.0
-    if remove_datum
-        allη = vcat((vec(η) for η in wet_faces)...)
-        datum = sum(allη) / length(allη)
-        for η in wet_faces
-            η .-= datum
-        end
-    end
-
-    lo = minimum(minimum(η) for η in wet_faces)
-    hi = maximum(maximum(η) for η in wet_faces)
+    gaps > 0 && @info @sprintf(" -> filled %d land points from the nearest wet neighbour in latitude", gaps)
     @info @sprintf(" -> ηᵉˣᵗ: datum %+.3f m removed, residual range %+.3f to %+.3f m (span %.3f m)",
-        datum, lo, hi, hi - lo)
+        datum, minimum(stack), maximum(stack), maximum(stack) - minimum(stack))
 
-    # Shaped to match `bsose_barotropic_transport`, so Flather receives a consistent pair.
     arch = architecture(grid)
+    faces = (west = stack[1, :, :], east = stack[Nx, :, :],
+             south = stack[:, 1, :], north = stack[:, Ny, :])
+
     series(side) = begin
         along_x = side === :south || side === :north
         fts = along_x ?
@@ -1546,7 +1529,8 @@ function bsose_exterior_free_surface(grid;
         arch isa GPU ? on_architecture(arch, fts) : fts
     end
 
-    return (west=series(:west), east=series(:east), south=series(:south), north=series(:north))
+    return (west=series(:west), east=series(:east), south=series(:south), north=series(:north),
+        initial=stack[:, :, 1], datum=datum)
 end
 
 

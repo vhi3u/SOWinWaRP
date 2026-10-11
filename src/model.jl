@@ -50,7 +50,7 @@ end
 # Change it for each experiment so runs do not overwrite one another, then animate
 # the result with `./run_animate_simulation RUN_NAME`.
 # ==============================================================================
-const RUN_NAME = "8M_flather_ssh"
+const RUN_NAME = "8M_flather_ssh_eta0"
 
 # flags
 
@@ -445,6 +445,26 @@ ocean = ocean_simulation(grid;
 
 if DATASET == "BSOSE"
     bsose_initial_conditions!(ocean.model; dataset=dataset, date=start_date, velocities=true)
+
+    # Initialise the free surface too. Setting u, v, T, S from BSOSE while leaving η flat is
+    # internally inconsistent: BSOSE's velocities are in geostrophic balance with a sea
+    # surface that drops about 2 m from 45S to the Antarctic margin, and starting without it
+    # leaves the model to build that tilt from scratch. Every run so far has done this --
+    # max|η| jumps from 0 to about 2.5 m on day 1 in all of them, which is the model
+    # manufacturing the sea surface it should have been handed.
+    #
+    # With Flather it is worse than a spin-up transient: ηᵉˣᵗ carries the tilt while ηᵇ starts
+    # at zero, so the condition sees a 0.7 m error on day one and answers it with hundreds of
+    # Sverdrups. The 2D field below shares the datum removed from the face values, so the
+    # interior and the boundary agree at t = 0 by construction.
+    if exterior_η isa NamedTuple
+        set!(ocean.model.free_surface.displacement, exterior_η.initial)
+        fill_halo_regions!(ocean.model.free_surface.displacement)
+        @info @sprintf(" -> free surface initialised from BSOSE ETAN: mean %+.3f m, range %+.3f to %+.3f m",
+            mean(interior(ocean.model.free_surface.displacement)),
+            minimum(interior(ocean.model.free_surface.displacement)),
+            maximum(interior(ocean.model.free_surface.displacement)))
+    end
 else
     set!(ocean.model,
         MetadataSet(:temperature; dataset=dataset, date=start_date),
