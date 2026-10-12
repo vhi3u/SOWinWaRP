@@ -50,7 +50,7 @@ end
 # Change it for each experiment so runs do not overwrite one another, then animate
 # the result with `./run_animate_simulation RUN_NAME`.
 # ==============================================================================
-const RUN_NAME = "8M_pa_gradient_bt_balanced"
+const RUN_NAME = "8M_pa_gradient_bt_ssh"
 
 # flags
 
@@ -115,7 +115,31 @@ const BAROTROPIC_OBC = true
 # So ηᵉˣᵗ = 0 is the conservative setting until the interior can be shown to hold the tilt.
 # Set `true` to use the SSH field, which also initialises η to match (the two must agree, or
 # the boundary sees a 2 m error on the first step).
-const EXTERIOR_SSH = false
+# ηᵉˣᵗ for the Flather condition. `false` tells every face its sea surface is zero.
+#
+# tools/inspect_bsose_boundaries.jl, Q8, measures what that costs. Relative to the domain
+# datum that `bsose_exterior_free_surface` removes, BSOSE i156 over 2014-06 to 2015-01 puts
+# the faces at:
+#
+#     west -0.151 m    east -0.034 m    north +1.105 m
+#
+# and the Flather sensitivity is 5.1 Sv per cm on west/east, 9.5 Sv per cm on north. So
+# `false` is not a simplification; it is a boundary condition that is wrong by 1.105 m on
+# the north face, which is worth about +1050 Sv. The model never reports that because the
+# free surface drifts down until the error partly cancels -- the observed "mean eta walking
+# down to -0.65 m" -- and what survives the drift is the +213 to +219 Sv the failed runs did
+# report. No scalar can fix this: the structure spans 1.26 m across the domain.
+#
+# SSH was tried before and the runs were worse, but that was with ObliqueRadiation and the
+# :oblique tangential condition, which were separately found to break stability. It has
+# never been run with the current PerturbationAdvection + :gradient + balanced barotropic
+# stack, and the 1.105 m north offset was not known then.
+#
+# If this still fails, the honest reading is that Flather on the north face is too stiff for
+# this domain -- at 9.5 Sv/cm the model's own η must track BSOSE's to a centimetre -- and the
+# northern boundary should move to prescribed transport plus a sponge, which is what MITgcm
+# does here.
+const EXTERIOR_SSH = true
 
 # Which faces get a Flather condition: `:all` (west, east, north, south) or `:zonal`
 # (west and east only, north/south depth-integrated flux held at zero).

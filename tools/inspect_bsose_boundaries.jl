@@ -24,6 +24,10 @@
 #       routine removes -- worth knowing how big it is before trusting the balance.
 #   Q7  Sanity: NaNs in the raw slices, and does BSOSE carry nonzero velocity below its
 #       own sea floor (the inpainting trap `bsose_barotropic_transport` warns about)?
+#   Q8  How far does BSOSE's sea surface sit from the domain mean at each face, and what is
+#       that worth in Sv? Flather prescribes the Riemann invariant, so an error in
+#       (ηᵇ - ηᵉˣᵗ) is transport at √(gH) x face width. This is the question that turned
+#       out to matter: with EXTERIOR_SSH = false every face is told ηᵉˣᵗ = 0.
 #
 # Runs on CPU only and needs no GPU -- it is NetCDF reads and column integrals. CPU is
 # deliberate: this codebase has already lost two debugging cycles to GPU scalar indexing
@@ -334,6 +338,61 @@ println("-"^104)
 println(""" If the band inflow T stays near freezing while the model develops +7-9 C there, the
  boundary is not importing the warm bias and the redistribution diagnosis stands. If the
  prescribed inflow is itself several degrees warm, it is a second source.""")
+
+# ------------------------------------------------------------------------------
+# Q8 -- where BSOSE's sea surface actually sits at each face.
+#
+# `bsose_exterior_free_surface` removes a single domain-wide datum, which lines BSOSE's
+# reference up with the model's (whose η starts at zero domain mean) while preserving the
+# spatial structure. What is left is the per-face offset the Flather condition must be told
+# about. Setting EXTERIOR_SSH = false replaces all of it with zero.
+# ------------------------------------------------------------------------------
+hdr("Q8 -- BSOSE sea surface at each face, relative to the domain datum")
+
+eds, ename = open_var(:sea_surface_height)
+gds2 = Dataset(grid_file)
+Depth_dom = Float64.(coalesce.(gds2["Depth"][irange, jrange], 0.0))
+close(gds2)
+wet_dom = Depth_dom .> 0
+
+# An eta offset of Δη on a face is worth Δη * √(gH) * Σ(width) of transport.
+Σw_we = sum(dy_col)
+Σw_N  = sum(dx_col_N)
+HN_mean = safemean(HN[HN .> 0])
+HW_mean = safemean(HW[HW .> 0])
+sens_we = 0.01 * sqrt(9.81 * HW_mean) * Σw_we / 1e6
+sens_N  = 0.01 * sqrt(9.81 * HN_mean) * Σw_N  / 1e6
+
+println(" date           datum     west-d    east-d   north-d |  north offset in Sv")
+println("-"^74)
+offW, offE, offN = Float64[], Float64[], Float64[]
+for t in tsel
+    η = Float64.(coalesce.(eds[ename][irange, jrange, t], 0.0))   # land is 0.0, never NaN
+    datum = mean(η[wet_dom])
+    fw = safemean(η[1, :][wet_dom[1, :]])
+    fe = safemean(η[end, :][wet_dom[end, :]])
+    fn = safemean(η[:, end][wet_dom[:, end]])
+    push!(offW, fw - datum); push!(offE, fe - datum); push!(offN, fn - datum)
+    @printf(" %s %+9.4f %+9.4f %+9.4f %+9.4f | %+10.1f Sv\n",
+            Dates.format(times[t], "yyyy-mm-dd"), datum, fw - datum, fe - datum, fn - datum,
+            (fn - datum) * sqrt(9.81 * HN_mean) * Σw_N / 1e6)
+end
+close(eds)
+println("-"^74)
+@printf(" mean offsets: west %+.4f m, east %+.4f m, north %+.4f m\n",
+        mean(offW), mean(offE), mean(offN))
+@printf("\n sensitivity: 1 cm of (etaB - etaExt) error is worth %.1f Sv on west/east, %.1f Sv on north.\n",
+        sens_we, sens_N)
+@printf(" The north face sits %+.3f m off the domain datum. Told etaExt = 0, that is %+.0f Sv.\n",
+        mean(offN), mean(offN) * sqrt(9.81 * HN_mean) * Σw_N / 1e6)
+println("""
+ The model never shows that number because the free surface drifts down until the error
+ partially cancels -- which is the observed 'mean eta walking down to -0.65 m'. What
+ survives the drift is the few-hundred-Sv residual the failed runs reported.
+
+ There is no scalar etaExt that is right for more than one face: the structure spans more
+ than a metre across this domain. EXTERIOR_SSH = false is not a simplification, it is a
+ different and wrong boundary condition.""")
 
 # ------------------------------------------------------------------------------
 # Q6 -- BSOSE's mask against the model's ETOPO bathymetry.
