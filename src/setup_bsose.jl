@@ -1398,6 +1398,95 @@ end
 
 
 """
+    face_geometry(side, grid)
+
+`(widths, depths)` per boundary column: the along-face cell width and the wet depth of each
+column of `side`, on the host.
+"""
+function face_geometry(side, grid)
+    underlying = grid isa ImmersedBoundaryGrid ? grid.underlying_grid : grid
+    cpu_grid = architecture(grid) isa GPU ? on_architecture(CPU(), grid) : grid
+    cpu_underlying = cpu_grid isa ImmersedBoundaryGrid ? cpu_grid.underlying_grid : cpu_grid
+    Nx, Ny, Nz = size(underlying)
+    Δz = boundary_vertical_spacing(grid)
+    along_x = side === :south || side === :north
+    N = along_x ? Nx : Ny
+
+    widths = [along_x ? Δxᶜᶠᶜ(n, side === :south ? 1 : Ny + 1, 1, cpu_underlying) :
+              Δyᶠᶜᶜ(side === :west ? 1 : Nx + 1, n, 1, cpu_underlying) for n in 1:N]
+
+    depths = zeros(N)
+    for n in 1:N, k in 1:Nz
+        i = along_x ? n : (side === :west ? 1 : Nx)
+        j = along_x ? (side === :south ? 1 : Ny) : n
+        cpu_grid isa ImmersedBoundaryGrid && immersed_cell(i, j, k, cpu_grid) && continue
+        depths[n] += Δz[k]
+    end
+    return widths, depths
+end
+
+
+"""
+    balance_barotropic_transports!(Us, grid)
+
+Remove the net volume imbalance from the prescribed barotropic transports, in place, record
+by record. This is MITgcm's `useOBCSbalance` and it is standard practice in regional modelling.
+
+BSOSE's velocities are masked onto a bathymetry that is not BSOSE's, so the four faces do not
+sum to zero even though BSOSE's own do. Over this domain the residual is about +3 Sv of
+outflow, which sounds small against ~200 Sv of gross transport and is not: unopposed it drains
+the free surface by 2.9 m over ninety days. Flather does oppose it, but only by letting η sit
+low enough for `√(gH)(ηᵇ - ηᵉˣᵗ)` to cancel it — and with `ηᵉˣᵗ = 0` that offset reached
+-0.65 m by day 50, which is worth several hundred Sverdrups of correction and was enough to
+reverse the eastern face from +203 Sv of outflow to -119 Sv of inflow.
+
+The correction is a uniform velocity across every open face, so each column is adjusted in
+proportion to its own depth and the vertical structure of the prescribed transport is left
+alone. Faces that are entirely land contribute no area and take no correction.
+"""
+function balance_barotropic_transports!(Us, grid)
+    sides = [s for s in (:west, :east, :south, :north) if getproperty(Us, s) !== nothing]
+    isempty(sides) && return Us
+
+    outward = (west=-1.0, east=+1.0, south=-1.0, north=+1.0)
+    geom = Dict(s => face_geometry(s, grid) for s in sides)
+    total_area = sum(sum(w .* d) for (w, d) in values(geom))
+
+    if total_area <= 0
+        @warn " -> no wet open-boundary area; barotropic transports left unbalanced."
+        return Us
+    end
+
+    cpu = Dict(s => (architecture(getproperty(Us, s)) isa GPU ?
+                     on_architecture(CPU(), getproperty(Us, s)) : getproperty(Us, s)) for s in sides)
+    nt = length(first(values(cpu)).times)
+    before, after = Float64[], Float64[]
+
+    for t in 1:nt
+        face_U(s) = (fts = cpu[s]; s in (:south, :north) ? interior(fts[t], :, 1, 1) : interior(fts[t], 1, :, 1))
+        net = sum(outward[s] * sum(face_U(s) .* geom[s][1]) for s in sides)
+        push!(before, net / 1e6)
+
+        Δu = net / total_area
+        for s in sides
+            face_U(s) .-= outward[s] * Δu .* geom[s][2]
+        end
+        push!(after, sum(outward[s] * sum(face_U(s) .* geom[s][1]) for s in sides) / 1e6)
+        for s in sides
+            fill_halo_regions!(cpu[s][t])
+        end
+    end
+
+    @info @sprintf(" -> barotropic balance: mean net %+.2f -> %+.2e Sv, worst record %+.2f -> %+.2e Sv, uniform correction up to %.4f m/s",
+        sum(before)/nt, sum(after)/nt, before[argmax(abs.(before))], after[argmax(abs.(after))],
+        maximum(abs.(before)) * 1e6 / total_area)
+
+    arch = architecture(grid)
+    return NamedTuple(s => (arch isa GPU ? on_architecture(arch, cpu[s]) : cpu[s]) for s in sides)
+end
+
+
+"""
     bsose_exterior_free_surface(grid; dataset, dates, reference_date, remove_datum = true)
 
 External sea surface `ηᵉˣᵗ` for the Flather condition, as a `NamedTuple` of per-face
@@ -1800,6 +1889,7 @@ function bsose_open_boundary_conditions(grid;
     penetrating_shortwave=false,
     tangential_bc_kind=:gradient,
     barotropic=false,
+    balance_transports=true,
     exterior_free_surface=0,
     tangential_gravity_wave_speed=210.0,
     oblique_inflow_timescale=3days,
@@ -2031,14 +2121,29 @@ function bsose_open_boundary_conditions(grid;
         V_south_transport = bsose_barotropic_transport(v_south, :south, grid)
         V_north_transport = bsose_barotropic_transport(v_north, :north, grid)
 
+        U_west_transport = is_x_periodic ? nothing : bsose_barotropic_transport(u_west, :west, grid)
+        U_east_transport = is_x_periodic ? nothing : bsose_barotropic_transport(u_east, :east, grid)
+
+        # Take the net imbalance out before any of these reach a boundary condition. See
+        # `balance_barotropic_transports!`: +3 Sv left in drains the domain, and Flather pays
+        # for that with a free-surface offset large enough to reverse a face.
+        if balance_transports
+            balanced = balance_barotropic_transports!(
+                (west=U_west_transport, east=U_east_transport,
+                 south=V_south_transport, north=V_north_transport), grid)
+            U_west_transport  = get(balanced, :west,  U_west_transport)
+            U_east_transport  = get(balanced, :east,  U_east_transport)
+            V_south_transport = get(balanced, :south, V_south_transport)
+            V_north_transport = get(balanced, :north, V_north_transport)
+        else
+            @info " -> barotropic transports left UNBALANCED (balance_transports = false)."
+        end
+
         V_bcs = FieldBoundaryConditions(grid, (Center(), Face(), nothing);
             south=GravityWaveRadiationBoundaryCondition((V_south_transport, η_at(:south))),
             north=GravityWaveRadiationBoundaryCondition((V_north_transport, η_at(:north))))
 
         if !is_x_periodic
-            U_west_transport = bsose_barotropic_transport(u_west, :west, grid)
-            U_east_transport = bsose_barotropic_transport(u_east, :east, grid)
-
             U_bcs = FieldBoundaryConditions(grid, (Face(), Center(), nothing);
                 west=GravityWaveRadiationBoundaryCondition((U_west_transport, η_at(:west))),
                 east=GravityWaveRadiationBoundaryCondition((U_east_transport, η_at(:east))))

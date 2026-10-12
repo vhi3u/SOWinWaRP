@@ -50,7 +50,7 @@ end
 # Change it for each experiment so runs do not overwrite one another, then animate
 # the result with `./run_animate_simulation RUN_NAME`.
 # ==============================================================================
-const RUN_NAME = "90d_pa_gradient_bt"
+const RUN_NAME = "8M_pa_gradient_bt_balanced"
 
 # flags
 
@@ -229,6 +229,13 @@ end
 # BSOSE iteration 156 (HPC) covers 2013-2024; iteration 105 (local CPU) covers
 # 2008-2012, so a local test run needs dates inside that earlier range.
 # ==============================================================================
+# Eight months, to December-January, so the run carries a full seasonal cycle into the warm
+# bloom. PENETRATING_SHORTWAVE stays OFF: this run is the barotropic/balance test, and leaving
+# the shortwave out makes it something we have never had -- the bloom reproduced on top of a
+# boundary that actually passes the ACC. That is the clean control the shortwave fix has been
+# missing, and it costs nothing extra to collect it here.
+#
+# (Previous header, from the ninety-day version:)
 # Ninety days. The fourteen-day A/B answered its question -- PerturbationAdvection on the
 # normal flow with GradientBoundaryCondition(0) on the tangential reproduces 54021db's log
 # almost exactly on current packages (day 13: |u| 0.83, |v| 1.17, |w| 0.0175, Δt 17.2 min
@@ -265,7 +272,7 @@ end
 # over a 3.1 m mixed layer against BSOSE's 21.8 m. Three questions, one run -- face transports
 # at startup, the |w| tripwire on day 1, the bloom around day 200.
 start_date = DateTime("2014-06-01")
-end_date = DateTime("2014-08-30")
+end_date = DateTime("2015-02-01")
 
 # option if need to do tests on CPU
 # start_date = DateTime("2009-06-01")
