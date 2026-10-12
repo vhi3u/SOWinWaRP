@@ -2020,9 +2020,12 @@ function bsose_open_boundary_conditions(grid;
                      getproperty(exterior_free_surface, side) : exterior_free_surface
 
         if !(exterior_free_surface isa NamedTuple)
-            @warn """ηᵉˣᵗ is a bare $(typeof(exterior_free_surface)), so every open face is told its sea \
-                     surface is flat. That is inconsistent with a prescribed transport and drives the \
-                     free surface away rather than holding it; pass `bsose_exterior_free_surface(grid; ...)`."""
+            @info """ -> ηᵉˣᵗ is a bare $(typeof(exterior_free_surface)): every open face is told its sea \
+                     surface is flat, and Flather carries transport only. Measured in \
+                     obc_tests/flather_sandbox.jl, a uniform ηᵉˣᵗ only shifts the datum (0 to 0.04 m moved \
+                     the transport 0.3%), whereas a tilt adds 60.8 Sv per metre regardless of Uᵉˣᵗ. Supply \
+                     `bsose_exterior_free_surface(grid; ...)` only when the model's own η can be shown to \
+                     hold BSOSE's 2 m tilt; otherwise this is the conservative setting."""
         end
 
         V_south_transport = bsose_barotropic_transport(v_south, :south, grid)

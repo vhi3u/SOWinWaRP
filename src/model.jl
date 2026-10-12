@@ -50,7 +50,7 @@ end
 # Change it for each experiment so runs do not overwrite one another, then animate
 # the result with `./run_animate_simulation RUN_NAME`.
 # ==============================================================================
-const RUN_NAME = "14d_54021db_config"
+const RUN_NAME = "90d_pa_gradient_bt"
 
 # flags
 
@@ -97,7 +97,25 @@ const BOUNDARY_DIAGNOSTICS = true # write free-surface height, boundary-face sli
 # margin, and a zero tells the boundary it is flat. SSH_bsoseI156_2013to2024_monthly.nc is the
 # fix and is not yet wired in. Read the face transports the barotropic setup now logs before
 # reading anything into the run: they should be west +180, east +205, north -25 Sv.
-const BAROTROPIC_OBC = false
+const BAROTROPIC_OBC = true
+
+# ηᵉˣᵗ for the Flather condition: BSOSE's sea surface, or zero.
+#
+# `false` here is deliberate. The idealised sandbox (obc_tests/flather_sandbox.jl) measures
+# the boundary's response as
+#
+#     transport = 0.815 x Uᵉˣᵗ  +  60.8 Sv per metre of ηᵉˣᵗ tilt
+#
+# linear to three digits. BSOSE's ETAN drops 2.05 m across this domain, which on that face is
+# ~125 Sv of tilt-driven transport on top of the ~197 Sv being prescribed. That only cancels
+# if the model's own η sustains the same tilt, and it does not: supplying the real SSH made
+# the transports worse, not better. A uniform ηᵉˣᵗ, by contrast, only moves the datum --
+# 0 to 0.04 m changed the transport by 0.3%.
+#
+# So ηᵉˣᵗ = 0 is the conservative setting until the interior can be shown to hold the tilt.
+# Set `true` to use the SSH field, which also initialises η to match (the two must agree, or
+# the boundary sees a 2 m error on the first step).
+const EXTERIOR_SSH = false
 
 # Open boundary matching scheme for the NORMAL flow: "ObliqueRadiation",
 # "PerturbationAdvection", "NormalRadiation", or "clamped".
@@ -211,8 +229,19 @@ end
 # BSOSE iteration 156 (HPC) covers 2013-2024; iteration 105 (local CPU) covers
 # 2008-2012, so a local test run needs dates inside that earlier range.
 # ==============================================================================
-# Fourteen days. This run exists to answer one question: does the configuration that was fast
-# and stable at 54021db (2026-09-27) still behave on the current packages?
+# Ninety days. The fourteen-day A/B answered its question -- PerturbationAdvection on the
+# normal flow with GradientBoundaryCondition(0) on the tangential reproduces 54021db's log
+# almost exactly on current packages (day 13: |u| 0.83, |v| 1.17, |w| 0.0175, Δt 17.2 min
+# against 0.83 / 1.17 / 0.018 / 17.16), so the package bump was never the problem and the
+# oblique schemes were.
+#
+# This run adds the one thing that configuration lacks: a barotropic boundary, so the ACC's
+# ~180 Sv can actually cross instead of turning and running along the edges. Every previous
+# barotropic attempt paired it with the oblique schemes now known to be unstable, so Flather
+# with PA + Gradient(0) has never been tried.
+#
+# Ninety days because the western boundary jet builds over a ~20-day cycle; at 14 days every
+# configuration still looks acceptable. About 2.4 hours at the rate the A/B ran.
 #
 # That commit ran PerturbationAdvection on the normal flow, GradientBoundaryCondition(0) on the
 # tangential, no barotropic condition, on Oceananigans 0.111.0 / NumericalEarth 0.7.0. Current
@@ -236,7 +265,7 @@ end
 # over a 3.1 m mixed layer against BSOSE's 21.8 m. Three questions, one run -- face transports
 # at startup, the |w| tripwire on day 1, the bloom around day 200.
 start_date = DateTime("2014-06-01")
-end_date = DateTime("2014-06-15")
+end_date = DateTime("2014-08-30")
 
 # option if need to do tests on CPU
 # start_date = DateTime("2009-06-01")
@@ -318,7 +347,7 @@ if OBCS && DATASET == "BSOSE"
     # open face the sea surface is flat -- inconsistent with the 200 Sv of geostrophic
     # transport the same condition prescribes, and the reason the east face delivered -176 Sv
     # of inflow where +203 Sv of outflow was asked for.
-    exterior_η = BAROTROPIC_OBC && DATASET == "BSOSE" ?
+    exterior_η = BAROTROPIC_OBC && EXTERIOR_SSH && DATASET == "BSOSE" ?
                  bsose_exterior_free_surface(grid; dataset=dataset, dates=bc_dates,
                      reference_date=start_date) : 0
 
