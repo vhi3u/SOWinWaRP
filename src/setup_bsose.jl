@@ -1889,6 +1889,7 @@ function bsose_open_boundary_conditions(grid;
     penetrating_shortwave=false,
     tangential_bc_kind=:gradient,
     barotropic=false,
+    barotropic_faces=:zonal,
     balance_transports=true,
     exterior_free_surface=0,
     tangential_gravity_wave_speed=210.0,
@@ -2128,9 +2129,17 @@ function bsose_open_boundary_conditions(grid;
         # `balance_barotropic_transports!`: +3 Sv left in drains the domain, and Flather pays
         # for that with a free-surface offset large enough to reverse a face.
         if balance_transports
-            balanced = balance_barotropic_transports!(
+            # Only the faces that can actually pass flux take part. With `:zonal` the
+            # north/south depth-integrated flux is zero by construction, so including them
+            # would hand correction to faces that cannot carry it and leave west/east
+            # unbalanced -- and with the meridional faces shut, west and east are the only
+            # places the domain can conserve volume.
+            open_faces = barotropic_faces === :all ?
                 (west=U_west_transport, east=U_east_transport,
-                 south=V_south_transport, north=V_north_transport), grid)
+                 south=V_south_transport, north=V_north_transport) :
+                (west=U_west_transport, east=U_east_transport,
+                 south=nothing, north=nothing)
+            balanced = balance_barotropic_transports!(open_faces, grid)
             U_west_transport  = get(balanced, :west,  U_west_transport)
             U_east_transport  = get(balanced, :east,  U_east_transport)
             V_south_transport = get(balanced, :south, V_south_transport)
@@ -2139,9 +2148,23 @@ function bsose_open_boundary_conditions(grid;
             @info " -> barotropic transports left UNBALANCED (balance_transports = false)."
         end
 
-        V_bcs = FieldBoundaryConditions(grid, (Center(), Face(), nothing);
-            south=GravityWaveRadiationBoundaryCondition((V_south_transport, η_at(:south))),
-            north=GravityWaveRadiationBoundaryCondition((V_north_transport, η_at(:north))))
+        # Flather on all four faces by default; `:zonal` closes north/south barotropically.
+        #
+        # `:zonal` exists but is not recommended. See the long note on BAROTROPIC_FACES in
+        # src/model.jl: tools/inspect_bsose_boundaries.jl measures the north face carrying
+        # -31 Sv (18% of the zonal transport, feeding the +31 Sv by which east exceeds west),
+        # not the ~1% it was assumed to carry, so closing it imposes a real distortion rather
+        # than removing a spurious one. Keep it for the diagnostic case where you want the
+        # meridional exchange removed deliberately.
+        if barotropic_faces === :all
+            V_bcs = FieldBoundaryConditions(grid, (Center(), Face(), nothing);
+                south=GravityWaveRadiationBoundaryCondition((V_south_transport, η_at(:south))),
+                north=GravityWaveRadiationBoundaryCondition((V_north_transport, η_at(:north))))
+        elseif barotropic_faces === :zonal
+            @info " -> barotropic faces: west and east only; north/south depth-integrated flux held at zero."
+        else
+            error("Unknown barotropic_faces: $barotropic_faces. Choose :zonal or :all.")
+        end
 
         if !is_x_periodic
             U_bcs = FieldBoundaryConditions(grid, (Face(), Center(), nothing);

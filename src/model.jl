@@ -117,6 +117,36 @@ const BAROTROPIC_OBC = true
 # the boundary sees a 2 m error on the first step).
 const EXTERIOR_SSH = false
 
+# Which faces get a Flather condition: `:all` (west, east, north, south) or `:zonal`
+# (west and east only, north/south depth-integrated flux held at zero).
+#
+# `:zonal` was added on the theory that the north face was a pure error amplifier: large
+# area, almost no prescribed signal, so any (ηᵇ - ηᵉˣᵗ) error there becomes huge transport.
+# tools/inspect_bsose_boundaries.jl measured that theory against BSOSE directly and it does
+# not hold. On iteration 105, 2008-06 to 2009-01:
+#
+#     west +173.0   east +204.0   south +0.0   north -31.1 Sv     (monthly means)
+#     four-face net -0.007 Sv    west+east-only net +31.1 Sv
+#
+# The four faces balance to 0.007 Sv out of ~200 Sv gross, so BSOSE does conserve volume
+# here and the integral is trustworthy. But the north face carries -31 Sv, 18% of the zonal
+# transport, not the 1.3% previously assumed -- +31 Sv genuinely enters from the north and
+# leaves through the east, which is why east exceeds west by that much. Closing it forces
+# that 31 Sv to zero, a 12% distortion of the face-mean velocity.
+#
+# The area ratio was also wrong: north/(west+east) is 1.10x on BSOSE's mask, not 1.9x. The
+# 1.9x compared the north face to a single zonal face rather than to the pair.
+#
+# So `:all` stays the default. The sandbox result that motivated `:zonal` (a third of the
+# throughflow leaking away when north/south are opened) was measured with Vᵉˣᵗ = 0, where no
+# meridional flux should exist at all -- it is not the configuration the model runs, and it
+# does not justify closing a face that carries 31 Sv. The real failure to explain is north
+# reporting +213 to +219 Sv against a prescribed -31: an error of ~250 Sv, which points at
+# ηᵉˣᵗ on that face rather than at the face being open.
+#
+# Re-run the tool on iteration 156 over the actual window before trusting these numbers.
+const BAROTROPIC_FACES = :all
+
 # Open boundary matching scheme for the NORMAL flow: "ObliqueRadiation",
 # "PerturbationAdvection", "NormalRadiation", or "clamped".
 const OBC_SCHEME = "PerturbationAdvection"
@@ -364,7 +394,7 @@ if OBCS && DATASET == "BSOSE"
         penetrating_shortwave=SURFACE_FLUXES && PENETRATING_SHORTWAVE, scheme=obc_scheme,
         tangential_bc_kind=TANGENTIAL_BC, oblique_inflow_timescale=OBLIQUE_TAU_IN,
         oblique_outflow_timescale=OBLIQUE_TAU_OUT, reference_date=start_date,
-        barotropic=BAROTROPIC_OBC)
+        barotropic=BAROTROPIC_OBC, barotropic_faces=BAROTROPIC_FACES)
 
     if SPONGE_LAYERS
         sponge_timescale = 30days

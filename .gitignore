@@ -21,3 +21,4 @@ obc_tests/
 # Copernicus Marine credentials — never commit (see tools/README or .copernicus_env.example)
 .copernicus_env
 .copernicusmarine/
+tools/bsose_boundary_report/
