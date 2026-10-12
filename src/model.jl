@@ -50,7 +50,7 @@ end
 # Change it for each experiment so runs do not overwrite one another, then animate
 # the result with `./run_animate_simulation RUN_NAME`.
 # ==============================================================================
-const RUN_NAME = "8M_flather_ssh_eta0"
+const RUN_NAME = "14d_54021db_config"
 
 # flags
 
@@ -79,7 +79,7 @@ const SURFACE_FLUXES = true
 # bloom is gone. The |w| tripwire at day 1 keeps this from being a confounded test: with the
 # split on and everything else at baseline, |w| grew 6x over day 1 (0.012 -> 0.073) where the
 # baseline decayed it to 0.0076. That number arrives on day 1, long before the bloom does.
-const PENETRATING_SHORTWAVE = true
+const PENETRATING_SHORTWAVE = false
 
 const CHECKPOINTS = false # save state and restart if the model crashes. If false, the model will start from scratch.
 const BOUNDARY_DIAGNOSTICS = true # write free-surface height, boundary-face slices, and a per-face volume transport log
@@ -97,11 +97,11 @@ const BOUNDARY_DIAGNOSTICS = true # write free-surface height, boundary-face sli
 # margin, and a zero tells the boundary it is flat. SSH_bsoseI156_2013to2024_monthly.nc is the
 # fix and is not yet wired in. Read the face transports the barotropic setup now logs before
 # reading anything into the run: they should be west +180, east +205, north -25 Sv.
-const BAROTROPIC_OBC = true
+const BAROTROPIC_OBC = false
 
 # Open boundary matching scheme for the NORMAL flow: "ObliqueRadiation",
 # "PerturbationAdvection", "NormalRadiation", or "clamped".
-const OBC_SCHEME = "ObliqueRadiation"
+const OBC_SCHEME = "PerturbationAdvection"
 
 # Condition for the TANGENTIAL velocity (u on south/north, v on west/east). One of :oblique,
 # :oblique_boundary_velocity, :gradient, :clamped, :radiation, :radiation_boundary_velocity,
@@ -110,7 +110,7 @@ const OBC_SCHEME = "ObliqueRadiation"
 #
 # :oblique with OBC_SCHEME = "ObliqueRadiation" is the configuration the MAB sandbox runs —
 # the same two-dimensional radiation on the normal flow and the tangential component alike.
-const TANGENTIAL_BC = :oblique
+const TANGENTIAL_BC = :gradient
 
 # Nudging timescales for ObliqueRadiation, on inflow and on outflow (MAB's values). The
 # other schemes below use 1 day and Inf; the difference is deliberate.
@@ -211,13 +211,32 @@ end
 # BSOSE iteration 156 (HPC) covers 2013-2024; iteration 105 (local CPU) covers
 # 2008-2012, so a local test run needs dates inside that earlier range.
 # ==============================================================================
+# Fourteen days. This run exists to answer one question: does the configuration that was fast
+# and stable at 54021db (2026-09-27) still behave on the current packages?
+#
+# That commit ran PerturbationAdvection on the normal flow, GradientBoundaryCondition(0) on the
+# tangential, no barotropic condition, on Oceananigans 0.111.0 / NumericalEarth 0.7.0. Current
+# main had changed all three settings AND both packages, and every comparison since has been
+# treating the 54021db run as "the same thing minus the shortwave", which it never was.
+#
+# The flags below reproduce 54021db's boundary configuration on today's packages. Compare
+# |u|, |v|, |w| and Δt day-for-day against its log:
+#
+#     day  1:  |u| 0.91  |v| 0.91  |w| 0.0076   Δt  7.56 min
+#     day  6:  |u| 0.77  |v| 1.01  |w| 0.013    Δt  6.24 min
+#     day 13:  |u| 0.83  |v| 1.17  |w| 0.018    Δt 17.16 min
+#
+# Matching those means the schemes are what broke it and the package bump is innocent.
+# Still slow means the bump is implicated and the schemes are not the story.
+#
+# (Original eight-month header, for when this goes back to being a science run:)
 # Eight months, June 2014 to February 2015. The start matches 2YS6_surface_flux so that |u|,
 # |v|, |w| and Δt compare day-for-day against the log of a run that stayed stable, and the end
 # reaches past the warm bloom: January 2015 is where the baseline ran SST +7.02 C too warm
 # over a 3.1 m mixed layer against BSOSE's 21.8 m. Three questions, one run -- face transports
 # at startup, the |w| tripwire on day 1, the bloom around day 200.
 start_date = DateTime("2014-06-01")
-end_date = DateTime("2015-02-01")
+end_date = DateTime("2014-06-15")
 
 # option if need to do tests on CPU
 # start_date = DateTime("2009-06-01")
