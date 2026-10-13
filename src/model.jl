@@ -105,6 +105,11 @@ const PENETRATING_SHORTWAVE = true
 # oceQsw hack exists only because this file had no atmosphere.
 const ATMOSPHERE = :era5
 
+# How many ERA5 variables to request from CDS at once. The backend defaults to one thread per
+# variable -- six concurrent requests -- and CDS rejects the batch with "Number queued requests
+# for this dataset is temporarily limited". One at a time is what gets through.
+const ERA5_THREADS = 1
+
 # Derived: the BSOSE surface forcing is only used when there is no atmosphere.
 const BSOSE_WINDS     = WINDS && ATMOSPHERE === :none
 const BSOSE_FLUXES    = SURFACE_FLUXES && ATMOSPHERE === :none
@@ -210,6 +215,21 @@ const GLORYS_N_MATCH = 4
 # Initialise the interior from GLORYS as well, as 02 does. Driving the boundaries from GLORYS
 # while starting the interior from BSOSE puts a discontinuity at the boundary on day one.
 const GLORYS_INITIAL_CONDITIONS = true
+
+# Whether to remove the domain mean from the initial free surface.
+#
+# 02 does this (`η .-= mean(...)`) while feeding RAW `zos` to Flather. Those two cannot both be
+# the reference, and on this domain the gap is not small: the run logs a removed mean of
+# -0.893 m, and at the measured Flather sensitivity of ~5.1 Sv per cm on the zonal faces that
+# is roughly 450 Sv of disagreement between the interior and its own boundary on step one.
+#
+# That is precisely the failure that killed the BSOSE Flather runs -- ηᵉˣᵗ = 0 gave north +213
+# to +219 Sv, ηᵉˣᵗ = BSOSE gave -393 to -437, bracketing zero because the condition is too stiff
+# to absorb a datum error. 05 makes the same point and keeps both raw: "removing the domain mean
+# here would make the boundaries import or export that mean in the first few hours."
+#
+# For the MAB the mean is small enough that 02 gets away with it. Here it is not.
+const GLORYS_REMOVE_ETA_MEAN = false
 
 # Which faces get a Flather condition: `:all` (west, east, north, south) or `:zonal`
 # (west and east only, north/south depth-integrated flux held at zero).
@@ -679,7 +699,8 @@ if OBC_SOURCE === :glorys && GLORYS_INITIAL_CONDITIONS
     # t = 0 that the open conditions then have to argue with.
     @info "Initializing model state from GLORYS at $start_date (02's initial conditions)..."
     glorys_initial_conditions!(ocean.model; date=start_date, dataset=GLORYS_DATASET,
-                               region=glorys_obc.region)
+                               region=glorys_obc.region,
+                               remove_eta_mean=GLORYS_REMOVE_ETA_MEAN)
     fill_bathymetry_gaps!(parent(ocean.model.tracers.S), S_MIN_PHYSICAL, S_MAX_PHYSICAL)
     fill_bathymetry_gaps!(parent(ocean.model.tracers.T), T_MIN_PHYSICAL, T_MAX_PHYSICAL)
     @info "Model successfully initialized from GLORYS and filled bathymetric gaps."
@@ -753,6 +774,11 @@ if ATMOSPHERE === :era5
     @info """ -> ERA5 needs the CopernicusClimateDataStore backend and a CDS API key in \
               ~/.cdsapirc. That is a different account from the Copernicus Marine one GLORYS \
               uses; without it the download below will fail."""
+
+    # Serially first -- see `prefetch_era5!`. The constructors below download with one thread
+    # per variable, which CDS rejects outright.
+    prefetch_era5!(start_date = start_date, end_date = end_date,
+                   region = era5_region, dir = era5_dir, threads = ERA5_THREADS)
 
     atmosphere = ERA5PrescribedAtmosphere(arch;
         start_date = start_date, end_date = end_date,
