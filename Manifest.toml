@@ -2,7 +2,7 @@
 
 julia_version = "1.12.0"
 manifest_format = "2.0"
-project_hash = "42ea2e4d39edc22a9d2b469b99ad709c2da5945c"
+project_hash = "d6ed7e707f9d926ccb748697171bc897d52252d1"
 
 [[deps.AbstractFFTs]]
 deps = ["LinearAlgebra"]
@@ -479,6 +479,12 @@ weakdeps = ["IntervalSets", "LinearAlgebra", "StaticArrays"]
 git-tree-sha1 = "439e35b0b36e2e5881738abc8857bd92ad6ff9a8"
 uuid = "d38c429a-6771-53c6-b99e-75d170b6e991"
 version = "0.6.3"
+
+[[deps.CopernicusClimateDataStore]]
+deps = ["Base64", "Dates", "Downloads", "HTTP", "JSON3"]
+git-tree-sha1 = "570d63cfd81c4f6d9fc761134c99850b3e869876"
+uuid = "bce3f73f-acea-4481-bd86-df89ecc2cb46"
+version = "0.2.2"
 
 [[deps.CopernicusMarine]]
 deps = ["Downloads", "JSON3", "Scratch"]

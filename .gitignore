@@ -22,3 +22,5 @@ obc_tests/
 .copernicus_env
 .copernicusmarine/
 tools/bsose_boundary_report/
+.cdsapirc
+.cdsapi_env

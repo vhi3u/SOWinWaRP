@@ -6,6 +6,8 @@ using Oceananigans.Units
 using Oceananigans.Grids
 using NumericalEarth
 using NumericalEarth.ECCO
+using CopernicusMarine              # activates the GLORYS download backend
+using CopernicusClimateDataStore    # activates the ERA5 download backend (needs ~/.cdsapirc)
 using NumericalEarth.DataWrangling: all_dates
 using CUDA: has_cuda_gpu, allowscalar
 using NCDatasets
@@ -51,7 +53,7 @@ end
 # Change it for each experiment so runs do not overwrite one another, then animate
 # the result with `./run_animate_simulation RUN_NAME`.
 # ==============================================================================
-const RUN_NAME = "8M_glorys_obc"
+const RUN_NAME = "8M_glorys_era5"
 
 # flags
 
@@ -84,6 +86,29 @@ const SURFACE_FLUXES = true
 # split on and everything else at baseline, |w| grew 6x over day 1 (0.012 -> 0.073) where the
 # baseline decayed it to 0.0076. That number arrives on day 1, long before the bloom does.
 const PENETRATING_SHORTWAVE = true
+
+# Surface forcing: where the atmosphere comes from.
+#
+#   :era5   02_mab_glorys_obc.jl's choice. ERA5PrescribedAtmosphere + ERA5PrescribedRadiation,
+#           coupled through OceanOnlyModel, so the surface fluxes come from bulk formulae
+#           against a real atmosphere instead of being prescribed. Needs the
+#           CopernicusClimateDataStore backend AND a CDS API key in ~/.cdsapirc -- a different
+#           account from the Copernicus Marine one GLORYS uses.
+#   :none   BSOSE wind stress and surface heat/salt fluxes, as before.
+#
+# `:era5` turns the BSOSE surface forcing off: the coupler computes the stress and the heat and
+# salt fluxes itself, so leaving WINDS or SURFACE_FLUXES on would apply them twice.
+#
+# It also makes PENETRATING_SHORTWAVE work properly rather than through the oceQsw callback.
+# The `TwoColorRadiation` handed to `ocean_simulation` has always been there; what was missing
+# is anything to fill its surface flux, which is exactly what a coupled model does. The BSOSE
+# oceQsw hack exists only because this file had no atmosphere.
+const ATMOSPHERE = :era5
+
+# Derived: the BSOSE surface forcing is only used when there is no atmosphere.
+const BSOSE_WINDS     = WINDS && ATMOSPHERE === :none
+const BSOSE_FLUXES    = SURFACE_FLUXES && ATMOSPHERE === :none
+const BSOSE_SHORTWAVE = PENETRATING_SHORTWAVE && ATMOSPHERE === :none
 
 const CHECKPOINTS = false # save state and restart if the model crashes. If false, the model will start from scratch.
 const BOUNDARY_DIAGNOSTICS = true # write free-surface height, boundary-face slices, and a per-face volume transport log
@@ -429,7 +454,11 @@ if bsose_window_center(last(bc_dates)) < end_date
 end
 
 @info @sprintf("Simulating %s to %s (%.1f days)", start_date, end_date, simulation_days)
-@info "Boundary condition dates: $(length(bc_dates)) monthly records from $(bc_dates[1]) to $(bc_dates[end])"
+# `bc_dates` is BSOSE's. On the :glorys path it no longer feeds the open boundaries -- only
+# the wind stress, the surface heat and salt fluxes and oceQsw, which stay BSOSE. The GLORYS
+# boundary dates are selected separately and logged where they are built.
+@info "BSOSE forcing dates: $(length(bc_dates)) monthly records from $(bc_dates[1]) to $(bc_dates[end])" *
+      (OBC_SOURCE === :glorys ? " (surface forcing only; boundaries come from GLORYS)" : " (surface forcing and open boundaries)")
 @info "Model time zero corresponds to $start_date; all forcing is stepped on that clock."
 
 # ==============================================================================
@@ -437,22 +466,20 @@ end
 # ==============================================================================
 
 if OBCS && DATASET == "BSOSE"
-    @info "Configuring BSOSE Open Boundary Conditions with radiation scheme..."
-    # In an open-ocean regional domain with strong outflow (ACC carrying ~130 Sv eastward through 150°E),
-    # rigid Dirichlet boundaries reflect outgoing eddies and waves, leading to tracer blowup at the boundary.
-    # PerturbationAdvection / NormalRadiation with outflow_timescale=Inf allows internal waves/eddies to freely
-    # radiate out of the domain, while inflow_timescale=1days nudges incoming boundary flow (West) smoothly to BSOSE.
     if OBC_SOURCE === :glorys
+        @info "Configuring GLORYS Open Boundary Conditions (02_mab_glorys_obc.jl recipe)..."
         # 02_mab_glorys_obc.jl's construction. It makes its own choices for the normal,
         # tangential, tracer, barotropic and η conditions, so OBC_SCHEME, TANGENTIAL_BC,
         # BAROTROPIC_SCHEME, BAROTROPIC_FACES and EXTERIOR_SSH are unused on this path.
         # Our surface forcing is not part of that construction, so it is passed in.
-        wind_bcs = WINDS ? bsose_surface_wind_stress(grid; dataset=dataset, dates=bc_dates,
-                                                     reference_date=start_date) : nothing
-        flux_bcs = SURFACE_FLUXES ?
+        # On the ERA5 path these stay `nothing`: the coupler computes stress and the heat and
+        # salt fluxes from bulk formulae, so prescribing them here as well would double-count.
+        wind_bcs = BSOSE_WINDS ? bsose_surface_wind_stress(grid; dataset=dataset, dates=bc_dates,
+                                                           reference_date=start_date) : nothing
+        flux_bcs = BSOSE_FLUXES ?
             bsose_surface_tracer_fluxes(grid; dataset=dataset, dates=bc_dates,
                 reference_date=start_date,
-                subtract_shortwave=PENETRATING_SHORTWAVE) : nothing
+                subtract_shortwave=BSOSE_SHORTWAVE) : nothing
 
         # 02 writes `start_date : Day(1) : stop_date` because GLORYSDaily has a record on
         # every one of those days. A monthly product does not, so take its own stamps.
@@ -473,6 +500,11 @@ if OBCS && DATASET == "BSOSE"
         boundary_conditions = glorys_obc.boundary_conditions
         exterior_η = 0            # the GLORYS path initialises η in its own block below
     else
+        @info "Configuring BSOSE Open Boundary Conditions with radiation scheme..."
+        # In an open-ocean regional domain with strong outflow (ACC carrying ~130 Sv eastward through 150°E),
+        # rigid Dirichlet boundaries reflect outgoing eddies and waves, leading to tracer blowup at the boundary.
+        # PerturbationAdvection / NormalRadiation with outflow_timescale=Inf allows internal waves/eddies to freely
+        # radiate out of the domain, while inflow_timescale=1days nudges incoming boundary flow (West) smoothly to BSOSE.
         obc_scheme = if OBC_SCHEME == "ObliqueRadiation"
             ObliqueRadiation(inflow_timescale=OBLIQUE_TAU_IN, outflow_timescale=OBLIQUE_TAU_OUT)
         elseif OBC_SCHEME == "PerturbationAdvection"
@@ -615,7 +647,11 @@ end
 radiation = TwoColorRadiation(grid)
 update_shortwave! = nothing
 
-if PENETRATING_SHORTWAVE
+if PENETRATING_SHORTWAVE && ATMOSPHERE !== :none
+    @info """Penetrating shortwave is handled by the $(ATMOSPHERE) coupling: TwoColorRadiation's \
+             surface flux is filled by the coupled model, which is what the BSOSE oceQsw \
+             callback was standing in for. Not registering that callback."""
+elseif PENETRATING_SHORTWAVE
     if DATASET != "BSOSE"
         @warn "PENETRATING_SHORTWAVE is only wired up for BSOSE; ignoring it for $DATASET."
     elseif !SURFACE_FLUXES
@@ -693,12 +729,53 @@ import SeawaterPolynomials.TEOS10 as TEOS10_mod
     @inline s(Sᴬ::FT) where FT = √(max((Sᴬ + FT(ΔS)) / FT(Sₐᵤ), zero(FT)))
 end
 
+# ==============================================================================
+# Atmosphere
+#
+# 02_mab_glorys_obc.jl's surface forcing: a prescribed atmosphere and downwelling radiation,
+# coupled through `OceanOnlyModel`, so the stress and the heat and freshwater fluxes come from
+# bulk formulae against real atmospheric state rather than being prescribed fields.
+#
+# `OceanOnlyModel` wraps the ocean SIMULATION, and the simulation then steps the coupled model
+# rather than the ocean model directly. Everything that reaches into the model has to go
+# through `.ocean.model` from here on -- which is why the callbacks below close over
+# `ocean.model` instead of taking it from `sim.model`.
+# ==============================================================================
+stepped_model = ocean.model     # what Simulation steps; replaced below if there is an atmosphere
+
+if ATMOSPHERE === :era5
+    era5_dir = get(ENV, "ERA5_DIR", joinpath(default_bsose_directory(), "era5"))
+    mkpath(era5_dir)
+    era5_region = BoundingBox(longitude = (λ₁ - 1.0, λ₂ + 1.0), latitude = (φ₁ - 1.0, φ₂ + 1.0))
+
+    @info "Building ERA5 prescribed atmosphere and radiation ($(start_date) to $(end_date))..."
+    @info " -> ERA5 directory: $era5_dir"
+    @info """ -> ERA5 needs the CopernicusClimateDataStore backend and a CDS API key in \
+              ~/.cdsapirc. That is a different account from the Copernicus Marine one GLORYS \
+              uses; without it the download below will fail."""
+
+    atmosphere = ERA5PrescribedAtmosphere(arch;
+        start_date = start_date, end_date = end_date,
+        region = era5_region, dir = era5_dir)
+
+    surface_radiation = ERA5PrescribedRadiation(arch;
+        start_date = start_date, end_date = end_date,
+        region = era5_region, dir = era5_dir)
+
+    stepped_model = OceanOnlyModel(ocean; atmosphere, radiation = surface_radiation)
+    @info "Coupled OceanOnlyModel built: surface fluxes now come from ERA5 bulk formulae."
+elseif ATMOSPHERE !== :none
+    error("Unknown ATMOSPHERE: $ATMOSPHERE. Choose :era5 or :none.")
+else
+    @info "No atmosphere: surface forcing is BSOSE wind stress and prescribed heat/salt fluxes."
+end
+
 # some housekeeping to set up the simulation (progress checks and adaptive timestep)
 
 # The run length comes from start_date and end_date; STOP_ITERATION can cut it short.
 # Start with a very small Δt so the first CATKE evaluation is numerically gentle;
 # the wizard will ramp this up within a few iterations.
-simulation = Simulation(ocean.model, Δt=1seconds,
+simulation = Simulation(stepped_model, Δt=1seconds,
     stop_time=Float64(simulation_seconds),
     stop_iteration=STOP_ITERATION)
 
@@ -746,10 +823,30 @@ end
 # output and progress interval (daily)
 output_interval = 1days
 
-# progress logger: Oceanostics TimedMessenger reports wall-clock timing,
-# max velocities and CFL/diffusive stability numbers each interval.
-progress = TimedMessenger()
-simulation.callbacks[:progress] = Callback(progress, TimeInterval(output_interval))
+# Wall-clock reference for the coupled progress messenger below (hoisted out of the branch:
+# a `const` inside a conditional is asking for trouble).
+const PROGRESS_WALL = Ref(time_ns())
+
+# progress logger. Oceanostics' TimedMessenger reads `sim.model.velocities`, which on the
+# coupled path is the EarthSystemModel and has none -- so there it is replaced by a messenger
+# that closes over the ocean model. The BSOSE path keeps TimedMessenger so its logs stay
+# comparable with every earlier run.
+if ATMOSPHERE === :none
+    progress = TimedMessenger()
+    simulation.callbacks[:progress] = Callback(progress, TimeInterval(output_interval))
+else
+    function coupled_progress(sim)
+        m = ocean.model
+        u, v, w = m.velocities
+        elapsed = (time_ns() - PROGRESS_WALL[]) / 1e9
+        PROGRESS_WALL[] = time_ns()
+        @info @sprintf("iter = %6d, time = %s, Δt = %s, walltime = %.1f s | |u⃗|ₘₐₓ = [%.2e, %.2e, %.2e] m/s",
+            iteration(sim), prettytime(m.clock.time), prettytime(sim.Δt), elapsed,
+            maximum(abs, u), maximum(abs, v), maximum(abs, w))
+        flush(stdout)
+    end
+    simulation.callbacks[:progress] = Callback(coupled_progress, TimeInterval(output_interval))
+end
 
 # With Dirichlet open boundaries there is no wave radiation, so any net
 # volume-flux imbalance across the four faces accumulates in the free surface.
@@ -870,7 +967,7 @@ if BOUNDARY_DIAGNOSTICS
         gross = abs(west) + abs(east) + abs(south) + abs(north)
         residual = gross == 0 ? 0.0 : 100 * abs(net) / gross
 
-        η = sim.model.free_surface.displacement
+        η = ocean.model.free_surface.displacement
         @info @sprintf("        transport (Sv): W %+8.2f | E %+8.2f | S %+8.2f | N %+8.2f || net out %+8.3f (%.2f%% of gross)",
             west, east, south, north, net, residual)
         @info @sprintf("        free surface  : mean η = %+.4f m, max|η| = %.4f m",

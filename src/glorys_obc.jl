@@ -66,7 +66,7 @@ using NumericalEarth.DataWrangling: Metadata, MetadataSet, BoundingBox, z_interf
 using Oceananigans.BoundaryConditions: PerturbationAdvection, NormalRadiation,
                                        GravityWaveRadiationBoundaryCondition,
                                        SurfaceWaveRadiationBoundaryCondition
-using Oceananigans.Grids: znodes
+using Oceananigans.Grids: znodes, halo_size
 using Statistics: mean
 
 """
@@ -80,6 +80,25 @@ function glorys_directory()
     dir = joinpath(default_bsose_directory(), "glorys")
     mkpath(dir)
     return dir
+end
+
+
+"""
+    host_bottom_height(x, Nx, Ny; halo = (0, 0))
+
+The `(Nx, Ny)` interior of a bottom-height field, on the host.
+
+`regrid_bathymetry` hands back a `Field`, but the one stored inside an `ImmersedBoundaryGrid`
+is a bare `OffsetArray` -- and on the GPU that wraps a `CuArray`. `view`ing the OffsetArray and
+then calling `Array` on the view does not reach the GPU copy machinery: it iterates element by
+element and throws "Scalar indexing is disallowed". So the device-to-host copy is taken on
+`parent`, which is contiguous, and the halo is stripped afterwards.
+"""
+function host_bottom_height(x, Nx, Ny; halo = (0, 0))
+    x isa Field && return reshape(Array(interior(x, :, :, 1)), Nx, Ny)
+    host = Array(parent(x))                       # one contiguous device-to-host copy
+    Hx, Hy = halo
+    return reshape(host[Hx .+ (1:Nx), Hy .+ (1:Ny), 1], Nx, Ny)
 end
 
 
@@ -140,9 +159,7 @@ function match_boundary_bathymetry!(bottom_height, grid; dir = glorys_directory(
     Nx, Ny, = size(grid)
     Hg = glorys_deptho_on_grid(grid; dir, region)
 
-    h = Array(bottom_height isa Field ? interior(bottom_height, :, :, 1) :
-                                        view(bottom_height, 1:Nx, 1:Ny, 1))
-    h = reshape(h, Nx, Ny)
+    h = host_bottom_height(bottom_height, Nx, Ny; halo = halo_size(grid)[1:2])
 
     changed, Σδ = 0, 0.0
     for j in 1:Ny, i in 1:Nx
@@ -272,12 +289,10 @@ function glorys_open_boundary_conditions(grid;
     zc_src = 0.5 .* (zi[1:end-1] .+ zi[2:end])
     Δz_src = diff(zi)
 
-    bh = if grid isa ImmersedBoundaryGrid
-        b = grid.immersed_boundary.bottom_height
-        reshape(Array(b isa Field ? interior(b, :, :, 1) : view(b, 1:Nx, 1:Ny, 1)), Nx, Ny)
-    else
-        zeros(Nx, Ny)
-    end
+    bh = grid isa ImmersedBoundaryGrid ?
+          host_bottom_height(grid.immersed_boundary.bottom_height, Nx, Ny;
+                             halo = halo_size(underlying)[1:2]) :
+          zeros(Nx, Ny)
     floors = ((bh[1, :], bh[end, :]),       # (west, east) rows      -- u boundaries
               (bh[:, 1], bh[:, end]))       # (south, north) columns -- v boundaries
 
