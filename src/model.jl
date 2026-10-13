@@ -22,6 +22,7 @@ using Oceanostics.ProgressMessengers: TimedMessenger
 
 # Include our BSOSE helper module
 include("setup_bsose.jl")
+include("glorys_obc.jl")
 
 import CUDA
 
@@ -50,12 +51,15 @@ end
 # Change it for each experiment so runs do not overwrite one another, then animate
 # the result with `./run_animate_simulation RUN_NAME`.
 # ==============================================================================
-const RUN_NAME = "8M_pa_gradient_bt_pinned"
+const RUN_NAME = "8M_glorys_obc"
 
 # flags
 
 const OBCS = true # open boundary conditions (NormalFlow with PerturbationAdvection)
-const SPONGE_LAYERS = true # sponge layer restoring (DatasetRestoring) near open boundary edges
+# 02_mab_glorys_obc.jl removes the interior restoring deliberately -- "the boundary condition
+# is the only thing communicating with the outside" -- so OBC_SOURCE = :glorys turns the sponge
+# off to match. 05 keeps one as an option, default off. Set back to `true` to A/B it.
+const SPONGE_LAYERS = false # sponge layer restoring (DatasetRestoring) near open boundary edges
 const WINDS = true # time-varying surface wind forcing from BSOSE data (oceTAUX and oceTAUY)
 # Surface heat and salt fluxes from BSOSE (TFLUX and SFLUX). Without these the ocean exchanges
 # nothing with the atmosphere but momentum: it cannot cool in winter or warm in summer, and its
@@ -140,6 +144,47 @@ const EXTERIOR_SSH = false
 # materialised once, so it is the time mean: the seasonal swing of the net is given up, the
 # shape and all baroclinic structure are not.
 const BAROTROPIC_SCHEME = :pinned
+
+# Where the open boundaries get their data, and how they are built.
+#
+#   :glorys  NumericalEarth's 02_mab_glorys_obc.jl, in src/glorys_obc.jl: GLORYS read through
+#            `Interpolated` on a source grid that brackets the model. Normal u/v get
+#            PerturbationAdvection; tangential u/v AND tracers get NormalRadiation, all fed
+#            real exterior values. Barotropic: Flather on the true depth mean over GLORYS's
+#            own 50 levels times the model's wet depth. η: Chapman, explicit on all four faces.
+#   :bsose   everything this file built before -- cached boundary slices, the hand-rolled
+#            barotropic transport, and BAROTROPIC_SCHEME / BAROTROPIC_FACES / EXTERIOR_SSH.
+#
+# `:glorys` ignores OBC_SCHEME, TANGENTIAL_BC, BAROTROPIC_SCHEME, BAROTROPIC_FACES and
+# EXTERIOR_SSH -- it makes every one of those choices itself, as that script does.
+const OBC_SOURCE = :glorys
+
+# Which GLORYS product drives the boundaries. 02 uses `GLORYSDaily()` over a 12x8 degree box
+# for ten days. This domain is 60x25 degrees for eight months: daily would be ~250 records and
+# tens of GB, monthly is 11 records. Swap to `GLORYSDaily()` for eddy-resolving boundary
+# forcing when the storage is there.
+const GLORYS_DATASET = GLORYSMonthly()
+
+# 02's MAB_UEXT. `:native` is its default and the mode it validated; `:masked` and `:legacy`
+# exist for the A/B that `report_uext` prints at startup.
+const GLORYS_UEXT_MODE = :native
+
+# 02's MAB_TANGENTIAL: `:radiated` (its default) or `:prescribed`.
+const GLORYS_TANGENTIAL = :radiated
+
+# 02's MAB_TAU_IN: the inflow nudging timescale shared by the normal, tangential and tracer
+# schemes. Outflow is Inf throughout, so outgoing features leave freely.
+const GLORYS_TAU_IN = 1days
+
+# 02's MAB_MATCH_BATHY / MAB_N_MATCH. The only thing here that changes the bathymetry, and it
+# touches a 4-cell band at the open edges only. U = ∫u dz, so a depth mismatch at the boundary
+# is a transport error no matter how carefully Uᵉˣᵗ is built.
+const GLORYS_MATCH_BATHY = true
+const GLORYS_N_MATCH = 4
+
+# Initialise the interior from GLORYS as well, as 02 does. Driving the boundaries from GLORYS
+# while starting the interior from BSOSE puts a discontinuity at the boundary on day one.
+const GLORYS_INITIAL_CONDITIONS = true
 
 # Which faces get a Flather condition: `:all` (west, east, north, south) or `:zonal`
 # (west and east only, north/south depth-integrated flux held at zero).
@@ -253,6 +298,14 @@ bottom_height = regrid_bathymetry(grid,
     height_above_water=1,
     minimum_depth=10,
     interpolation_passes=5)
+
+# 02's MAB_MATCH_BATHY. Must happen before the immersed grid is built, since that is what
+# freezes the wet column the barotropic transport is computed over.
+if OBC_SOURCE === :glorys && GLORYS_MATCH_BATHY
+    match_boundary_bathymetry!(bottom_height, grid;
+        region = BoundingBox(longitude = (λ₁ - 1.0, λ₂ + 1.0), latitude = (φ₁ - 1.0, φ₂ + 1.0)),
+        n_match = GLORYS_N_MATCH, minimum_depth = 10)
+end
 
 grid = ImmersedBoundaryGrid(grid, GridFittedBottom(bottom_height))
 
@@ -389,37 +442,68 @@ if OBCS && DATASET == "BSOSE"
     # rigid Dirichlet boundaries reflect outgoing eddies and waves, leading to tracer blowup at the boundary.
     # PerturbationAdvection / NormalRadiation with outflow_timescale=Inf allows internal waves/eddies to freely
     # radiate out of the domain, while inflow_timescale=1days nudges incoming boundary flow (West) smoothly to BSOSE.
-    obc_scheme = if OBC_SCHEME == "ObliqueRadiation"
-        ObliqueRadiation(inflow_timescale=OBLIQUE_TAU_IN, outflow_timescale=OBLIQUE_TAU_OUT)
-    elseif OBC_SCHEME == "PerturbationAdvection"
-        PerturbationAdvection(inflow_timescale=1days, outflow_timescale=Inf)
-    elseif OBC_SCHEME == "NormalRadiation"
-        NormalRadiation(inflow_timescale=1days, outflow_timescale=Inf)
-    elseif OBC_SCHEME == "clamped" || OBC_SCHEME == "none"
-        nothing
+    if OBC_SOURCE === :glorys
+        # 02_mab_glorys_obc.jl's construction. It makes its own choices for the normal,
+        # tangential, tracer, barotropic and η conditions, so OBC_SCHEME, TANGENTIAL_BC,
+        # BAROTROPIC_SCHEME, BAROTROPIC_FACES and EXTERIOR_SSH are unused on this path.
+        # Our surface forcing is not part of that construction, so it is passed in.
+        wind_bcs = WINDS ? bsose_surface_wind_stress(grid; dataset=dataset, dates=bc_dates,
+                                                     reference_date=start_date) : nothing
+        flux_bcs = SURFACE_FLUXES ?
+            bsose_surface_tracer_fluxes(grid; dataset=dataset, dates=bc_dates,
+                reference_date=start_date,
+                subtract_shortwave=PENETRATING_SHORTWAVE) : nothing
+
+        # 02 writes `start_date : Day(1) : stop_date` because GLORYSDaily has a record on
+        # every one of those days. A monthly product does not, so take its own stamps.
+        glorys_dates = glorys_boundary_dates(start_date, end_date; dataset = GLORYS_DATASET)
+        @info "GLORYS boundary dates: $(length(glorys_dates)) records from $(first(glorys_dates)) to $(last(glorys_dates))"
+
+        glorys_obc = glorys_open_boundary_conditions(grid;
+            dates = glorys_dates,
+            dataset = GLORYS_DATASET,
+            tau_in = GLORYS_TAU_IN,
+            uext_mode = GLORYS_UEXT_MODE,
+            tangential = GLORYS_TANGENTIAL,
+            top_u = wind_bcs === nothing ? nothing : wind_bcs.u,
+            top_v = wind_bcs === nothing ? nothing : wind_bcs.v,
+            top_T = flux_bcs === nothing ? nothing : flux_bcs.T,
+            top_S = flux_bcs === nothing ? nothing : flux_bcs.S)
+
+        boundary_conditions = glorys_obc.boundary_conditions
+        exterior_η = 0            # the GLORYS path initialises η in its own block below
     else
-        error("Unknown OBC_SCHEME: $OBC_SCHEME. Choose 'ObliqueRadiation', 'PerturbationAdvection', 'NormalRadiation', or 'clamped'.")
+        obc_scheme = if OBC_SCHEME == "ObliqueRadiation"
+            ObliqueRadiation(inflow_timescale=OBLIQUE_TAU_IN, outflow_timescale=OBLIQUE_TAU_OUT)
+        elseif OBC_SCHEME == "PerturbationAdvection"
+            PerturbationAdvection(inflow_timescale=1days, outflow_timescale=Inf)
+        elseif OBC_SCHEME == "NormalRadiation"
+            NormalRadiation(inflow_timescale=1days, outflow_timescale=Inf)
+        elseif OBC_SCHEME == "clamped" || OBC_SCHEME == "none"
+            nothing
+        else
+            error("Unknown OBC_SCHEME: $OBC_SCHEME. Choose 'ObliqueRadiation', 'PerturbationAdvection', 'NormalRadiation', or 'clamped'.")
+        end
+        @info "  -> OBC Scheme: $(obc_scheme === nothing ? "Clamped Dirichlet" : summary(obc_scheme))"
+        @info "  -> Tangential velocity condition: $TANGENTIAL_BC"
+
+        # Exterior sea surface for the Flather condition. Without it ηᵉˣᵗ is 0, which tells every
+        # open face the sea surface is flat -- inconsistent with the 200 Sv of geostrophic
+        # transport the same condition prescribes, and the reason the east face delivered -176 Sv
+        # of inflow where +203 Sv of outflow was asked for.
+        exterior_η = BAROTROPIC_OBC && EXTERIOR_SSH && DATASET == "BSOSE" ?
+                     bsose_exterior_free_surface(grid; dataset=dataset, dates=bc_dates,
+                         reference_date=start_date) : 0
+
+        boundary_conditions = bsose_open_boundary_conditions(grid; dataset=dataset, dates=bc_dates,
+            exterior_free_surface=exterior_η,
+            winds=WINDS, surface_fluxes=SURFACE_FLUXES,
+            penetrating_shortwave=SURFACE_FLUXES && PENETRATING_SHORTWAVE, scheme=obc_scheme,
+            tangential_bc_kind=TANGENTIAL_BC, oblique_inflow_timescale=OBLIQUE_TAU_IN,
+            oblique_outflow_timescale=OBLIQUE_TAU_OUT, reference_date=start_date,
+            barotropic=BAROTROPIC_OBC, barotropic_faces=BAROTROPIC_FACES,
+            barotropic_scheme=BAROTROPIC_SCHEME)
     end
-    @info "  -> OBC Scheme: $(obc_scheme === nothing ? "Clamped Dirichlet" : summary(obc_scheme))"
-
-    @info "  -> Tangential velocity condition: $TANGENTIAL_BC"
-
-    # Exterior sea surface for the Flather condition. Without it ηᵉˣᵗ is 0, which tells every
-    # open face the sea surface is flat -- inconsistent with the 200 Sv of geostrophic
-    # transport the same condition prescribes, and the reason the east face delivered -176 Sv
-    # of inflow where +203 Sv of outflow was asked for.
-    exterior_η = BAROTROPIC_OBC && EXTERIOR_SSH && DATASET == "BSOSE" ?
-                 bsose_exterior_free_surface(grid; dataset=dataset, dates=bc_dates,
-                     reference_date=start_date) : 0
-
-    boundary_conditions = bsose_open_boundary_conditions(grid; dataset=dataset, dates=bc_dates,
-        exterior_free_surface=exterior_η,
-        winds=WINDS, surface_fluxes=SURFACE_FLUXES,
-        penetrating_shortwave=SURFACE_FLUXES && PENETRATING_SHORTWAVE, scheme=obc_scheme,
-        tangential_bc_kind=TANGENTIAL_BC, oblique_inflow_timescale=OBLIQUE_TAU_IN,
-        oblique_outflow_timescale=OBLIQUE_TAU_OUT, reference_date=start_date,
-        barotropic=BAROTROPIC_OBC, barotropic_faces=BAROTROPIC_FACES,
-        barotropic_scheme=BAROTROPIC_SCHEME)
 
     if SPONGE_LAYERS
         sponge_timescale = 30days
@@ -553,7 +637,17 @@ ocean = ocean_simulation(grid;
 
 # initial conditions based on either BSOSE or the other datasets
 
-if DATASET == "BSOSE"
+if OBC_SOURCE === :glorys && GLORYS_INITIAL_CONDITIONS
+    # 02 initialises the interior from the same dataset that drives the boundaries. Mixing
+    # them -- GLORYS at the edges, BSOSE inside -- puts a discontinuity on the boundary at
+    # t = 0 that the open conditions then have to argue with.
+    @info "Initializing model state from GLORYS at $start_date (02's initial conditions)..."
+    glorys_initial_conditions!(ocean.model; date=start_date, dataset=GLORYS_DATASET,
+                               region=glorys_obc.region)
+    fill_bathymetry_gaps!(parent(ocean.model.tracers.S), S_MIN_PHYSICAL, S_MAX_PHYSICAL)
+    fill_bathymetry_gaps!(parent(ocean.model.tracers.T), T_MIN_PHYSICAL, T_MAX_PHYSICAL)
+    @info "Model successfully initialized from GLORYS and filled bathymetric gaps."
+elseif DATASET == "BSOSE"
     bsose_initial_conditions!(ocean.model; dataset=dataset, date=start_date, velocities=true)
 
     # Initialise the free surface too. Setting u, v, T, S from BSOSE while leaving η flat is
