@@ -53,7 +53,7 @@ end
 # Change it for each experiment so runs do not overwrite one another, then animate
 # the result with `./run_animate_simulation RUN_NAME`.
 # ==============================================================================
-const RUN_NAME = "8M_glorys_era5"
+const RUN_NAME = "20D_glorys_pinned"
 
 # flags
 
@@ -62,11 +62,11 @@ const OBCS = true # open boundary conditions (NormalFlow with PerturbationAdvect
 # is the only thing communicating with the outside" -- so OBC_SOURCE = :glorys turns the sponge
 # off to match. 05 keeps one as an option, default off. Set back to `true` to A/B it.
 const SPONGE_LAYERS = false # sponge layer restoring (DatasetRestoring) near open boundary edges
-const WINDS = true # time-varying surface wind forcing from BSOSE data (oceTAUX and oceTAUY)
+const WINDS = false # time-varying surface wind forcing from BSOSE data (oceTAUX and oceTAUY)
 # Surface heat and salt fluxes from BSOSE (TFLUX and SFLUX). Without these the ocean exchanges
 # nothing with the atmosphere but momentum: it cannot cool in winter or warm in summer, and its
 # surface temperature drifts away from BSOSE as water crosses the domain.
-const SURFACE_FLUXES = true
+const SURFACE_FLUXES = false
 
 # Distribute the solar part of the surface heat flux through the water column by Beer's law
 # instead of depositing all of it in the top cell.
@@ -85,7 +85,7 @@ const SURFACE_FLUXES = true
 # bloom is gone. The |w| tripwire at day 1 keeps this from being a confounded test: with the
 # split on and everything else at baseline, |w| grew 6x over day 1 (0.012 -> 0.073) where the
 # baseline decayed it to 0.0076. That number arrives on day 1, long before the bloom does.
-const PENETRATING_SHORTWAVE = true
+const PENETRATING_SHORTWAVE = false
 
 # Surface forcing: where the atmosphere comes from.
 #
@@ -103,7 +103,7 @@ const PENETRATING_SHORTWAVE = true
 # The `TwoColorRadiation` handed to `ocean_simulation` has always been there; what was missing
 # is anything to fill its surface flux, which is exactly what a coupled model does. The BSOSE
 # oceQsw hack exists only because this file had no atmosphere.
-const ATMOSPHERE = :era5
+const ATMOSPHERE = :none
 
 # How many ERA5 variables to request from CDS at once. The backend defaults to one thread per
 # variable -- six concurrent requests -- and CDS rejects the batch with "Number queued requests
@@ -201,6 +201,19 @@ const GLORYS_UEXT_MODE = :native
 
 # 02's MAB_TANGENTIAL: `:radiated` (its default) or `:prescribed`.
 const GLORYS_TANGENTIAL = :radiated
+
+# Pin the depth-integrated transport through each face.
+#
+# Flather prescribes the Riemann invariant, not transport, so the net through a face is only
+# as good as ηᵉˣᵗ -- 5.1 Sv per cm of error on the zonal faces here, 9.5 on the north. Water
+# the condition will not pass has to go somewhere, and that somewhere is the western and
+# eastern edges. `target_transport` rescales each face uniformly after every barotropic
+# substep so its integral matches: Flather keeps the shape, the pin fixes the net.
+#
+# This combination -- PerturbationAdvection on the 3-D normal flow plus a pinned barotropic
+# transport -- has not been run before. The pinning was built for the BSOSE path
+# (BAROTROPIC_SCHEME) which OBC_SOURCE = :glorys bypasses entirely.
+const GLORYS_PIN_TRANSPORT = true
 
 # 02's MAB_TAU_IN: the inflow nudging timescale shared by the normal, tangential and tracer
 # schemes. Outflow is Inf throughout, so outgoing features leave freely.
@@ -424,7 +437,7 @@ end
 # over a 3.1 m mixed layer against BSOSE's 21.8 m. Three questions, one run -- face transports
 # at startup, the |w| tripwire on day 1, the bloom around day 200.
 start_date = DateTime("2014-06-01")
-end_date = DateTime("2015-02-01")
+end_date = DateTime("2014-06-21")   # 20 days: a boundary test, not a science run
 
 # option if need to do tests on CPU
 # start_date = DateTime("2009-06-01")
@@ -512,6 +525,7 @@ if OBCS && DATASET == "BSOSE"
             tau_in = GLORYS_TAU_IN,
             uext_mode = GLORYS_UEXT_MODE,
             tangential = GLORYS_TANGENTIAL,
+            pin_transport = GLORYS_PIN_TRANSPORT,
             top_u = wind_bcs === nothing ? nothing : wind_bcs.u,
             top_v = wind_bcs === nothing ? nothing : wind_bcs.v,
             top_T = flux_bcs === nothing ? nothing : flux_bcs.T,
@@ -793,7 +807,9 @@ if ATMOSPHERE === :era5
 elseif ATMOSPHERE !== :none
     error("Unknown ATMOSPHERE: $ATMOSPHERE. Choose :era5 or :none.")
 else
-    @info "No atmosphere: surface forcing is BSOSE wind stress and prescribed heat/salt fluxes."
+    @info @sprintf("No atmosphere. Surface forcing: winds %s, heat/salt fluxes %s, penetrating shortwave %s.",
+                   BSOSE_WINDS ? "BSOSE" : "OFF", BSOSE_FLUXES ? "BSOSE" : "OFF",
+                   BSOSE_SHORTWAVE ? "ON" : "OFF")
 end
 
 # some housekeeping to set up the simulation (progress checks and adaptive timestep)

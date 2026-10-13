@@ -237,6 +237,7 @@ function glorys_open_boundary_conditions(grid;
                                          tau_in = 1days,
                                          uext_mode = :native,
                                          tangential = :radiated,
+                                         pin_transport = true,
                                          top_u = nothing, top_v = nothing,
                                          top_T = nothing, top_S = nothing)
 
@@ -516,12 +517,66 @@ function glorys_open_boundary_conditions(grid;
         north = ValueBoundaryCondition(Interpolated(fts); scheme = tracer_scheme),
         maybe_top(top)...)
 
+    # ---------------------------------------------------------------------------
+    # Pinning the barotropic transport.
+    #
+    # Flather alone does not prescribe transport. It prescribes the Riemann invariant
+    # Uᵇ - √(gH)ηᵇ, so the net through a face is only as good as ηᵉˣᵗ, and the stiffness on this
+    # domain is severe -- measured at 5.1 Sv per cm of (ηᵇ - ηᵉˣᵗ) error on the zonal faces and
+    # 9.5 Sv/cm on the north face. Water the condition cannot pass has to go somewhere, and
+    # where it goes is up against the western and eastern edges.
+    #
+    # `target_transport` closes that loop. After the Flather fill of every barotropic substep
+    # Oceananigans shifts the face transport uniformly so its integral matches the target: the
+    # Flather profile still sets the SHAPE along the face, but the free surface can no longer
+    # change the NET. Radiation is retained, unlike a plain Dirichlet.
+    #
+    # The targets must close to zero or the pinned net is a permanent volume source and η ramps
+    # linearly forever, so the residual is distributed over the open faces by area.
+    #
+    # The target is materialised once when the free surface is built, so it is a constant per
+    # face. That is the one thing given up: the seasonal swing of the net (GLORYS puts west at
+    # +153 to +210 Sv over the year) is replaced by its mean. Shape and all baroclinic structure
+    # still vary in time.
+    targets = Dict(:west => 0.0, :east => 0.0, :south => 0.0, :north => 0.0)
+    if pin_transport
+        mean_face(slabs, side) = begin
+            widths, _ = face_geometry(side, grid)
+            N = length(widths)
+            at(slab, n) = slab[clamp(n + n_pad, 1, length(slab))]
+            sum(sum(at(sl, n) * widths[n] for n in 1:N) for sl in slabs) / length(slabs)
+        end
+        targets[:west]  = mean_face(U_lo, :west)
+        targets[:east]  = mean_face(U_hi, :east)
+        targets[:south] = mean_face(V_lo, :south)
+        targets[:north] = mean_face(V_hi, :north)
+
+        outward = (west = -1.0, east = +1.0, south = -1.0, north = +1.0)
+        # `face_geometry` returns (widths, depths); the wet area is their elementwise product.
+        face_area(side) = (g = face_geometry(side, grid); sum(g[1] .* g[2]))
+        areas = Dict(s => face_area(s) for s in keys(targets))
+        open_sides = [s for s in (:west, :east, :south, :north) if areas[s] > 0]
+        net = sum(outward[s] * targets[s] for s in open_sides)
+        total_area = sum(areas[s] for s in open_sides)
+        for s in open_sides
+            targets[s] -= outward[s] * net * areas[s] / total_area
+        end
+
+        @info @sprintf(" -> barotropic transport PINNED. Targets (Sv): W %+.2f, E %+.2f, S %+.2f, N %+.2f; net %+.2e",
+            targets[:west]/1e6, targets[:east]/1e6, targets[:south]/1e6, targets[:north]/1e6,
+            sum(outward[s] * targets[s] for s in open_sides)/1e6)
+    else
+        @info " -> barotropic transport NOT pinned: Flather alone sets the net."
+    end
+
+    tt(side) = pin_transport ? targets[side] : nothing
+
     U_bcs = FieldBoundaryConditions(grid, (Face(), Center(), nothing);
-        west = GravityWaveRadiationBoundaryCondition((U_west_ext,  η_west_ext)),
-        east = GravityWaveRadiationBoundaryCondition((U_east_ext,  η_east_ext)))
+        west = GravityWaveRadiationBoundaryCondition((U_west_ext,  η_west_ext);  target_transport = tt(:west)),
+        east = GravityWaveRadiationBoundaryCondition((U_east_ext,  η_east_ext);  target_transport = tt(:east)))
     V_bcs = FieldBoundaryConditions(grid, (Center(), Face(), nothing);
-        south = GravityWaveRadiationBoundaryCondition((V_south_ext, η_south_ext)),
-        north = GravityWaveRadiationBoundaryCondition((V_north_ext, η_north_ext)))
+        south = GravityWaveRadiationBoundaryCondition((V_south_ext, η_south_ext); target_transport = tt(:south)),
+        north = GravityWaveRadiationBoundaryCondition((V_north_ext, η_north_ext); target_transport = tt(:north)))
     η_bcs = FieldBoundaryConditions(grid, (Center(), Center(), Face());
         west  = SurfaceWaveRadiationBoundaryCondition(), east  = SurfaceWaveRadiationBoundaryCondition(),
         south = SurfaceWaveRadiationBoundaryCondition(), north = SurfaceWaveRadiationBoundaryCondition())
