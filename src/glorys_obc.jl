@@ -49,7 +49,8 @@
 # inside a fixed, already-downloaded GLORYS box. GLORYS is global and we download what we ask
 # for, so we instead keep the model domain fixed and extend the SOURCE outward by `n_pad`
 # cells. The index relation is identical -- source index s along a boundary is model index
-# s − n_pad -- so `lerp_slab`, `wet_transport` and `boundary_columns` carry over unchanged.
+# s − n_pad -- so `wet_transport` and `boundary_columns` carry over unchanged, and that is
+# also the mapping used when the slabs are turned into per-face `FieldTimeSeries` below.
 #
 # RECONSTRUCTED: `match_boundary_bathymetry!`. 02 calls it from `glorys_bathymetry.jl`, which
 # was not provided, so it is rebuilt here from that script's description of it: blend the model
@@ -337,6 +338,7 @@ function glorys_open_boundary_conditions(grid;
 
     # ---------------- "native" mode: the true depth mean on GLORYS's OWN vertical grid -------
     local fts_u_native, fts_v_native, true_floors, zc_nat, Δz_nat
+    local tU, U_lo, U_hi, tV, V_lo, V_hi
     if uext_mode === :native
         z_native = z_interfaces(meta(:u_velocity))
         Nz_native = length(z_native) - 1
@@ -431,26 +433,51 @@ function glorys_open_boundary_conditions(grid;
         p = n_pad + 1
         (A[p, :], A[end-n_pad, :], A[:, p], A[:, end-n_pad])   # west, east, south, north
     end
+    η_w = [sl[1] for sl in η_slabs]
+    η_e = [sl[2] for sl in η_slabs]
+    η_s = [sl[3] for sl in η_slabs]
+    η_n = [sl[4] for sl in η_slabs]
 
-    @inline function frame(times, t)
-        t <= times[1]   && return (1, 1, 0.0)
-        t >= times[end] && return (length(times), length(times), 0.0)
-        n = searchsortedlast(times, t)
-        return (n, n + 1, (t - times[n]) / (times[n+1] - times[n]))
-    end
-    @inline function lerp_slab(times, slabs, i, t)
-        n1, n2, w = frame(times, t)
-        a = slabs[n1]; b = slabs[n2]
-        ii = clamp(i + n_pad, 1, length(a))
-        return (1 - w) * a[ii] + w * b[ii]
-    end
-    ηs(k) = [s[k] for s in η_slabs]
-    η_w, η_e, η_s, η_n = ηs(1), ηs(2), ηs(3), ηs(4)
+    # ---------------------------------------------------------------------------
+    # From host slabs to boundary conditions.
+    #
+    # 02 feeds Flather `discrete_form` closures that interpolate the slabs on the fly. That is
+    # CPU-only: a boundary condition is passed INTO a GPU kernel, so it must be `isbits`, and a
+    # closure over `Vector{Vector{Float64}}` is not -- nor are the `Core.Box`es Julia creates
+    # for variables assigned inside a branch and captured afterwards. The kernel compiler
+    # rejects both by name.
+    #
+    # So the slabs become `FieldTimeSeries` instead, the same construction
+    # `bsose_barotropic_transport` uses and the same one the 3-D `Interpolated` conditions
+    # already rely on: Oceananigans adapts them to device arrays before launch, and they carry
+    # their own time interpolation, so nothing is lost.
+    #
+    # The times are taken from the parent series rather than recomputed. Whatever epoch
+    # NumericalEarth put `fts_u.times` on, the 3-D conditions are already on it, so reusing it
+    # is what keeps the barotropic and baroclinic boundaries on one clock.
+    cpu_grid = arch isa GPU ? on_architecture(CPU(), grid) : grid
 
-    U_west(j, k, g, clock, f)  = (lerp_slab(tU, U_lo, j, clock.time), lerp_slab(tU, η_w, j, clock.time))
-    U_east(j, k, g, clock, f)  = (lerp_slab(tU, U_hi, j, clock.time), lerp_slab(tU, η_e, j, clock.time))
-    V_south(i, k, g, clock, f) = (lerp_slab(tV, V_lo, i, clock.time), lerp_slab(tV, η_s, i, clock.time))
-    V_north(i, k, g, clock, f) = (lerp_slab(tV, V_hi, i, clock.time), lerp_slab(tV, η_n, i, clock.time))
+    """Host slab (source-indexed) -> per-face `FieldTimeSeries` on the model grid."""
+    function face_series(slabs, times, side)
+        along_x = side in (:south, :north)
+        N = along_x ? Nx : Ny
+        fts = along_x ?
+              FieldTimeSeries{Center,Nothing,Nothing}(cpu_grid, times; indices = (:, 1, 1)) :
+              FieldTimeSeries{Nothing,Center,Nothing}(cpu_grid, times; indices = (1, :, 1))
+        for t in eachindex(times)
+            slab = slabs[t]
+            # model index n  <->  source index n + n_pad, as in 02's `lerp_slab`.
+            v = [slab[clamp(n + n_pad, 1, length(slab))] for n in 1:N]
+            along_x ? (interior(fts[t], :, 1, 1) .= v) : (interior(fts[t], 1, :, 1) .= v)
+            fill_halo_regions!(fts[t])
+        end
+        return arch isa GPU ? on_architecture(arch, fts) : fts
+    end
+
+    U_west_ext,  η_west_ext  = face_series(U_lo, tU, :west),  face_series(η_w, tU, :west)
+    U_east_ext,  η_east_ext  = face_series(U_hi, tU, :east),  face_series(η_e, tU, :east)
+    V_south_ext, η_south_ext = face_series(V_lo, tV, :south), face_series(η_s, tV, :south)
+    V_north_ext, η_north_ext = face_series(V_hi, tV, :north), face_series(η_n, tV, :north)
 
     report_face_transport(" -> west ", U_lo, grid, :west,  n_pad)
     report_face_transport(" -> east ", U_hi, grid, :east,  n_pad)
@@ -490,11 +517,11 @@ function glorys_open_boundary_conditions(grid;
         maybe_top(top)...)
 
     U_bcs = FieldBoundaryConditions(grid, (Face(), Center(), nothing);
-        west = GravityWaveRadiationBoundaryCondition(U_west; discrete_form = true),
-        east = GravityWaveRadiationBoundaryCondition(U_east; discrete_form = true))
+        west = GravityWaveRadiationBoundaryCondition((U_west_ext,  η_west_ext)),
+        east = GravityWaveRadiationBoundaryCondition((U_east_ext,  η_east_ext)))
     V_bcs = FieldBoundaryConditions(grid, (Center(), Face(), nothing);
-        south = GravityWaveRadiationBoundaryCondition(V_south; discrete_form = true),
-        north = GravityWaveRadiationBoundaryCondition(V_north; discrete_form = true))
+        south = GravityWaveRadiationBoundaryCondition((V_south_ext, η_south_ext)),
+        north = GravityWaveRadiationBoundaryCondition((V_north_ext, η_north_ext)))
     η_bcs = FieldBoundaryConditions(grid, (Center(), Center(), Face());
         west  = SurfaceWaveRadiationBoundaryCondition(), east  = SurfaceWaveRadiationBoundaryCondition(),
         south = SurfaceWaveRadiationBoundaryCondition(), north = SurfaceWaveRadiationBoundaryCondition())
