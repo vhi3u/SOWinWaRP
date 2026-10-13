@@ -50,7 +50,7 @@ end
 # Change it for each experiment so runs do not overwrite one another, then animate
 # the result with `./run_animate_simulation RUN_NAME`.
 # ==============================================================================
-const RUN_NAME = "8M_pa_gradient_bt_ssh"
+const RUN_NAME = "8M_pa_gradient_bt_pinned"
 
 # flags
 
@@ -79,7 +79,7 @@ const SURFACE_FLUXES = true
 # bloom is gone. The |w| tripwire at day 1 keeps this from being a confounded test: with the
 # split on and everything else at baseline, |w| grew 6x over day 1 (0.012 -> 0.073) where the
 # baseline decayed it to 0.0076. That number arrives on day 1, long before the bloom does.
-const PENETRATING_SHORTWAVE = false
+const PENETRATING_SHORTWAVE = true
 
 const CHECKPOINTS = false # save state and restart if the model crashes. If false, the model will start from scratch.
 const BOUNDARY_DIAGNOSTICS = true # write free-surface height, boundary-face slices, and a per-face volume transport log
@@ -115,31 +115,31 @@ const BAROTROPIC_OBC = true
 # So ηᵉˣᵗ = 0 is the conservative setting until the interior can be shown to hold the tilt.
 # Set `true` to use the SSH field, which also initialises η to match (the two must agree, or
 # the boundary sees a 2 m error on the first step).
-# ηᵉˣᵗ for the Flather condition. `false` tells every face its sea surface is zero.
+# ηᵉˣᵗ, used only by the Flather barotropic scheme. With BAROTROPIC_SCHEME = :prescribed
+# nothing reads it, so `false` also skips loading ETAN and skips initialising the free
+# surface from it.
 #
-# tools/inspect_bsose_boundaries.jl, Q8, measures what that costs. Relative to the domain
-# datum that `bsose_exterior_free_surface` removes, BSOSE i156 over 2014-06 to 2015-01 puts
-# the faces at:
+# Leaving the η initialisation off is deliberate. It existed to stop Flather seeing a 0.7 m
+# error on day one. Without Flather there is nothing to protect, and initialising from BSOSE
+# only buys a day-one shock: max|η| fell 3.40 -> 1.32 m in 24 h as the field radiated into
+# balance with the model's own dynamics. Starting flat lets the surface build its own tilt
+# from the prescribed transport and the wind, which is the tilt the interior can actually
+# hold. Set this back to `true` only alongside BAROTROPIC_SCHEME = :flather.
+const EXTERIOR_SSH = false
+
+# How the barotropic mode is constrained: `:pinned` or `:flather`. See the long note in
+# `bsose_open_boundary_conditions` for the measurements behind this.
 #
-#     west -0.151 m    east -0.034 m    north +1.105 m
+# Flather alone prescribes Uᵇ - √(gH)ηᵇ, not transport, at 5.1 Sv/cm on west/east and 9.5 Sv/cm
+# on north. Two runs bracket zero -- ηᵉˣᵗ = 0 gave north +213 to +219 Sv, ηᵉˣᵗ = BSOSE gave -393
+# to -437, against a prescribed -31. Same magnitude, opposite sign: too stiff, not mis-signed.
 #
-# and the Flather sensitivity is 5.1 Sv per cm on west/east, 9.5 Sv per cm on north. So
-# `false` is not a simplification; it is a boundary condition that is wrong by 1.105 m on
-# the north face, which is worth about +1050 Sv. The model never reports that because the
-# free surface drifts down until the error partly cancels -- the observed "mean eta walking
-# down to -0.65 m" -- and what survives the drift is the +213 to +219 Sv the failed runs did
-# report. No scalar can fix this: the structure spans 1.26 m across the domain.
-#
-# SSH was tried before and the runs were worse, but that was with ObliqueRadiation and the
-# :oblique tangential condition, which were separately found to break stability. It has
-# never been run with the current PerturbationAdvection + :gradient + balanced barotropic
-# stack, and the 1.105 m north offset was not known then.
-#
-# If this still fails, the honest reading is that Flather on the north face is too stiff for
-# this domain -- at 9.5 Sv/cm the model's own η must track BSOSE's to a centimetre -- and the
-# northern boundary should move to prescribed transport plus a sponge, which is what MITgcm
-# does here.
-const EXTERIOR_SSH = true
+# `:pinned` keeps Flather for the shape and hands it Oceananigans' `target_transport`, which
+# rescales the face uniformly after every barotropic substep so the integral matches. The free
+# surface can then redistribute transport along a face but cannot change the net. The target is
+# materialised once, so it is the time mean: the seasonal swing of the net is given up, the
+# shape and all baroclinic structure are not.
+const BAROTROPIC_SCHEME = :pinned
 
 # Which faces get a Flather condition: `:all` (west, east, north, south) or `:zonal`
 # (west and east only, north/south depth-integrated flux held at zero).
@@ -418,7 +418,8 @@ if OBCS && DATASET == "BSOSE"
         penetrating_shortwave=SURFACE_FLUXES && PENETRATING_SHORTWAVE, scheme=obc_scheme,
         tangential_bc_kind=TANGENTIAL_BC, oblique_inflow_timescale=OBLIQUE_TAU_IN,
         oblique_outflow_timescale=OBLIQUE_TAU_OUT, reference_date=start_date,
-        barotropic=BAROTROPIC_OBC, barotropic_faces=BAROTROPIC_FACES)
+        barotropic=BAROTROPIC_OBC, barotropic_faces=BAROTROPIC_FACES,
+        barotropic_scheme=BAROTROPIC_SCHEME)
 
     if SPONGE_LAYERS
         sponge_timescale = 30days
@@ -569,10 +570,12 @@ if DATASET == "BSOSE"
     if exterior_η isa NamedTuple
         set!(ocean.model.free_surface.displacement, exterior_η.initial)
         fill_halo_regions!(ocean.model.free_surface.displacement)
+        # `mean` over a GPU view calls `first(A)`, which is scalar indexing. Julia's logging
+        # swallows the exception, so the line silently vanishes instead of failing -- the
+        # third time this has bitten in this file. Copy to the host first.
+        local η₀ = Array(interior(ocean.model.free_surface.displacement))
         @info @sprintf(" -> free surface initialised from BSOSE ETAN: mean %+.3f m, range %+.3f to %+.3f m",
-            mean(interior(ocean.model.free_surface.displacement)),
-            minimum(interior(ocean.model.free_surface.displacement)),
-            maximum(interior(ocean.model.free_surface.displacement)))
+            mean(η₀), minimum(η₀), maximum(η₀))
     end
 else
     set!(ocean.model,

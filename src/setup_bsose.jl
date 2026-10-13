@@ -1487,6 +1487,29 @@ end
 
 
 """
+    mean_face_transport(fts, side, grid)
+
+Time-mean net transport through one face, `∮U·dl` in m³ s⁻¹, signed positive in the positive
+coordinate direction -- the convention `GravityWaveRadiation`'s `target_transport` expects.
+
+`fts` is a depth-integrated transport series (m² s⁻¹) as `bsose_barotropic_transport` returns,
+so multiplying by the column width and summing along the face gives m³ s⁻¹ directly.
+"""
+function mean_face_transport(fts, side, grid)
+    fts === nothing && return 0.0
+    widths, _ = face_geometry(side, grid)
+    cpu = architecture(fts) isa GPU ? on_architecture(CPU(), fts) : fts
+    nt = length(cpu.times)
+    total = 0.0
+    for t in 1:nt
+        U = side in (:south, :north) ? interior(cpu[t], :, 1, 1) : interior(cpu[t], 1, :, 1)
+        total += sum(U .* widths)
+    end
+    return total / nt
+end
+
+
+"""
     bsose_exterior_free_surface(grid; dataset, dates, reference_date, remove_datum = true)
 
 External sea surface `ηᵉˣᵗ` for the Flather condition, as a `NamedTuple` of per-face
@@ -1890,6 +1913,7 @@ function bsose_open_boundary_conditions(grid;
     tangential_bc_kind=:gradient,
     barotropic=false,
     barotropic_faces=:zonal,
+    barotropic_scheme=:pinned,
     balance_transports=true,
     exterior_free_surface=0,
     tangential_gravity_wave_speed=210.0,
@@ -2110,7 +2134,7 @@ function bsose_open_boundary_conditions(grid;
         η_at(side) = exterior_free_surface isa NamedTuple ?
                      getproperty(exterior_free_surface, side) : exterior_free_surface
 
-        if !(exterior_free_surface isa NamedTuple)
+        if !(exterior_free_surface isa NamedTuple) && barotropic_scheme === :flather
             @info """ -> ηᵉˣᵗ is a bare $(typeof(exterior_free_surface)): every open face is told its sea \
                      surface is flat, and Flather carries transport only. Measured in \
                      obc_tests/flather_sandbox.jl, a uniform ηᵉˣᵗ only shifts the datum (0 to 0.04 m moved \
@@ -2156,10 +2180,74 @@ function bsose_open_boundary_conditions(grid;
         # not the ~1% it was assumed to carry, so closing it imposes a real distortion rather
         # than removing a spurious one. Keep it for the diagnostic case where you want the
         # meridional exchange removed deliberately.
+        # How the barotropic mode is constrained: `:pinned` or `:flather`.
+        #
+        # Flather alone does not prescribe transport. It prescribes Uᵇ - √(gH)ηᵇ, so it is only
+        # as good as ηᵉˣᵗ, and the stiffness here is brutal:
+        # tools/inspect_bsose_boundaries.jl measures 5.1 Sv per cm of (ηᵇ - ηᵉˣᵗ) error on
+        # west/east and 9.5 Sv per cm on north. The model's free surface would have to track
+        # BSOSE's ETAN to the centimetre for that to be well posed, and it does not. Initialised
+        # from BSOSE, max|η| falls 3.40 -> 1.32 m within a day as the field radiates into balance
+        # with the model's own dynamics (√(gH) = 200 m/s crosses this domain in ~4 h). What is
+        # left is the model's own η, over a metre from BSOSE's at the north face.
+        #
+        # Two Flather runs confirm it, and they bracket zero:
+        #
+        #     ηᵉˣᵗ = 0        north +213 to +219 Sv   (prescribed -31)
+        #     ηᵉˣᵗ = BSOSE    north -393 to -437 Sv   (prescribed -31)
+        #
+        # Same magnitude, opposite sign: too stiff, not mis-signed. Volume stayed conserved
+        # throughout (net out within ±0.5 Sv), so it was never a leak -- it was a ~400 Sv
+        # spurious overturning cell, in at the north and out through both zonal faces, which is
+        # the corner pileup and the 5.3 m/s |u|ₘₐₓ.
+        #
+        # `:pinned` keeps Flather but hands it a `target_transport`. Oceananigans then shifts the
+        # face transport uniformly after the Flather fill of every barotropic substep so its
+        # integral along the boundary matches the target: the Flather profile sets the *shape*,
+        # the target sets the *net*. The free-surface error can no longer move net volume, only
+        # redistribute it along the face. Radiation is retained, unlike a plain Dirichlet.
+        #
+        # The one compromise: `boundary_transport` is materialised once when the free surface is
+        # built, so the target is a single number per face for the whole run. We pin the time
+        # mean and lose the seasonal swing of the net (west +183 to +212, north -31 to +16).
+        # The shape, and all the baroclinic structure, still vary in time.
+        #
+        # Note a plain `NormalFlowBoundaryCondition(transport_series)` does NOT work here: a
+        # `FieldTimeSeries` falls into `getbc`'s `AbstractArray` branch, which reads
+        # `condition[i, j, 1]` -- no time interpolation, and it throws on the adapted type.
+        barotropic_bc = if barotropic_scheme === :pinned
+            # Targets must close to zero or the pinned net is a permanent volume source and η
+            # ramps linearly forever. The balanced series already closes per record; this makes
+            # the time means close exactly.
+            tt = Dict(s => mean_face_transport(getfield((west=U_west_transport, east=U_east_transport,
+                                                         south=V_south_transport, north=V_north_transport), s),
+                                               s, grid)
+                      for s in (:west, :east, :south, :north))
+            open_sides = [s for s in (:west, :east, :south, :north)
+                          if (barotropic_faces === :all || s in (:west, :east)) && sum(face_geometry(s, grid)[2]) > 0]
+            outward = (west=-1.0, east=+1.0, south=-1.0, north=+1.0)
+            areas = Dict(s => sum(face_geometry(s, grid)[1] .* face_geometry(s, grid)[2]) for s in open_sides)
+            net = sum(outward[s] * tt[s] for s in open_sides)
+            total_area = sum(values(areas))
+            for s in open_sides
+                tt[s] -= outward[s] * net * areas[s] / total_area
+            end
+            @info @sprintf(" -> barotropic scheme: Flather + pinned transport. Targets (Sv): W %+.2f, E %+.2f, S %+.2f, N %+.2f; net %+.2e",
+                tt[:west]/1e6, tt[:east]/1e6, tt[:south]/1e6, tt[:north]/1e6,
+                sum(outward[s] * tt[s] for s in open_sides)/1e6)
+            (transport, side) -> GravityWaveRadiationBoundaryCondition((transport, η_at(side));
+                                                                       target_transport = tt[side])
+        elseif barotropic_scheme === :flather
+            @info " -> barotropic scheme: Flather, transport NOT pinned."
+            (transport, side) -> GravityWaveRadiationBoundaryCondition((transport, η_at(side)))
+        else
+            error("Unknown barotropic_scheme: $barotropic_scheme. Choose :pinned or :flather.")
+        end
+
         if barotropic_faces === :all
             V_bcs = FieldBoundaryConditions(grid, (Center(), Face(), nothing);
-                south=GravityWaveRadiationBoundaryCondition((V_south_transport, η_at(:south))),
-                north=GravityWaveRadiationBoundaryCondition((V_north_transport, η_at(:north))))
+                south=barotropic_bc(V_south_transport, :south),
+                north=barotropic_bc(V_north_transport, :north))
         elseif barotropic_faces === :zonal
             @info " -> barotropic faces: west and east only; north/south depth-integrated flux held at zero."
         else
@@ -2168,8 +2256,8 @@ function bsose_open_boundary_conditions(grid;
 
         if !is_x_periodic
             U_bcs = FieldBoundaryConditions(grid, (Face(), Center(), nothing);
-                west=GravityWaveRadiationBoundaryCondition((U_west_transport, η_at(:west))),
-                east=GravityWaveRadiationBoundaryCondition((U_east_transport, η_at(:east))))
+                west=barotropic_bc(U_west_transport, :west),
+                east=barotropic_bc(U_east_transport, :east))
         end
 
         @info " -> η gets its companion Chapman condition automatically from U/V."
