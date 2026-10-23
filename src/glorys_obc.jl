@@ -499,7 +499,15 @@ function glorys_open_boundary_conditions(grid;
     # The times are taken from the parent series rather than recomputed. Whatever epoch
     # NumericalEarth put `fts_u.times` on, the 3-D conditions are already on it, so reusing it
     # is what keeps the barotropic and baroclinic boundaries on one clock.
-    cpu_grid = arch isa GPU ? on_architecture(CPU(), grid) : grid
+    # A flat, single-level grid just for these profiles.
+    #
+    # They are 1-D boundary lines; nothing about them needs the model's 135 levels or its
+    # immersed boundary, and building them on the model grid meant round-tripping an
+    # `ImmersedBoundaryGrid` CPU->GPU eight times. `getbc` on an XZFTS/YZFTS reads `f[i,1,k,t]` /
+    # `f[1,j,k,t]` and never consults the grid, so only the horizontal extent has to match.
+    face_grid = LatitudeLongitudeGrid(CPU(); size = (Nx, Ny, 1),
+                                      longitude = (λ[1], λ[end]), latitude = (φ[1], φ[end]),
+                                      z = (-1, 0), halo = (7, 7, 1))
 
     """Host slab (source-indexed) -> per-face `FieldTimeSeries` on the model grid."""
     function face_series(slabs, times, side)
@@ -529,8 +537,8 @@ function glorys_open_boundary_conditions(grid;
         # a flat Uᵉˣᵗ still rescaled to the right net transport. The net was never the tell -- the
         # shape was, and the pileups sat on exactly the two faces this corrupted.
         fts = along_x ?
-              FieldTimeSeries{Center,Nothing,Center}(cpu_grid, times; indices = (:, 1, 1)) :
-              FieldTimeSeries{Nothing,Center,Center}(cpu_grid, times; indices = (1, :, 1))
+              FieldTimeSeries{Center,Nothing,Center}(face_grid, times; indices = (:, 1, 1)) :
+              FieldTimeSeries{Nothing,Center,Center}(face_grid, times; indices = (1, :, 1))
         for t in eachindex(times)
             slab = slabs[t]
             # model index n  <->  source index n + n_pad, as in 02's `lerp_slab`.
