@@ -52,13 +52,34 @@ end
 # Change it for each experiment so runs do not overwrite one another, then animate
 # the result with `./run_animate_simulation RUN_NAME`.
 # ==============================================================================
-const RUN_NAME = "20D_glorys_pinned_prestan"
+const RUN_NAME = "20D_glorys_dirichlet"
+
+# ==============================================================================
+# THE SWITCH: which dataset drives this run.
+#
+#   :glorys   GLORYS open boundaries (hard Dirichlet) and GLORYS initial conditions, and
+#             **NO ATMOSPHERIC FORCING AT ALL**. Wind stress, surface heat and salt fluxes,
+#             penetrating shortwave, the sponge and ERA5 are forced off regardless of the
+#             flags below. GLORYS drives the boundaries and the initial state; nothing else
+#             touches the model. Deliberate while the boundary is what is under test -- with
+#             no wind the ACC is sustained only by the boundaries and the interior drifts,
+#             so do not read the interior as physics.
+#
+#   :bsose    everything this file did before: B-SOSE boundaries, B-SOSE wind stress and
+#             surface fluxes, oceQsw, B-SOSE initial conditions, optional sponge, and the
+#             ERA5 coupling if ATMOSPHERE = :era5. All the flags below apply.
+#
+# Nothing is deleted on either path; the flags simply only take effect on `:bsose`.
+# ==============================================================================
+const DATASET = :glorys        # :glorys | :bsose
+
+const FORCING_ON = DATASET === :bsose
 
 # flags
 
 const OBCS = true # open boundary conditions (NormalFlow with PerturbationAdvection)
 # 02_mab_glorys_obc.jl removes the interior restoring deliberately -- "the boundary condition
-# is the only thing communicating with the outside" -- so OBC_SOURCE = :glorys turns the sponge
+# is the only thing communicating with the outside" -- so DATASET = :glorys turns the sponge
 # off to match. 05 keeps one as an option, default off. Set back to `true` to A/B it.
 const SPONGE_LAYERS = false # sponge layer restoring (DatasetRestoring) near open boundary edges
 const WINDS = false # time-varying surface wind forcing from BSOSE data (oceTAUX and oceTAUY)
@@ -109,10 +130,14 @@ const ATMOSPHERE = :none
 # for this dataset is temporarily limited". One at a time is what gets through.
 const ERA5_THREADS = 1
 
-# Derived: the BSOSE surface forcing is only used when there is no atmosphere.
-const BSOSE_WINDS     = WINDS && ATMOSPHERE === :none
-const BSOSE_FLUXES    = SURFACE_FLUXES && ATMOSPHERE === :none
-const BSOSE_SHORTWAVE = PENETRATING_SHORTWAVE && ATMOSPHERE === :none
+# Derived. `FORCING_ON` is false on the GLORYS path, which is what switches every surface
+# forcing off there; `ATMOSPHERE === :none` additionally stops BSOSE fluxes double-counting
+# against a coupled atmosphere. `FORCING_ON` is defined with the DATASET switch at the top.
+const BSOSE_WINDS     = FORCING_ON && WINDS && ATMOSPHERE === :none
+const BSOSE_FLUXES    = FORCING_ON && SURFACE_FLUXES && ATMOSPHERE === :none
+const BSOSE_SHORTWAVE = FORCING_ON && PENETRATING_SHORTWAVE && ATMOSPHERE === :none
+const SPONGE_ACTIVE   = FORCING_ON && SPONGE_LAYERS
+const ATMOSPHERE_ACTIVE = FORCING_ON ? ATMOSPHERE : :none
 
 const CHECKPOINTS = false # save state and restart if the model crashes. If false, the model will start from scratch.
 const BOUNDARY_DIAGNOSTICS = true # write free-surface height and a per-face volume transport log
@@ -186,7 +211,13 @@ const BAROTROPIC_SCHEME = :pinned
 #
 # `:glorys` ignores OBC_SCHEME, TANGENTIAL_BC, BAROTROPIC_SCHEME, BAROTROPIC_FACES and
 # EXTERIOR_SSH -- it makes every one of those choices itself, as that script does.
-const OBC_SOURCE = :glorys
+#
+# IT ALSO RUNS WITH NO ATMOSPHERIC FORCING. On `:glorys` the wind stress, the surface heat and
+# salt fluxes, the penetrating shortwave, the sponge and ERA5 are all forced OFF regardless of
+# the flags above: GLORYS drives the boundaries and the initial state and nothing else touches
+# the model. That is deliberate while the boundary is the thing under test -- with no wind the
+# ACC is sustained only by the boundaries and the interior drifts, so do not read the interior
+# as physics. The flags are not deleted; they simply only apply on `:bsose`.
 
 # Which GLORYS product drives the boundaries. 02 uses `GLORYSDaily()` over a 12x8 degree box
 # for ten days. This domain is 60x25 degrees for eight months: daily would be ~250 records and
@@ -198,30 +229,46 @@ const GLORYS_DATASET = GLORYSMonthly()
 # exist for the A/B that `report_uext` prints at startup.
 const GLORYS_UEXT_MODE = :native
 
-# The tangential velocity condition: `:prescribed`, `:radiated` (02's default) or `:gradient`.
+# Boundary condition form on the GLORYS path.
 #
-# Completing the three-way comparison on THIS domain rather than trusting the MAB's ranking,
-# which has already failed here once. East-face v at i=360, j~141-147, two 20-day runs:
+#   :dirichlet  the GLORYS value imposed directly on u, v (normal AND tangential), T and S at
+#               all four faces. No scheme, no relaxation timescale. MITgcm `useOBCSprescribe`.
+#   :schemes    02's PerturbationAdvection on the normal flow, NormalRadiation elsewhere.
 #
-#     day      :radiated    :gradient
-#       9         1.45         1.90
-#      13         2.51         3.00
-#      17         3.02         3.76
-#      21         3.42         4.13
+# `:dirichlet`, because every scheme comparison previously run on this domain is VOID. The west
+# and east exterior profiles were built as {Nothing, Center, Nothing} FieldTimeSeries, and
+# `getbc` resolves that triple by a guess its own source calls "not really well defined" --
+# `j = ifelse(size(grid)[3] == 1, i1, i2)` -- which picks the wrong index whenever the field's
+# grid is 3-D. The barotropic U, V and η live on the full 3-D grid, so all 150 columns of both
+# zonal faces read element j = 1: a single 70°S value held constant up the whole face, for Uᵉˣᵗ
+# and ηᵉˣᵗ alike. `target_transport` pins the face INTEGRAL, so a flat profile still rescaled to
+# the right net -- which is why the transports looked perfect while the shape was wrong, and why
+# no scheme ever helped. Fixed in `face_series`; see glorys_obc.jl.
 #
-# 02's nested tests rank these Gradient(0) 0.330 < radiated 0.923 < prescribed 1.611 by
-# enstrophy, i.e. the exact reverse of what we measure for the first two. So its ordering does
-# not transfer, and `:prescribed` -- the one it ranks worst -- is untested here.
-#
-# It is also what MITgcm's `obcs` actually does. `obcs_apply_uv.F` sets the tangential
-# component by hard Dirichlet from the parent file at every boundary:
+# So this starts from the simplest condition proven elsewhere rather than re-running a three-way
+# comparison on top of a bug fix. It is what MITgcm's `obcs` does -- `obcs_apply_uv.F` sets both
+# components by hard Dirichlet from the parent file at every boundary:
 #
 #     uFld(i,Jobc,k,bi,bj) = OBNu(i,k,bi,bj) * _maskW(...)     ! north: tangential u
 #     vFld(Iobc,j,k,bi,bj) = OBEv(j,k,bi,bj) * _maskS(...)     ! east:  tangential v
 #
 # That is the lineage Ito & Timmermans' SODA-forced setup sits in, and it is decades-proven on
 # domains like this one.
-const GLORYS_TANGENTIAL = :prescribed
+const GLORYS_FORM = :dirichlet
+
+# Impose GLORYS `zos` on η instead of radiating it (Chapman).
+#
+# This also makes the BAROTROPIC transport Dirichlet, which is the only way to get there while
+# keeping the transport pin: `target_transport` is a field of the Flather scheme and has no
+# equivalent on a scheme-free condition. With η prescribed, Flather's √(gH)(ηᵇ − ηᵉˣᵗ) term is
+# identically zero, so U = Uᵉˣᵗ, then rescaled to the balanced net -- MITgcm `useOBCSprescribe`
+# plus `useOBCSbalance`.
+#
+# What it costs is the radiating path for barotropic gravity waves. MITgcm does not need one --
+# its implicit free surface does not resolve them -- but ours substeps at √(gH) ≈ 198 m/s. A
+# fully reflecting basin this size seiches at 2L/c ≈ 10.1 h zonal, 7.8 h meridional, which daily
+# output aliases; the free-surface callback below watches for it every 30 minutes.
+const GLORYS_PRESCRIBE_ETA = true
 
 # Pin the depth-integrated transport through each face.
 #
@@ -233,12 +280,8 @@ const GLORYS_TANGENTIAL = :prescribed
 #
 # This combination -- PerturbationAdvection on the 3-D normal flow plus a pinned barotropic
 # transport -- has not been run before. The pinning was built for the BSOSE path
-# (BAROTROPIC_SCHEME) which OBC_SOURCE = :glorys bypasses entirely.
+# (BAROTROPIC_SCHEME) which DATASET = :glorys bypasses entirely.
 const GLORYS_PIN_TRANSPORT = true
-
-# 02's MAB_TAU_IN: the inflow nudging timescale shared by the normal, tangential and tracer
-# schemes. Outflow is Inf throughout, so outgoing features leave freely.
-const GLORYS_TAU_IN = 1days
 
 # 02's MAB_MATCH_BATHY / MAB_N_MATCH. The only thing here that changes the bathymetry, and it
 # touches a 4-cell band at the open edges only. U = ∫u dz, so a depth mismatch at the boundary
@@ -331,7 +374,6 @@ const CIRCUMPOLAR = false # if true, we will use a circumpolar domain
 # Nothing is auto-detected and nothing falls back -- a missing file is an error.
 const BSOSE_ITERATION = 156
 
-const DATASET = "BSOSE" # by default, our forcings and BCs will be BSOSE, but if we want to test GLORYS or ECCO, we should be able to do that. 
 
 # Domain setup
 
@@ -385,7 +427,7 @@ bottom_height = regrid_bathymetry(grid,
 
 # 02's MAB_MATCH_BATHY. Must happen before the immersed grid is built, since that is what
 # freezes the wet column the barotropic transport is computed over.
-if OBC_SOURCE === :glorys && GLORYS_MATCH_BATHY
+if DATASET === :glorys && GLORYS_MATCH_BATHY
     match_boundary_bathymetry!(bottom_height, grid;
         region = BoundingBox(longitude = (λ₁ - 1.0, λ₂ + 1.0), latitude = (φ₁ - 1.0, φ₂ + 1.0)),
         n_match = GLORYS_N_MATCH, minimum_depth = 10)
@@ -397,17 +439,16 @@ grid = ImmersedBoundaryGrid(grid, GridFittedBottom(bottom_height))
 
 # dataset conditonal
 
-if DATASET == "BSOSE"
-    dataset = BSOSEMonthly(iteration=BSOSE_ITERATION)
-elseif DATASET == "GLORYS"
-    dataset = GLORYSMonthly()
-elseif DATASET == "ECCO"
-    dataset = ECCO4Monthly()
-else
-    error("Unknown dataset: $DATASET. Choose 'BSOSE', 'GLORYS', or 'ECCO'.")
-end
+DATASET in (:glorys, :bsose) || error("DATASET must be :glorys or :bsose; got $DATASET.")
 
-@info "Selected dataset: $(summary(dataset))"
+# Only the B-SOSE path needs a NumericalEarth dataset object and the monthly record selection
+# below. On `:glorys` the boundaries take their own dates from the GLORYS product and nothing
+# reads B-SOSE at all, so `dataset` stays `nothing` and `bc_dates` stays empty.
+dataset = DATASET === :bsose ? BSOSEMonthly(iteration=BSOSE_ITERATION) : nothing
+
+@info DATASET === :bsose ?
+      "Dataset: $(summary(dataset)) -- boundaries, forcing and initial conditions" :
+      "Dataset: GLORYS -- boundaries and initial conditions only; NO atmospheric forcing"
 
 # ==============================================================================
 # Simulation window
@@ -475,57 +516,68 @@ dates = (start_date, end_date)
 simulation_seconds = Dates.value(Second(end_date - start_date))
 simulation_days = simulation_seconds / 86400
 
-# Monthly records for the boundary conditions, winds and sponge nudging.
-all_available_dates = all_dates(dataset, :temperature)
+# Monthly B-SOSE records for the boundary conditions, winds and sponge nudging.
+# Skipped entirely on the GLORYS path, which selects its own dates where the boundaries are built.
+bc_dates = DateTime[]
 
-if end_date < first(all_available_dates) || start_date > last(all_available_dates)
-    error("""$(summary(dataset)) holds no data for $start_date to $end_date. Its monthly records \
-             run from $(first(all_available_dates)) to $(last(all_available_dates)); set start_date \
-             and end_date above to a period inside that range.""")
-end
+if DATASET === :bsose
+    all_available_dates = all_dates(dataset, :temperature)
 
-# Take the records whose data falls inside the run and extend by one at each end. Taking the
-# whole window rather than a fixed twelve is what makes a multi-year run follow the real
-# BSOSE years instead of replaying one year cyclically; the extra record at each end lets
-# the series interpolate across the first and last half-month rather than wrapping around
-# to the other end of the record.
-#
-# The test is on each record's window CENTRE, not on its stamp. A record's value sits at the
-# middle of the month it averages while its stamp sits at the end of that month, so
-# selecting on stamps pads the head by two records and leaves the tail half a month short —
-# which silently hands the last two weeks of the run to the cyclical wrap.
-inside = findall(d -> start_date <= bsose_window_center(d) <= end_date, all_available_dates)
+    if end_date < first(all_available_dates) || start_date > last(all_available_dates)
+        error("""$(summary(dataset)) holds no data for $start_date to $end_date. Its monthly records \
+                 run from $(first(all_available_dates)) to $(last(all_available_dates)); set start_date \
+                 and end_date above to a period inside that range.""")
+    end
 
-lo, hi = if isempty(inside)   # a run shorter than the gap between records: bracket it
-    (something(findlast(d -> bsose_window_center(d) <= start_date, all_available_dates), firstindex(all_available_dates)),
-        something(findfirst(d -> bsose_window_center(d) >= end_date, all_available_dates), lastindex(all_available_dates)))
-else
-    (first(inside), last(inside))
-end
+    # Take the records whose data falls inside the run and extend by one at each end. Taking the
+    # whole window rather than a fixed twelve is what makes a multi-year run follow the real
+    # BSOSE years instead of replaying one year cyclically; the extra record at each end lets
+    # the series interpolate across the first and last half-month rather than wrapping around
+    # to the other end of the record.
+    #
+    # The test is on each record's window CENTRE, not on its stamp. A record's value sits at the
+    # middle of the month it averages while its stamp sits at the end of that month, so
+    # selecting on stamps pads the head by two records and leaves the tail half a month short --
+    # which silently hands the last two weeks of the run to the cyclical wrap.
+    inside = findall(d -> start_date <= bsose_window_center(d) <= end_date, all_available_dates)
 
-lo = max(firstindex(all_available_dates), lo - 1)
-hi = min(lastindex(all_available_dates), hi + 1)
-bc_dates = all_available_dates[lo:hi]
+    lo, hi = if isempty(inside)   # a run shorter than the gap between records: bracket it
+        (something(findlast(d -> bsose_window_center(d) <= start_date, all_available_dates), firstindex(all_available_dates)),
+            something(findfirst(d -> bsose_window_center(d) >= end_date, all_available_dates), lastindex(all_available_dates)))
+    else
+        (first(inside), last(inside))
+    end
 
-if bsose_window_center(last(bc_dates)) < end_date
-    @warn """$(summary(dataset)) records stop at $(last(bc_dates)), before the run ends at $end_date. \
-             The forcing will wrap cyclically for the remainder of the run."""
+    lo = max(firstindex(all_available_dates), lo - 1)
+    hi = min(lastindex(all_available_dates), hi + 1)
+    bc_dates = all_available_dates[lo:hi]
+
+    if bsose_window_center(last(bc_dates)) < end_date
+        @warn """$(summary(dataset)) records stop at $(last(bc_dates)), before the run ends at $end_date. \
+                 The forcing will wrap cyclically for the remainder of the run."""
+    end
 end
 
 @info @sprintf("Simulating %s to %s (%.1f days)", start_date, end_date, simulation_days)
 # `bc_dates` is BSOSE's. On the :glorys path it no longer feeds the open boundaries -- only
 # the wind stress, the surface heat and salt fluxes and oceQsw, which stay BSOSE. The GLORYS
 # boundary dates are selected separately and logged where they are built.
-@info "BSOSE forcing dates: $(length(bc_dates)) monthly records from $(bc_dates[1]) to $(bc_dates[end])" *
-      (OBC_SOURCE === :glorys ? " (surface forcing only; boundaries come from GLORYS)" : " (surface forcing and open boundaries)")
+if DATASET === :bsose
+    @info "BSOSE records: $(length(bc_dates)) monthly, $(bc_dates[1]) to $(bc_dates[end]) (boundaries, forcing and initial conditions)"
+end
 @info "Model time zero corresponds to $start_date; all forcing is stepped on that clock."
 
 # ==============================================================================
 # Boundary Conditions & Forcing
 # ==============================================================================
 
-if OBCS && DATASET == "BSOSE"
-    if OBC_SOURCE === :glorys
+# Assigned by the BSOSE branch below when it builds a Flather condition; the GLORYS branch and
+# the `!OBCS` branch both leave it at 0, which the initial-condition block tests against.
+exterior_η = 0
+
+
+if OBCS
+    if DATASET === :glorys
         @info "Configuring GLORYS Open Boundary Conditions (02_mab_glorys_obc.jl recipe)..."
         # 02_mab_glorys_obc.jl's construction. It makes its own choices for the normal,
         # tangential, tracer, barotropic and η conditions, so OBC_SCHEME, TANGENTIAL_BC,
@@ -548,9 +600,9 @@ if OBCS && DATASET == "BSOSE"
         glorys_obc = glorys_open_boundary_conditions(grid;
             dates = glorys_dates,
             dataset = GLORYS_DATASET,
-            tau_in = GLORYS_TAU_IN,
             uext_mode = GLORYS_UEXT_MODE,
-            tangential = GLORYS_TANGENTIAL,
+            form = GLORYS_FORM,
+            prescribe_eta = GLORYS_PRESCRIBE_ETA,
             pin_transport = GLORYS_PIN_TRANSPORT,
             top_u = wind_bcs === nothing ? nothing : wind_bcs.u,
             top_v = wind_bcs === nothing ? nothing : wind_bcs.v,
@@ -583,7 +635,7 @@ if OBCS && DATASET == "BSOSE"
         # open face the sea surface is flat -- inconsistent with the 200 Sv of geostrophic
         # transport the same condition prescribes, and the reason the east face delivered -176 Sv
         # of inflow where +203 Sv of outflow was asked for.
-        exterior_η = BAROTROPIC_OBC && EXTERIOR_SSH && DATASET == "BSOSE" ?
+        exterior_η = BAROTROPIC_OBC && EXTERIOR_SSH ?
                      bsose_exterior_free_surface(grid; dataset=dataset, dates=bc_dates,
                          reference_date=start_date) : 0
 
@@ -597,7 +649,7 @@ if OBCS && DATASET == "BSOSE"
             barotropic_scheme=BAROTROPIC_SCHEME)
     end
 
-    if SPONGE_LAYERS
+    if SPONGE_ACTIVE
         sponge_timescale = 30days
         @info "Configuring boundary edge sponge layers (3.0° width, $(sponge_timescale) restoring timescale)..."
         forcings = bsose_sponge_layer_forcing(grid; dataset=dataset, dates=bc_dates, sponge_width=3.0, timescale=sponge_timescale, restore_velocities=true, reference_date=start_date)
@@ -606,20 +658,19 @@ if OBCS && DATASET == "BSOSE"
     end
 elseif !OBCS
     @info "Configuring whole-region DatasetRestoring (30-day restoring for T and S from $DATASET)..."
-    wind_bcs = (WINDS && DATASET == "BSOSE") ? bsose_surface_wind_stress(grid; dataset=dataset, dates=bc_dates, reference_date=start_date) : nothing
+    wind_bcs = BSOSE_WINDS ? bsose_surface_wind_stress(grid; dataset=dataset, dates=bc_dates, reference_date=start_date) : nothing
     boundary_conditions = wind_bcs !== nothing ? (u=FieldBoundaryConditions(top=wind_bcs.u), v=FieldBoundaryConditions(top=wind_bcs.v)) : NamedTuple()
 
-    restoring_region = DATASET == "BSOSE" ? bsose_region(grid) : nothing
+    DATASET === :bsose || error("OBCS = false is only wired up for DATASET = :bsose.")
+    restoring_region = bsose_region(grid)
     temperature_metadata = Metadata(:temperature; dataset, start_date, end_date, region=restoring_region)
     salinity_metadata = Metadata(:salinity; dataset, start_date, end_date, region=restoring_region)
 
     FT = DatasetRestoring(temperature_metadata, grid; rate=1 / 30days)
     FS = DatasetRestoring(salinity_metadata, grid; rate=1 / 30days)
 
-    if DATASET == "BSOSE"
-        restore_on_model_clock!(FT, start_date)
-        restore_on_model_clock!(FS, start_date)
-    end
+    restore_on_model_clock!(FT, start_date)
+    restore_on_model_clock!(FS, start_date)
 
     forcings = (T=FT, S=FS)
 else
@@ -707,13 +758,13 @@ end
 radiation = TwoColorRadiation(grid)
 update_shortwave! = nothing
 
-if PENETRATING_SHORTWAVE && ATMOSPHERE !== :none
-    @info """Penetrating shortwave is handled by the $(ATMOSPHERE) coupling: TwoColorRadiation's \
+if PENETRATING_SHORTWAVE && ATMOSPHERE_ACTIVE !== :none
+    @info """Penetrating shortwave is handled by the $(ATMOSPHERE_ACTIVE) coupling: TwoColorRadiation's \
              surface flux is filled by the coupled model, which is what the BSOSE oceQsw \
              callback was standing in for. Not registering that callback."""
 elseif PENETRATING_SHORTWAVE
-    if DATASET != "BSOSE"
-        @warn "PENETRATING_SHORTWAVE is only wired up for BSOSE; ignoring it for $DATASET."
+    if DATASET !== :bsose
+        @warn "PENETRATING_SHORTWAVE is only wired up for :bsose; ignoring it for $DATASET."
     elseif !SURFACE_FLUXES
         @warn """PENETRATING_SHORTWAVE has no effect while SURFACE_FLUXES is false: with no \
                  surface heat flux there is no solar part to separate out."""
@@ -733,7 +784,7 @@ ocean = ocean_simulation(grid;
 
 # initial conditions based on either BSOSE or the other datasets
 
-if OBC_SOURCE === :glorys && GLORYS_INITIAL_CONDITIONS
+if DATASET === :glorys && GLORYS_INITIAL_CONDITIONS
     # 02 initialises the interior from the same dataset that drives the boundaries. Mixing
     # them -- GLORYS at the edges, BSOSE inside -- puts a discontinuity on the boundary at
     # t = 0 that the open conditions then have to argue with.
@@ -744,7 +795,7 @@ if OBC_SOURCE === :glorys && GLORYS_INITIAL_CONDITIONS
     fill_bathymetry_gaps!(parent(ocean.model.tracers.S), S_MIN_PHYSICAL, S_MAX_PHYSICAL)
     fill_bathymetry_gaps!(parent(ocean.model.tracers.T), T_MIN_PHYSICAL, T_MAX_PHYSICAL)
     @info "Model successfully initialized from GLORYS and filled bathymetric gaps."
-elseif DATASET == "BSOSE"
+elseif DATASET === :bsose
     bsose_initial_conditions!(ocean.model; dataset=dataset, date=start_date, velocities=true)
 
     # Initialise the free surface too. Setting u, v, T, S from BSOSE while leaving η flat is
@@ -769,16 +820,12 @@ elseif DATASET == "BSOSE"
             mean(η₀), minimum(η₀), maximum(η₀))
     end
 else
-    set!(ocean.model,
-        MetadataSet(:temperature; dataset=dataset, date=start_date),
-        MetadataSet(:salinity; dataset=dataset, date=start_date)
-    )
-    fill_bathymetry_gaps!(parent(ocean.model.tracers.S), S_MIN_PHYSICAL, S_MAX_PHYSICAL)
-    fill_bathymetry_gaps!(parent(ocean.model.tracers.T), T_MIN_PHYSICAL, T_MAX_PHYSICAL)
-    fill_halo_regions!(ocean.model.tracers.T, ocean.model.clock, fields(ocean.model))
-    fill_halo_regions!(ocean.model.tracers.S, ocean.model.clock, fields(ocean.model))
-    fill_bathymetry_gaps!(parent(ocean.model.tracers.S), S_MIN_PHYSICAL, S_MAX_PHYSICAL)
-    fill_bathymetry_gaps!(parent(ocean.model.tracers.T), T_MIN_PHYSICAL, T_MAX_PHYSICAL)
+    # DATASET = :glorys with GLORYS_INITIAL_CONDITIONS = false. There is no other source of an
+    # initial state on this path -- `dataset` is `nothing` -- so say so rather than failing
+    # inside MetadataSet with a less obvious message.
+    error("""DATASET = :glorys with GLORYS_INITIAL_CONDITIONS = false leaves the model with no \
+             initial condition. Set GLORYS_INITIAL_CONDITIONS = true, or switch to \
+             DATASET = :bsose.""")
 end
 
 # ── TEOS10 sqrt guard ─────────────────────────────────────────────────────────
@@ -804,7 +851,7 @@ end
 # ==============================================================================
 stepped_model = ocean.model     # what Simulation steps; replaced below if there is an atmosphere
 
-if ATMOSPHERE === :era5
+if ATMOSPHERE_ACTIVE === :era5
     era5_dir = get(ENV, "ERA5_DIR", joinpath(default_bsose_directory(), "era5"))
     mkpath(era5_dir)
     era5_region = BoundingBox(longitude = (λ₁ - 1.0, λ₂ + 1.0), latitude = (φ₁ - 1.0, φ₂ + 1.0))
@@ -830,8 +877,10 @@ if ATMOSPHERE === :era5
 
     stepped_model = OceanOnlyModel(ocean; atmosphere, radiation = surface_radiation)
     @info "Coupled OceanOnlyModel built: surface fluxes now come from ERA5 bulk formulae."
-elseif ATMOSPHERE !== :none
-    error("Unknown ATMOSPHERE: $ATMOSPHERE. Choose :era5 or :none.")
+elseif ATMOSPHERE_ACTIVE !== :none
+    error("Unknown ATMOSPHERE: $ATMOSPHERE_ACTIVE. Choose :era5 or :none.")
+elseif DATASET === :glorys
+    @info "GLORYS path: NO atmospheric forcing. Wind, heat flux, salt flux, shortwave, sponge and ERA5 are all OFF."
 else
     @info @sprintf("No atmosphere. Surface forcing: winds %s, heat/salt fluxes %s, penetrating shortwave %s.",
                    BSOSE_WINDS ? "BSOSE" : "OFF", BSOSE_FLUXES ? "BSOSE" : "OFF",
@@ -899,7 +948,7 @@ const PROGRESS_WALL = Ref(time_ns())
 # coupled path is the EarthSystemModel and has none -- so there it is replaced by a messenger
 # that closes over the ocean model. The BSOSE path keeps TimedMessenger so its logs stay
 # comparable with every earlier run.
-if ATMOSPHERE === :none
+if ATMOSPHERE_ACTIVE === :none
     progress = TimedMessenger()
     simulation.callbacks[:progress] = Callback(progress, TimeInterval(output_interval))
 else
@@ -927,6 +976,27 @@ end
 # end
 # simulation.callbacks[:free_surface] = Callback(log_free_surface, TimeInterval(callback_interval))
 
+# The reflection watch.
+#
+# With GLORYS_PRESCRIBE_ETA the free surface is Dirichlet, so barotropic gravity waves have no
+# radiating path out of the domain. If this basin is going to ring it does so at 2L/c ≈ 10.1 h
+# zonal and 7.8 h meridional -- periods daily output aliases into noise. Thirty minutes resolves
+# them ~16x over.
+#
+# Read the MEAN, not the max: `maximum(abs, η)` includes immersed cells and is not a physical
+# number (it has read 9 m while the ocean peaked at 1.19 m). A steady or decaying mean means the
+# Dirichlet free surface is fine and no sponge is needed. A persistent ~8-10 h oscillation that
+# does not decay is the reflection, and then η needs damping.
+if DATASET === :glorys && GLORYS_PRESCRIBE_ETA
+    function log_eta_watch(sim)
+        η = ocean.model.free_surface.displacement
+        @info @sprintf("        [eta] t = %8.3f d   mean η = %+.5f m",
+                       ocean.model.clock.time / 86400, mean(η))
+        flush(stdout)
+    end
+    simulation.callbacks[:eta_watch] = Callback(log_eta_watch, TimeInterval(30minutes))
+end
+
 # output writers
 
 u, v, w = ocean.model.velocities
@@ -940,7 +1010,10 @@ T, S = ocean.model.tracers
 output_metadata = Dict("run_name" => RUN_NAME,
     "start_date" => string(start_date),
     "end_date" => string(end_date),
-    "dataset" => DATASET)
+    "dataset" => String(DATASET),
+    "boundaries" => DATASET === :glorys ?
+        ("Dirichlet (u, v, T, S" * (GLORYS_PRESCRIBE_ETA ? ", eta" : "") * ") + pinned transport") :
+        "BSOSE $(OBC_SCHEME)")
 
 simulation.output_writers[:surface] = NetCDFWriter(
     ocean.model,
@@ -1039,8 +1112,16 @@ end
 
 @info "--- Model Setup Complete ---"
 @info "Grid Resolution: Nx=$(grid.Nx), Ny=$(grid.Ny), Nz=$(grid.Nz)"
-@info "OBCS: $OBCS | WINDS: $WINDS | SURFACE_FLUXES: $SURFACE_FLUXES | DATASET: $DATASET"
-@info "PENETRATING_SHORTWAVE: $PENETRATING_SHORTWAVE (active: $(update_shortwave! !== nothing))"
+@info "DATASET: $DATASET"
+if DATASET === :glorys
+    @info "Boundaries: $(GLORYS_FORM) from GLORYS on u, v, T, S" *
+          (GLORYS_PRESCRIBE_ETA ? " and η" : "; η Chapman") *
+          "; transport $(GLORYS_PIN_TRANSPORT ? "pinned" : "free")"
+    @info "Surface forcing: NONE (wind, heat flux, salt flux, shortwave, sponge, ERA5 all off)"
+else
+    @info "Boundaries: BSOSE, scheme $OBC_SCHEME, tangential $TANGENTIAL_BC, barotropic $BAROTROPIC_SCHEME"
+    @info "Surface forcing: winds $(BSOSE_WINDS) | fluxes $(BSOSE_FLUXES) | shortwave $(update_shortwave! !== nothing) | sponge $(SPONGE_ACTIVE) | atmosphere $ATMOSPHERE_ACTIVE"
+end
 
 # red button 
 
