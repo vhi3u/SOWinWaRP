@@ -37,11 +37,39 @@ function edge_report(i, j, Nx, Ny)
     return d, nearest, d[nearest]
 end
 
-function coords(ds)
-    # Oceananigans' NetCDF writer names axes by location; accept whichever is present.
-    lon = haskey(ds, "x_caa") ? ds["x_caa"][:] : haskey(ds, "xC") ? ds["xC"][:] : haskey(ds, "lon") ? ds["lon"][:] : nothing
-    lat = haskey(ds, "y_aca") ? ds["y_aca"][:] : haskey(ds, "yC") ? ds["yC"][:] : haskey(ds, "lat") ? ds["lat"][:] : nothing
-    return lon, lat
+"""
+    axis_values(ds, var)
+
+The x and y coordinate vectors for `var`, read from its OWN dimension names.
+
+Oceananigans names axes by field location -- `u` is on `x_faa` while `T` is on `x_caa` -- so
+guessing from a fixed list of names silently returns `nothing` and prints NaN, which is what
+the first version of this script did.
+"""
+function axis_values(ds, var)
+    dn = dimnames(ds[var])
+    get_or_nothing(n) = (n !== nothing && haskey(ds, n)) ? Float64.(ds[n][:]) : nothing
+    xn = length(dn) >= 1 ? dn[1] : nothing
+    yn = length(dn) >= 2 ? dn[2] : nothing
+    return get_or_nothing(xn), get_or_nothing(yn), dn
+end
+
+"""
+    slab(ds, var, t)
+
+The horizontal field of `var` at output index `t`, whatever its rank.
+
+The writers emit 2-D fields as (x, y, time) and level-sliced 3-D fields as (x, y, z, time)
+with z of length one. Indexing the latter as if it were the former reads the z axis with a
+time index -- a `BoundsError` past t = 1, and silently the wrong slab at t = 1.
+"""
+function slab(ds, var, t)
+    v = ds[var]
+    nd = ndims(v)
+    A = nd == 4 ? v[:, :, 1, t] :
+        nd == 3 ? v[:, :, t]    :
+        error("unexpected rank $nd for `$var` with dims $(dimnames(v))")
+    return Float64.(coalesce.(A, NaN))
 end
 
 """The TOPN largest |A| cells of a 2-D slab, with position and distance to the edges."""
@@ -51,8 +79,9 @@ function report_slab(A, lon, lat, label)
     isempty(finite) && (println("  $label: all non-finite"); return)
     sort!(finite; by = first, rev = true)
 
-    @printf("  %s: max %.3f, mean %.4f over %d finite cells\n",
-            label, first(finite)[1], mean(first.(finite)), length(finite))
+    vals = [A[i, j] for i in 1:Nx, j in 1:Ny if isfinite(A[i, j])]
+    @printf("  %s: max|.| %.3f, range %+.3f to %+.3f, mean %+.4f over %d finite cells\n",
+            label, first(finite)[1], minimum(vals), maximum(vals), mean(vals), length(finite))
     for (v, i, j) in finite[1:min(TOPN, length(finite))]
         d, nearest, dist = edge_report(i, j, Nx, Ny)
         λ = lon === nothing ? NaN : lon[min(i, length(lon))]
@@ -67,14 +96,12 @@ fs_path = joinpath(DIR, "$(RUN)_free_surface.nc")
 if isfile(fs_path)
     hdr("Free surface: $(basename(fs_path))")
     ds = Dataset(fs_path)
-    lon, lat = coords(ds)
-    η = ds["η"]
-    nt = size(η)[end]
+    lon, lat, dn = axis_values(ds, "η")
+    @info "η dims: $dn, size $(size(ds["η"]))"
+    nt = size(ds["η"])[end]
     for t in 1:nt
-        A = Float64.(coalesce.(η[:, :, t], NaN))
-        ndims(A) == 3 && (A = A[:, :, 1])
         println("\n t = $t of $nt")
-        report_slab(A, lon, lat, "|η| (m)")
+        report_slab(slab(ds, "η", t), lon, lat, "η (m)")
     end
     close(ds)
 else
@@ -86,15 +113,16 @@ sf_path = joinpath(DIR, "$(RUN)_surface.nc")
 if isfile(sf_path)
     hdr("Surface fields: $(basename(sf_path))  (top level only -- a deeper max will not appear here)")
     ds = Dataset(sf_path)
-    lon, lat = coords(ds)
     nt = size(ds["v"])[end]
+    for name in ("u", "v")
+        haskey(ds, name) && @info "$name dims: $(dimnames(ds[name])), size $(size(ds[name]))"
+    end
     for t in 1:nt
         println("\n t = $t of $nt")
         for name in ("u", "v")
             haskey(ds, name) || continue
-            A = Float64.(coalesce.(ds[name][:, :, t], NaN))
-            ndims(A) == 3 && (A = A[:, :, 1])
-            report_slab(A, lon, lat, "|$name| (m/s)")
+            lon, lat, _ = axis_values(ds, name)
+            report_slab(slab(ds, name, t), lon, lat, "$name (m/s)")
         end
     end
     close(ds)
