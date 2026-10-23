@@ -243,8 +243,8 @@ function glorys_open_boundary_conditions(grid;
 
     uext_mode in (:native, :masked, :legacy) ||
         error("uext_mode must be :native, :masked or :legacy; got $uext_mode.")
-    tangential in (:radiated, :prescribed) ||
-        error("tangential must be :radiated or :prescribed; got $tangential.")
+    tangential in (:radiated, :prescribed, :gradient) ||
+        error("tangential must be :radiated, :prescribed or :gradient; got $tangential.")
 
     underlying = grid isa ImmersedBoundaryGrid ? grid.underlying_grid : grid
     Nx, Ny, Nz = size(underlying)
@@ -490,9 +490,16 @@ function glorys_open_boundary_conditions(grid;
     tangential_sch = NormalRadiation(inflow_timescale = tau_in, outflow_timescale = Inf)
     tracer_scheme  = NormalRadiation(inflow_timescale = tau_in, outflow_timescale = Inf)
 
-    tangential_bc(fts) = tangential === :prescribed ?
-        ValueBoundaryCondition(Interpolated(fts)) :
-        ValueBoundaryCondition(Interpolated(fts); scheme = tangential_sch)
+    # 02 runs `:radiated`, but its own nested tests rank `Gradient(0)` best by a wide margin
+    # -- enstrophy 0.330 against a truth of 1.000, versus 0.923 radiated and 1.611 prescribed.
+    # `:gradient` imposes ∂(tangential)/∂n = 0, which gives up the exterior tangential value
+    # but removes the discontinuity that a prescribed or relaxed value puts into ∂v/∂x. Since
+    # ζ = ∂v/∂x − ∂u/∂y, that discontinuity shows up as vorticity sitting on the boundary --
+    # and it is the tangential components that grow at the corners here.
+    tangential_bc(fts) =
+        tangential === :prescribed ? ValueBoundaryCondition(Interpolated(fts)) :
+        tangential === :gradient   ? GradientBoundaryCondition(0) :
+                                     ValueBoundaryCondition(Interpolated(fts); scheme = tangential_sch)
 
     maybe_top(bc) = bc === nothing ? NamedTuple() : (; top = bc)
 
@@ -582,7 +589,9 @@ function glorys_open_boundary_conditions(grid;
         south = SurfaceWaveRadiationBoundaryCondition(), north = SurfaceWaveRadiationBoundaryCondition())
 
     @info " -> normal: PerturbationAdvection(τ_in = $(tau_in/days) d, τ_out = Inf)"
-    @info " -> tangential: $(tangential === :prescribed ? "prescribed (Dirichlet)" : "NormalRadiation(τ_in = $(tau_in/days) d, τ_out = Inf)")"
+    @info " -> tangential: $(tangential === :prescribed ? "prescribed (Dirichlet)" :
+                             tangential === :gradient   ? "Gradient(0)" :
+                             "NormalRadiation(τ_in = $(tau_in/days) d, τ_out = Inf)")"
     @info " -> tracers: NormalRadiation(τ_in = $(tau_in/days) d, τ_out = Inf)"
     @info " -> barotropic: Flather on all four faces; η: Chapman on all four faces"
 

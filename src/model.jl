@@ -52,7 +52,7 @@ end
 # Change it for each experiment so runs do not overwrite one another, then animate
 # the result with `./run_animate_simulation RUN_NAME`.
 # ==============================================================================
-const RUN_NAME = "20D_glorys_pinned"
+const RUN_NAME = "20D_glorys_pinned_gradtan"
 
 # flags
 
@@ -198,8 +198,24 @@ const GLORYS_DATASET = GLORYSMonthly()
 # exist for the A/B that `report_uext` prints at startup.
 const GLORYS_UEXT_MODE = :native
 
-# 02's MAB_TANGENTIAL: `:radiated` (its default) or `:prescribed`.
-const GLORYS_TANGENTIAL = :radiated
+# The tangential velocity condition: `:gradient`, `:radiated` (02's default) or `:prescribed`.
+#
+# `:gradient` despite 02 running `:radiated`, for two reasons that agree.
+#
+# 02's own nested tests rank the three by enstrophy against a truth of 1.000: Gradient(0)
+# 0.330, radiated 0.923, prescribed 1.611. It picked radiated anyway, but its own number for
+# Gradient(0) is nearly three times better.
+#
+# And the 20-day pinned run says the same thing from this domain. With the net transport
+# pinned to 0.02 Sv, what still grows is the TANGENTIAL component at the corners: v on the
+# east face at 45.7-46.5S went 1.4 -> 3.4 m/s over twelve days, roughly linear and not
+# saturating, with u along the north face doing the same. Those are exactly the components
+# `:radiated` governs. Gradient(0) gives up the exterior tangential value and in exchange
+# removes the discontinuity a relaxed value puts into ∂v/∂x -- which, since ζ = ∂v/∂x − ∂u/∂y,
+# is vorticity generated on the boundary.
+#
+# It is also what every stable BSOSE run here used (`TANGENTIAL_BC = :gradient`).
+const GLORYS_TANGENTIAL = :gradient
 
 # Pin the depth-integrated transport through each face.
 #
