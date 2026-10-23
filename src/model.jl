@@ -52,7 +52,7 @@ end
 # Change it for each experiment so runs do not overwrite one another, then animate
 # the result with `./run_animate_simulation RUN_NAME`.
 # ==============================================================================
-const RUN_NAME = "20D_glorys_pinned_gradtan"
+const RUN_NAME = "20D_glorys_pinned_prestan"
 
 # flags
 
@@ -198,24 +198,30 @@ const GLORYS_DATASET = GLORYSMonthly()
 # exist for the A/B that `report_uext` prints at startup.
 const GLORYS_UEXT_MODE = :native
 
-# The tangential velocity condition: `:gradient`, `:radiated` (02's default) or `:prescribed`.
+# The tangential velocity condition: `:prescribed`, `:radiated` (02's default) or `:gradient`.
 #
-# `:gradient` despite 02 running `:radiated`, for two reasons that agree.
+# Completing the three-way comparison on THIS domain rather than trusting the MAB's ranking,
+# which has already failed here once. East-face v at i=360, j~141-147, two 20-day runs:
 #
-# 02's own nested tests rank the three by enstrophy against a truth of 1.000: Gradient(0)
-# 0.330, radiated 0.923, prescribed 1.611. It picked radiated anyway, but its own number for
-# Gradient(0) is nearly three times better.
+#     day      :radiated    :gradient
+#       9         1.45         1.90
+#      13         2.51         3.00
+#      17         3.02         3.76
+#      21         3.42         4.13
 #
-# And the 20-day pinned run says the same thing from this domain. With the net transport
-# pinned to 0.02 Sv, what still grows is the TANGENTIAL component at the corners: v on the
-# east face at 45.7-46.5S went 1.4 -> 3.4 m/s over twelve days, roughly linear and not
-# saturating, with u along the north face doing the same. Those are exactly the components
-# `:radiated` governs. Gradient(0) gives up the exterior tangential value and in exchange
-# removes the discontinuity a relaxed value puts into ∂v/∂x -- which, since ζ = ∂v/∂x − ∂u/∂y,
-# is vorticity generated on the boundary.
+# 02's nested tests rank these Gradient(0) 0.330 < radiated 0.923 < prescribed 1.611 by
+# enstrophy, i.e. the exact reverse of what we measure for the first two. So its ordering does
+# not transfer, and `:prescribed` -- the one it ranks worst -- is untested here.
 #
-# It is also what every stable BSOSE run here used (`TANGENTIAL_BC = :gradient`).
-const GLORYS_TANGENTIAL = :gradient
+# It is also what MITgcm's `obcs` actually does. `obcs_apply_uv.F` sets the tangential
+# component by hard Dirichlet from the parent file at every boundary:
+#
+#     uFld(i,Jobc,k,bi,bj) = OBNu(i,k,bi,bj) * _maskW(...)     ! north: tangential u
+#     vFld(Iobc,j,k,bi,bj) = OBEv(j,k,bi,bj) * _maskS(...)     ! east:  tangential v
+#
+# That is the lineage Ito & Timmermans' SODA-forced setup sits in, and it is decades-proven on
+# domains like this one.
+const GLORYS_TANGENTIAL = :prescribed
 
 # Pin the depth-integrated transport through each face.
 #

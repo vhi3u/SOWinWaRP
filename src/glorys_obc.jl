@@ -175,10 +175,43 @@ function match_boundary_bathymetry!(bottom_height, grid; dir = glorys_directory(
         changed += 1; Σδ += abs(δ)
     end
 
+    # MITgcm's OBCSfixTopo, which Taka Ito's regional setup runs with (`OBCSfixtopo=.TRUE.`
+    # in input_bling/data.obcs). `obcs_check_depths.F` enforces outward d(topography)/dn >= 0:
+    # a boundary cell may not be DEEPER than the cell one step inward.
+    #
+    #     IF ( R_low(i,j) .LT. R_low(i-1,j) )  R_low(i,j) = R_low(i-1,j)      ! east
+    #
+    # A boundary cell deeper than its inward neighbour is a pit at the edge. Water prescribed
+    # to enter at depth has no path inward at that depth, so it converges there -- a candidate
+    # for the stuck cell at the south-east corner, and for the corner jet generally. Blending
+    # toward GLORYS `deptho` above can create such a pit, so the check comes after it.
+    #
+    # `h` is bottom HEIGHT (negative downward), so "not deeper" is `h_boundary >= h_inward`.
+    # The southern edge of this domain is entirely land and simply contributes no violations.
+    fixed = 0
+    Σraise = 0.0
+    fix!(ib, jb, ii, ji) = begin
+        (h[ib, jb] < 0 && h[ii, ji] < 0) || return                 # both wet, or leave alone
+        h[ib, jb] < h[ii, ji] || return                            # already shallower or equal
+        Σraise += h[ii, ji] - h[ib, jb]
+        h[ib, jb] = h[ii, ji]
+        fixed += 1
+    end
+    for j in 1:Ny
+        fix!(1, j, 2, j)             # west,  inward neighbour i+1
+        fix!(Nx, j, Nx - 1, j)       # east,  inward neighbour i-1
+    end
+    for i in 1:Nx
+        fix!(i, 1, i, 2)             # south, inward neighbour j+1
+        fix!(i, Ny, i, Ny - 1)       # north, inward neighbour j-1
+    end
+
     set!(bottom_height, reshape(h, Nx, Ny, 1))
     fill_halo_regions!(bottom_height)
     @info @sprintf(" -> boundary bathymetry matched to GLORYS over %d cells: %d columns changed, mean |Δdepth| %.1f m",
                    n_match, changed, changed == 0 ? 0.0 : Σδ / changed)
+    @info @sprintf(" -> OBCSfixTopo (outward d(topo)/dn >= 0): %d boundary cells were deeper than their inward neighbour, raised by %.1f m on average",
+                   fixed, fixed == 0 ? 0.0 : Σraise / fixed)
     return bottom_height
 end
 
@@ -618,6 +651,31 @@ function report_face_transport(label, slabs, grid, side, n_pad)
            maximum(abs(at(slabs[1], n)) / max(depths[n], eps()) for n in 1:N if depths[n] > 0)
     @info @sprintf("%s Uᵉˣᵗ: %+7.1f Sv (range %+.1f to %+.1f), max |U|/H = %.3f m/s over %d wet columns",
                    label, sum(sv)/length(sv), minimum(sv), maximum(sv), peak, wet)
+
+    # WHERE along the face the transport sits.
+    #
+    # `target_transport` pins the face TOTAL and says nothing about its distribution, so a
+    # face can hit its target exactly while concentrating all of the flux into a handful of
+    # columns. The north face is the case in point: -27.6 Sv spread over 360 wet columns is a
+    # mean |U|/H near 0.0015 m/s against a peak of 0.136 -- roughly 90x peaked. If that peak
+    # sits next to a corner, the corner has to turn a large local flux, which is the leading
+    # explanation for the jet that spins up at the north-east corner.
+    wet == 0 && return nothing
+    col = [at(slabs[1], n) * widths[n] / 1e6 for n in 1:N]       # Sv per column, frame 1
+    gross = sum(abs, col)
+    gross == 0 && return nothing
+
+    order = sortperm(abs.(col); rev = true)
+    ntop = max(1, round(Int, 0.1 * wet))
+    top_frac = sum(abs(col[n]) for n in order[1:ntop]) / gross
+    ipeak = order[1]
+
+    # How close the busiest columns are to each end of the face.
+    lo_end = count(n -> n <= 0.1N, order[1:ntop])
+    hi_end = count(n -> n >= 0.9N, order[1:ntop])
+
+    @info @sprintf("%s   busiest 10%% of columns carry %.0f%% of |transport|; peak at column %d of %d (%.0f%% along); %d of top %d in the first tenth, %d in the last",
+                   label, 100 * top_frac, ipeak, N, 100 * ipeak / N, lo_end, ntop, hi_end)
     return nothing
 end
 
