@@ -198,59 +198,87 @@ trusting a file that was only matched by its variable name.
 bsose_names_iteration(filename, iteration::Int) =
     any(t -> occursin(t, lowercase(filename)), bsose_iteration_tokens(iteration))
 
+"""
+    BSOSE_FILES
+
+The one filename per variable, per iteration: `(token, span)` builds
+
+    iteration 156   <token>_bsoseI156_<span>.nc
+    iteration 105   bsose_i105_<span>_<token>.nc
+
+matching how each distribution actually ships. The iteration 156 entries are confirmed
+against the cluster's `data/` listing (2026-10-22), not inferred. There is deliberately no
+list of candidate spellings and no directory scan. Guessing produced two silent failures in this project -- a
+missing iteration 156 file resolving to the iteration 105 file beside it, and a variable
+resolving to whatever `.nc` happened to contain its name -- and both were only caught by
+noticing wrong numbers much later. If a token here is wrong the run stops and says so.
+"""
+const BSOSE_FILES = Dict(
+    156 => Dict(
+        :temperature            => ("Theta",    "2013to2024_monthly"),
+        :salinity               => ("Salt",     "2013to2024_monthly"),
+        :u_velocity             => ("Uvel",     "2013to2024_monthly"),
+        :v_velocity             => ("Vvel",     "2013to2024_monthly"),
+        :surface_heat_flux      => ("surfTflx", "2013to2024_monthly"),
+        :surface_salt_flux      => ("surfSflx", "2013to2024_monthly"),
+        :surface_shortwave      => ("oceQsw",   "2013to2024_monthly"),
+        :sea_surface_height     => ("SSH",      "2013to2024_monthly"),
+        # The cluster carries BOTH `oceTAUX_bsoseI156_2013to2024_monthly.nc` and
+        # `oceTAUX_bsoseI156_2014_5day.nc`. Monthly is the one this project uses: the 5-day
+        # wind forcing was taken out deliberately. Switch the span to "2014_5day" to go back.
+        :zonal_wind_stress      => ("oceTAUX",  "2013to2024_monthly"),
+        :meridional_wind_stress => ("oceTAUY",  "2013to2024_monthly"),
+    ),
+    105 => Dict(
+        :temperature            => ("Theta",    "2008to2012_monthly"),
+        :salinity               => ("Salt",     "2008to2012_monthly"),
+        :u_velocity             => ("Uvel",     "2008to2012_monthly"),
+        :v_velocity             => ("Vvel",     "2008to2012_monthly"),
+        :surface_heat_flux      => ("surfTflx", "2008to2012_monthly"),
+        :surface_salt_flux      => ("surfSflx", "2008to2012_monthly"),
+        :zonal_wind_stress      => ("oceTAUX",  "2008to2012_monthly"),
+        :meridional_wind_stress => ("oceTAUY",  "2008to2012_monthly"),
+    ),
+)
+
+bsose_filename(token, span, iteration) =
+    iteration == 156 ? "$(token)_bsoseI156_$(span).nc" :
+                       "bsose_i$(iteration)_$(span)_$(token).nc"
+
+"""
+    resolve_bsose_filename(dir, var_name, iteration)
+
+The bare filename for `var_name` at `iteration`, or an error.
+
+Errors rather than falling back, by design -- see [`BSOSE_FILES`](@ref). The message names the
+exact path that was expected and lists any `.nc` file in `dir` carrying the same token, so a
+wrong token in the table is a one-line fix rather than a debugging session.
+"""
 function resolve_bsose_filename(dir::String, var_name::Symbol, iteration::Int)
-    shortname = get(BSOSE_VARIABLE_NAMES, var_name, string(var_name))
-    filetoken = get(BSOSE_FILE_TOKENS, var_name, shortname)
+    haskey(BSOSE_FILES, iteration) ||
+        error("No BSOSE filename table for iteration $iteration. Known: $(sort(collect(keys(BSOSE_FILES)))).")
 
-    # Candidate filename patterns for Iteration 156 (2013-2024)
-    cands_156 = [
-        "$(shortname)_bsoseI156_2013to2024_monthly.nc",
-        "$(titlecase(shortname))_bsoseI156_2013to2024_monthly.nc",
-        "$(uppercase(shortname))_bsoseI156_2013to2024_monthly.nc",
-        "$(lowercase(shortname))_bsoseI156_2013to2024_monthly.nc",
-        "bsose_i156_2013to2024_monthly_$(shortname).nc",
-        "bsose_i156_2013to2024_monthly_$(titlecase(shortname)).nc",
-        "$(filetoken)_bsoseI156_2013to2024_monthly.nc",
-    ]
+    table = BSOSE_FILES[iteration]
+    haskey(table, var_name) ||
+        error("""BSOSE iteration $iteration has no filename for `$var_name`.
+                 Known variables: $(sort(string.(collect(keys(table))))).
+                 Add it to `BSOSE_FILES` in src/setup_bsose.jl.""")
 
-    # Candidate filename patterns for Iteration 105 (2008-2012)
-    cands_105 = [
-        "bsose_i105_2008to2012_monthly_$(shortname).nc",
-        "bsose_i105_2008to2012_monthly_$(titlecase(shortname)).nc",
-        "bsose_i105_2008to2012_monthly_$(uppercase(shortname)).nc",
-        "$(titlecase(shortname))_bsoseI105_2008to2012_monthly.nc",
-        "$(shortname)_bsoseI105_2008to2012_monthly.nc",
-        "bsose_i105_2008to2012_monthly_$(filetoken).nc",
-    ]
+    token, span = table[var_name]
+    fname = bsose_filename(token, span, iteration)
+    isfile(joinpath(dir, fname)) && return fname
 
-    candidates = iteration == 156 ? vcat(cands_156, cands_105) : vcat(cands_105, cands_156)
+    # Not found: say exactly what was expected, and what is there under the same token.
+    nearby = isdir(dir) ?
+             filter(f -> endswith(f, ".nc") && occursin(lowercase(token), lowercase(f)), readdir(dir)) :
+             String[]
+    hint = isempty(nearby) ? "No .nc file in that directory mentions \"$token\"." :
+           "Files there mentioning \"$token\":\n    " * join(nearby, "\n    ") *
+           "\n  If one of those is the right file, fix the token for `$var_name` in `BSOSE_FILES`."
 
-    for cand in candidates
-        if isfile(joinpath(dir, cand))
-            return cand
-        end
-    end
-
-    # Fallback directory search matching the variable token, preferring files that
-    # also name this iteration. Without the iteration preference, a directory
-    # holding both iterations would silently serve iteration 105 data to an
-    # iteration 156 run.
-    if isdir(dir)
-        t_low = lowercase(filetoken)
-        matches = filter(readdir(dir)) do f
-            endswith(f, ".nc") && occursin(t_low, lowercase(f))
-        end
-
-        for token in bsose_iteration_tokens(iteration)
-            for f in matches
-                occursin(token, lowercase(f)) && return f
-            end
-        end
-
-        isempty(matches) || return first(matches)
-    end
-
-    return iteration == 156 ? "$(titlecase(shortname))_bsoseI156_2013to2024_monthly.nc" : "bsose_i105_2008to2012_monthly_$(titlecase(shortname)).nc"
+    error("""BSOSE iteration $iteration: `$var_name` not found.
+             Expected: $(joinpath(dir, fname))
+             $hint""")
 end
 
 # ==============================================================================
@@ -756,21 +784,16 @@ function DataWrangling.inpainted_metadata_path(metadata::BSOSEMetadata)
 end
 
 function DataWrangling.all_dates(dataset::BSOSEMonthly, var)
-    fn = resolve_bsose_filename(dataset.dir, var, dataset.iteration)
-    fp = joinpath(dataset.dir, fn)
-    if isfile(fp)
-        try
-            ds = Dataset(fp)
-            dates = [DateTime(t) for t in ds["time"][:]]
-            close(ds)
-            return dates
-        catch
-        end
-    end
-    if dataset.iteration == 156
-        return collect(DateTime(2013, 1, 1):Month(1):DateTime(2024, 12, 1))
-    else
-        return collect(DateTime(2008, 1, 1):Month(1):DateTime(2012, 12, 1))
+    # Read the dates out of the file, or fail. There used to be a `catch` here that fell back
+    # to a synthetic `2013-01-01:Month(1):2024-12-01` range, which meant an unreadable or
+    # truncated file produced a plausible-looking date axis that did not match its own
+    # contents -- a silent error of exactly the kind this module is trying to stop making.
+    fp = joinpath(dataset.dir, resolve_bsose_filename(dataset.dir, var, dataset.iteration))
+    ds = Dataset(fp)
+    try
+        return [DateTime(t) for t in ds["time"][:]]
+    finally
+        close(ds)
     end
 end
 

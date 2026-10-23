@@ -48,7 +48,6 @@ end
 #     RUN_NAME_surface.nc        surface fields, daily
 #     RUN_NAME_midlon.nc         mid-longitude transect, daily
 #     RUN_NAME_free_surface.nc   free-surface height, daily          (BOUNDARY_DIAGNOSTICS)
-#     RUN_NAME_face_west.nc  …   the four boundary faces, 5-daily    (BOUNDARY_DIAGNOSTICS)
 #
 # Change it for each experiment so runs do not overwrite one another, then animate
 # the result with `./run_animate_simulation RUN_NAME`.
@@ -116,7 +115,7 @@ const BSOSE_FLUXES    = SURFACE_FLUXES && ATMOSPHERE === :none
 const BSOSE_SHORTWAVE = PENETRATING_SHORTWAVE && ATMOSPHERE === :none
 
 const CHECKPOINTS = false # save state and restart if the model crashes. If false, the model will start from scratch.
-const BOUNDARY_DIAGNOSTICS = true # write free-surface height, boundary-face slices, and a per-face volume transport log
+const BOUNDARY_DIAGNOSTICS = true # write free-surface height and a per-face volume transport log
 
 # Barotropic (depth-integrated) open boundary conditions: Flather on U and V, fed the BSOSE
 # depth-integrated transport, with the companion Chapman condition added to η automatically.
@@ -305,6 +304,11 @@ const DZ_SURFACE = 5 # m (gives ~135 vertical levels total, with 100 levels in u
 const DZ_BOTTOM = 200 # m
 const CIRCUMPOLAR = false # if true, we will use a circumpolar domain
 
+# Which BSOSE iteration to read. This picks the filenames directly (see `BSOSE_FILES` in
+# src/setup_bsose.jl): iteration 156 covers 2013-2024, iteration 105 covers 2008-2012.
+# Nothing is auto-detected and nothing falls back -- a missing file is an error.
+const BSOSE_ITERATION = 156
+
 const DATASET = "BSOSE" # by default, our forcings and BCs will be BSOSE, but if we want to test GLORYS or ECCO, we should be able to do that. 
 
 # Domain setup
@@ -372,7 +376,7 @@ grid = ImmersedBoundaryGrid(grid, GridFittedBottom(bottom_height))
 # dataset conditonal
 
 if DATASET == "BSOSE"
-    dataset = BSOSEMonthly()
+    dataset = BSOSEMonthly(iteration=BSOSE_ITERATION)
 elseif DATASET == "GLORYS"
     dataset = GLORYSMonthly()
 elseif DATASET == "ECCO"
@@ -948,9 +952,10 @@ simulation.output_writers[:mid_lon] = NetCDFWriter(
 #   2. Volume transport through each of the four faces. Net outflow should be a small
 #      residual of the gross transport (the ACC alone carries ~100 Sv through this
 #      domain) and should balance the rate of change of volume in the free surface.
-#   3. Full-depth slices at each face, to see whether flow and tracers cross the
-#      boundary at every depth or only near the surface, and to compare against the
-#      BSOSE values the boundary conditions prescribe.
+#
+# A third diagnostic -- full-depth slices at each face, written to RUN_NAME_face_*.nc -- used
+# to live here. It was removed: four files per run cluttering the project directory, for
+# something the transport log below already answers.
 # ==============================================================================
 
 if BOUNDARY_DIAGNOSTICS
@@ -966,27 +971,6 @@ if BOUNDARY_DIAGNOSTICS
         global_attributes=output_metadata,
         overwrite_files=true
     )
-
-    # Outermost cell of each face, full depth. The writer takes a single `indices` tuple,
-    # so on the east and north faces the normal velocity written is the inner face of that
-    # cell; the exact boundary-face transport is what the log below integrates.
-    boundary_interval = 5days
-    face_indices = (west=(1, :, :),
-        east=(grid.Nx, :, :),
-        south=(:, 1, :),
-        north=(:, grid.Ny, :))
-
-    for (face, indices) in pairs(face_indices)
-        simulation.output_writers[Symbol(:face_, face)] = NetCDFWriter(
-            ocean.model,
-            (; u, v, T, S),
-            filename="$(RUN_NAME)_face_$(face).nc",
-            schedule=TimeInterval(boundary_interval),
-            indices=indices,
-            global_attributes=output_metadata,
-            overwrite_files=true
-        )
-    end
 
     # Volume transport through each boundary face: ∫∫ u·n dA over the face.
     u_transport = KernelFunctionOperation{Face,Center,Center}(Ax_qᶠᶜᶜ, grid, u)
