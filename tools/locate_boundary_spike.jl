@@ -130,6 +130,49 @@ else
     @warn "no surface file at $sf_path"
 end
 
+# ==============================================================================
+# Watch table: the two features this run is actually being judged on.
+#
+# The global maximum is useless for the A/B. One stuck cell at the south-east corner holds
+# |v| near 6.2 m/s from day one and never accumulates, so it dominates `|u⃗|ₘₐₓ` in the log
+# and hides the thing that matters -- the north-east corner, where east-face tangential v
+# grew 1.4 -> 3.4 m/s over twelve days in the :radiated run. That whole range is below 6.2.
+#
+# So report them separately: the corner cell on its own, and the east-face maximum north of
+# 48S with that corner excluded.
+# ==============================================================================
+if isfile(sf_path)
+    hdr("WATCH: the A/B metrics, per output day")
+    ds = Dataset(sf_path)
+    nt = size(ds["v"])[end]
+    _, lat, _ = axis_values(ds, "v")
+
+    jcut = lat === nothing ? 120 : findfirst(φ -> φ > -48.0, lat)
+    jcut === nothing && (jcut = 120)
+
+    @printf("%4s  %22s  %10s   %18s\n", "day", "NE: max|v| east face", "at j", "SE corner (360,11)")
+    @printf("%4s  %22s  %10s   %18s\n", "---", "(i=360, j>=$jcut)", "----", "------------------")
+    for t in 1:nt
+        V = slab(ds, "v", t)
+        Nx, Ny = size(V)
+        ie = min(360, Nx)
+
+        best, jbest = -Inf, 0
+        for j in jcut:Ny
+            v = V[ie, j]
+            isfinite(v) && abs(v) > best && (best = abs(v); jbest = j)
+        end
+        corner = (11 <= Ny) ? V[ie, 11] : NaN
+        @printf("%4d  %22.3f  %10d   %18.3f\n", t - 1, best, jbest, corner)
+    end
+    close(ds)
+    println("""
+ NE column: flat means Gradient(0) fixed the corner accumulation. Still climbing toward 3+
+ means the tangential condition was not the cause and the corner needs a different answer.
+ SE column: expected to be unchanged (~6.2, slowly decaying) either way -- that cell is a
+ separate problem, most likely a thin column left by the bathymetry matching.""")
+end
+
 println("""
 
 Reading this:
