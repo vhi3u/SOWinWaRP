@@ -31,6 +31,9 @@
 #     DAYS         comma-separated output indices to map, or "first,mid,last" (default)
 #     EXCLUDE_KM   width of the boundary exclusion band, km (300, after Ito et al.)
 #     CLIP_PCT     percentile for the clipped panel (99.0)
+#     TRIM_CORNERS cells dropped from each end of every edge line before the profile
+#                  statistics (0). Set it to ~30 to ask whether a face is bad or whether a
+#                  corner is setting the percentile for both faces that meet there.
 #     OUTDIR       where figures go (tools/boundary_maps)
 # ==============================================================================
 
@@ -40,6 +43,7 @@ const RUN        = get(ENV, "RUN_NAME", length(ARGS) > 0 ? ARGS[1] : "20D_glorys
 const DIR        = get(ENV, "DIR", ".")
 const EXCLUDE_KM = parse(Float64, get(ENV, "EXCLUDE_KM", "300"))
 const CLIP_PCT   = parse(Float64, get(ENV, "CLIP_PCT", "99.0"))
+const TRIM       = parse(Int,     get(ENV, "TRIM_CORNERS", "0"))
 const OUTDIR     = get(ENV, "OUTDIR", joinpath(@__DIR__, "boundary_maps"))
 
 mkpath(OUTDIR)
@@ -76,8 +80,16 @@ function band_cells(lon, lat, km)
     return max(1, round(Int, km / Δx)), max(1, round(Int, km / Δy)), Δx, Δy
 end
 
-"""Max and 99th percentile of `S` as a function of distance in cells from each edge."""
-function edge_profiles(S)
+"""
+Max and 99th percentile of `S` as a function of distance in cells from each edge.
+
+`trim` drops that many cells from each END of every line before the statistics, which separates
+"this face is bad" from "a corner is bad and it is setting the percentile for both faces that
+meet there". A corner feature spanning ~10 cells is the top 3% of a 360-cell row, so it alone
+can set that row's p99. If a face's profile collapses to the interior value under a modest trim,
+the face is clean and the corner owns the signal.
+"""
+function edge_profiles(S; trim = 0)
     Nx, Ny = size(S)
     out = Dict{Symbol,Tuple{Vector{Float64},Vector{Float64}}}()
     for (side, n, sel) in ((:west,  Nx, d -> S[d + 1, :]),
@@ -87,7 +99,9 @@ function edge_profiles(S)
         dmax = min(60, n - 1)
         mx, p99 = Float64[], Float64[]
         for d in 0:dmax
-            line = filter(isfinite, sel(d))
+            raw = sel(d)
+            t = min(trim, (length(raw) - 1) ÷ 2)
+            line = filter(isfinite, raw[1+t:end-t])
             push!(mx,  isempty(line) ? NaN : maximum(line))
             push!(p99, isempty(line) ? NaN : quantile(line, 0.99))
         end
@@ -148,10 +162,11 @@ for t in days
     end
 
     # distance-from-edge profiles
-    prof = edge_profiles(S)
-    ax3 = Axis(fig[2, 1], title = "max speed vs distance from each boundary",
+    prof = edge_profiles(S; trim = TRIM)
+    tlab = TRIM > 0 ? "  (corners trimmed $(TRIM) cells)" : ""
+    ax3 = Axis(fig[2, 1], title = "max speed vs distance from each boundary" * tlab,
                xlabel = "cells from boundary", ylabel = "max |u⃗| (m/s)")
-    ax4 = Axis(fig[2, 2], title = "99th percentile vs distance (the field, not the outlier)",
+    ax4 = Axis(fig[2, 2], title = "99th percentile vs distance (the field, not the outlier)" * tlab,
                xlabel = "cells from boundary", ylabel = "p99 |u⃗| (m/s)")
     for (side, c) in ((:west, :dodgerblue), (:east, :firebrick), (:south, :orange), (:north, :seagreen))
         mx, p99 = prof[side]
@@ -162,7 +177,7 @@ for t in days
     vlines!(ax4, [by], color = :gray, linestyle = :dash)
     axislegend(ax3, position = :rt); axislegend(ax4, position = :rt)
 
-    f = joinpath(OUTDIR, "$(RUN)_day$(lpad(t-1, 2, '0')).png")
+    f = joinpath(OUTDIR, "$(RUN)_day$(lpad(t-1, 2, '0'))$(TRIM > 0 ? "_trim$(TRIM)" : "").png")
     save(f, fig)
     @info "wrote $f"
 end
@@ -206,4 +221,7 @@ Reading this:
   * In the profile panels, a pileup is a spike at distance 0 decaying within a few cells. A
     real current crossing the boundary is flat with distance.
   * The p99 lines matter more than the max: one stuck cell moves the max and nothing else.
+  * Run it twice, once with TRIM_CORNERS=30. A face whose edge value collapses toward the
+    interior under the trim is clean -- the corner where it meets its neighbour owns the
+    signal, and both faces were reporting it.
 """)
