@@ -259,6 +259,12 @@ end
 
 `uext_mode` is 02's `MAB_UEXT`: `:native` (its default and the one it validated), `:masked`, or
 `:legacy`. `tangential` is its `MAB_TANGENTIAL`: `:radiated` (default) or `:prescribed`.
+
+`form = :schemes` (default) keeps 02's radiation/advection schemes on `u`, `v`, `T`, `S`.
+`form = :dirichlet` drops every scheme and imposes the GLORYS value directly on all four faces --
+MITgcm's `useOBCSprescribe`, the condition Ito & Timmermans' SODA-forced setup runs. `prescribe_eta`
+additionally imposes GLORYS `zos` on `η`; see the comment on `η_bcs`. Both default to the existing
+behaviour, so `src/model.jl` is unaffected.
 `top_*` carry our own surface forcing, which 02 has no equivalent of -- it gets ERA5 through
 `OceanOnlyModel` -- and `FieldBoundaryConditions` is immutable, so they must be built in here.
 """
@@ -270,6 +276,8 @@ function glorys_open_boundary_conditions(grid;
                                          tau_in = 1days,
                                          uext_mode = :native,
                                          tangential = :radiated,
+                                         form = :schemes,
+                                         prescribe_eta = false,
                                          pin_transport = true,
                                          top_u = nothing, top_v = nothing,
                                          top_T = nothing, top_S = nothing)
@@ -278,6 +286,8 @@ function glorys_open_boundary_conditions(grid;
         error("uext_mode must be :native, :masked or :legacy; got $uext_mode.")
     tangential in (:radiated, :prescribed, :gradient) ||
         error("tangential must be :radiated, :prescribed or :gradient; got $tangential.")
+    form in (:schemes, :dirichlet) ||
+        error("form must be :schemes or :dirichlet; got $form.")
 
     underlying = grid isa ImmersedBoundaryGrid ? grid.underlying_grid : grid
     Nx, Ny, Nz = size(underlying)
@@ -495,9 +505,32 @@ function glorys_open_boundary_conditions(grid;
     function face_series(slabs, times, side)
         along_x = side in (:south, :north)
         N = along_x ? Nx : Ny
+        # The z location must be `Center`, not `Nothing`, even though these series carry no depth.
+        #
+        # `getbc` dispatches on the location triple. The west/east fill calls
+        # `getbc(bc, j, k, grid, clock)` with k = 1 (the barotropic fields are `Nothing` in z, so
+        # the kernel is one cell deep). {Nothing, Center, Nothing} is `YFTS`, whose `getbc` is
+        #
+        #     getbc(f::YFTS, i1, i2, grid, clock) = (Nx, _, Nz = size(grid);
+        #                                            j = ifelse(Nz == 1, i1, i2); f[1, j, 1, t])
+        #
+        # a guess its own source comment calls "not really well defined". It asks whether the GRID
+        # is two-dimensional -- but the barotropic U, V and η are built on `maybe_extended_grid`,
+        # the full 3-D grid with Nz = 135. So Nz != 1, it takes i2 = k = 1, and EVERY column along
+        # the west and east faces reads element j = 1: the single 70°S value, held constant up the
+        # whole face, for both Uᵉˣᵗ and ηᵉˣᵗ. South and north were correct (`XFTS` uses only the
+        # first index); they move to `XZFTS` here for symmetry, not because they were wrong.
+        #
+        # {Nothing, Center, Center} is `YZFTS`, whose `getbc` is unambiguous:
+        #     getbc(f::YZFTS, j, k, grid, clock) = f[1, j, k, t]
+        # and with the one-cell z window k = 1 is the only valid index. Verified by dispatch test.
+        #
+        # This is why no boundary scheme ever helped: `target_transport` pins the face INTEGRAL, so
+        # a flat Uᵉˣᵗ still rescaled to the right net transport. The net was never the tell -- the
+        # shape was, and the pileups sat on exactly the two faces this corrupted.
         fts = along_x ?
-              FieldTimeSeries{Center,Nothing,Nothing}(cpu_grid, times; indices = (:, 1, 1)) :
-              FieldTimeSeries{Nothing,Center,Nothing}(cpu_grid, times; indices = (1, :, 1))
+              FieldTimeSeries{Center,Nothing,Center}(cpu_grid, times; indices = (:, 1, 1)) :
+              FieldTimeSeries{Nothing,Center,Center}(cpu_grid, times; indices = (1, :, 1))
         for t in eachindex(times)
             slab = slabs[t]
             # model index n  <->  source index n + n_pad, as in 02's `lerp_slab`.
@@ -529,32 +562,45 @@ function glorys_open_boundary_conditions(grid;
     # but removes the discontinuity that a prescribed or relaxed value puts into ∂v/∂x. Since
     # ζ = ∂v/∂x − ∂u/∂y, that discontinuity shows up as vorticity sitting on the boundary --
     # and it is the tangential components that grow at the corners here.
+    #
+    # `form = :dirichlet` collapses all of the above: normal velocity, tangential velocity and both
+    # tracers become the hard GLORYS value on every face, with no scheme and no timescale. Nothing
+    # is lost on outflow -- tracer advection is upwind-biased, so on an outflow face the upstream
+    # cell is interior and the prescribed exterior value is simply unused, which is the same
+    # inflow/outflow switching `outflow_timescale = Inf` was doing explicitly.
+    dirichlet = form === :dirichlet
+
+    normal_bc(fts) = dirichlet ? NormalFlowBoundaryCondition(Interpolated(fts)) :
+                                 NormalFlowBoundaryCondition(Interpolated(fts); scheme = normal_scheme)
+
     tangential_bc(fts) =
+        dirichlet                  ? ValueBoundaryCondition(Interpolated(fts)) :
         tangential === :prescribed ? ValueBoundaryCondition(Interpolated(fts)) :
         tangential === :gradient   ? GradientBoundaryCondition(0) :
                                      ValueBoundaryCondition(Interpolated(fts); scheme = tangential_sch)
 
+    tracer_bc(fts) = dirichlet ? ValueBoundaryCondition(Interpolated(fts)) :
+                                 ValueBoundaryCondition(Interpolated(fts); scheme = tracer_scheme)
+
     maybe_top(bc) = bc === nothing ? NamedTuple() : (; top = bc)
 
     u_bcs = FieldBoundaryConditions(;
-        west  = NormalFlowBoundaryCondition(Interpolated(fts_u); scheme = normal_scheme),
-        east  = NormalFlowBoundaryCondition(Interpolated(fts_u); scheme = normal_scheme),
+        west  = normal_bc(fts_u),
+        east  = normal_bc(fts_u),
         south = tangential_bc(fts_u),
         north = tangential_bc(fts_u),
         maybe_top(top_u)...)
 
     v_bcs = FieldBoundaryConditions(;
-        south = NormalFlowBoundaryCondition(Interpolated(fts_v); scheme = normal_scheme),
-        north = NormalFlowBoundaryCondition(Interpolated(fts_v); scheme = normal_scheme),
+        south = normal_bc(fts_v),
+        north = normal_bc(fts_v),
         west  = tangential_bc(fts_v),
         east  = tangential_bc(fts_v),
         maybe_top(top_v)...)
 
     tracer_bcs(fts, top) = FieldBoundaryConditions(;
-        west  = ValueBoundaryCondition(Interpolated(fts); scheme = tracer_scheme),
-        east  = ValueBoundaryCondition(Interpolated(fts); scheme = tracer_scheme),
-        south = ValueBoundaryCondition(Interpolated(fts); scheme = tracer_scheme),
-        north = ValueBoundaryCondition(Interpolated(fts); scheme = tracer_scheme),
+        west  = tracer_bc(fts), east  = tracer_bc(fts),
+        south = tracer_bc(fts), north = tracer_bc(fts),
         maybe_top(top)...)
 
     # ---------------------------------------------------------------------------
@@ -617,16 +663,47 @@ function glorys_open_boundary_conditions(grid;
     V_bcs = FieldBoundaryConditions(grid, (Center(), Face(), nothing);
         south = GravityWaveRadiationBoundaryCondition((V_south_ext, η_south_ext); target_transport = tt(:south)),
         north = GravityWaveRadiationBoundaryCondition((V_north_ext, η_north_ext); target_transport = tt(:north)))
-    η_bcs = FieldBoundaryConditions(grid, (Center(), Center(), Face());
-        west  = SurfaceWaveRadiationBoundaryCondition(), east  = SurfaceWaveRadiationBoundaryCondition(),
-        south = SurfaceWaveRadiationBoundaryCondition(), north = SurfaceWaveRadiationBoundaryCondition())
+    # The free surface: Chapman radiation (the default), or GLORYS `zos` imposed directly.
+    #
+    # Prescribing η also makes the BAROTROPIC transport Dirichlet, which is the only way to get
+    # there while keeping the transport pin -- `target_transport` is a field of the Flather scheme
+    # and has no equivalent on a scheme-free `NormalFlowBoundaryCondition`.
+    #
+    # The collapse is exact, not approximate. Flather's west fill reads
+    #
+    #     ηᵇ = ℑxᶠᵃᵃ(1, j, Nz+1, grid, η) = (η[0,j] + η[1,j]) / 2
+    #
+    # and a `Value` halo fill sets η[0,j] = 2v - η[1,j] (from ∇c = (c₁ - v)/(Δ/2) extrapolated
+    # back one Δ), so ηᵇ = v identically. Feed the same series as both the prescribed value and
+    # Flather's ηᵉˣᵗ and the √(gH)(ηᵇ - ηᵉˣᵗ) term is identically zero: U = Uᵉˣᵗ, then rescaled to
+    # the balanced net. That is MITgcm `useOBCSprescribe` + `useOBCSbalance`.
+    #
+    # What it gives up is the radiating path for barotropic gravity waves. MITgcm does not need
+    # one -- its implicit free surface (deltaTfreesurf = deltaTmom) does not resolve them at all --
+    # but ours substeps at √(gH) ~ 198 m/s, so they exist here and a Dirichlet η reflects them.
+    # A fully reflecting basin of this size seiches at 2L/c ~ 10.1 h zonal, 7.8 h meridional.
+    # Daily output aliases that, so watch the free-surface log, not the NetCDF.
+    η_bcs = prescribe_eta ?
+        FieldBoundaryConditions(grid, (Center(), Center(), Face());
+            west  = ValueBoundaryCondition(η_west_ext),  east  = ValueBoundaryCondition(η_east_ext),
+            south = ValueBoundaryCondition(η_south_ext), north = ValueBoundaryCondition(η_north_ext)) :
+        FieldBoundaryConditions(grid, (Center(), Center(), Face());
+            west  = SurfaceWaveRadiationBoundaryCondition(), east  = SurfaceWaveRadiationBoundaryCondition(),
+            south = SurfaceWaveRadiationBoundaryCondition(), north = SurfaceWaveRadiationBoundaryCondition())
 
-    @info " -> normal: PerturbationAdvection(τ_in = $(tau_in/days) d, τ_out = Inf)"
-    @info " -> tangential: $(tangential === :prescribed ? "prescribed (Dirichlet)" :
-                             tangential === :gradient   ? "Gradient(0)" :
-                             "NormalRadiation(τ_in = $(tau_in/days) d, τ_out = Inf)")"
-    @info " -> tracers: NormalRadiation(τ_in = $(tau_in/days) d, τ_out = Inf)"
-    @info " -> barotropic: Flather on all four faces; η: Chapman on all four faces"
+    if dirichlet
+        @info " -> u, v (normal and tangential), T, S: hard Dirichlet from GLORYS on all four faces"
+    else
+        @info " -> normal: PerturbationAdvection(τ_in = $(tau_in/days) d, τ_out = Inf)"
+        @info " -> tangential: $(tangential === :prescribed ? "prescribed (Dirichlet)" :
+                                 tangential === :gradient   ? "Gradient(0)" :
+                                 "NormalRadiation(τ_in = $(tau_in/days) d, τ_out = Inf)")"
+        @info " -> tracers: NormalRadiation(τ_in = $(tau_in/days) d, τ_out = Inf)"
+    end
+    @info prescribe_eta ?
+          " -> barotropic: Flather collapsed to Dirichlet (η prescribed from GLORYS); net still pinned" :
+          " -> barotropic: Flather on all four faces; η: Chapman on all four faces"
+    @info " -> face series: XZFTS/YZFTS (getbc reads the j-th column, not j = 1)"
 
     bcs = (u = u_bcs, v = v_bcs, T = tracer_bcs(fts_T, top_T), S = tracer_bcs(fts_S, top_S),
            U = U_bcs, V = V_bcs, η = η_bcs)
