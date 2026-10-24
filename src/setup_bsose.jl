@@ -1824,7 +1824,8 @@ the 3D field uses.
   PerturbationAdvection usable here; √(gH) ≈ 210 m/s for a 4.5 km water column.
 """
 function bsose_tangential_boundary_condition(value, kind; gravity_wave_speed=210.0,
-    oblique_inflow_timescale=3days, oblique_outflow_timescale=360days)
+    oblique_inflow_timescale=3days, oblique_outflow_timescale=360days,
+    radiation_inflow_timescale=1days)
     kind === :gradient && return GradientBoundaryCondition(0)
     kind === :clamped && return ValueBoundaryCondition(value)
 
@@ -1837,10 +1838,10 @@ function bsose_tangential_boundary_condition(value, kind; gravity_wave_speed=210
             outflow_timescale=oblique_outflow_timescale, use_boundary_velocity=true))
 
     kind === :radiation && return ValueBoundaryCondition(value;
-        scheme=NormalRadiation(inflow_timescale=1days, outflow_timescale=Inf))
+        scheme=NormalRadiation(inflow_timescale=radiation_inflow_timescale, outflow_timescale=Inf))
 
     kind === :radiation_boundary_velocity && return ValueBoundaryCondition(value;
-        scheme=NormalRadiation(inflow_timescale=1days, outflow_timescale=Inf,
+        scheme=NormalRadiation(inflow_timescale=radiation_inflow_timescale, outflow_timescale=Inf,
             use_boundary_velocity=true))
 
     kind === :perturbation_advection && return ValueBoundaryCondition(value;
@@ -1934,6 +1935,8 @@ function bsose_open_boundary_conditions(grid;
     surface_fluxes=false,
     penetrating_shortwave=false,
     tangential_bc_kind=:gradient,
+    tracer_scheme=:same,
+    radiation_inflow_timescale=1days,
     barotropic=false,
     barotropic_faces=:zonal,
     barotropic_scheme=:pinned,
@@ -2337,7 +2340,23 @@ function bsose_open_boundary_conditions(grid;
     # a fast meridional jet pinned along the western edge.
     tangential_bc(value) = bsose_tangential_boundary_condition(value, tangential_bc_kind;
         gravity_wave_speed=tangential_gravity_wave_speed,
-        oblique_inflow_timescale, oblique_outflow_timescale)
+        oblique_inflow_timescale, oblique_outflow_timescale, radiation_inflow_timescale)
+
+    # Tracers can take a different scheme from the normal flow.
+    #
+    # `:same` keeps the historical behaviour -- T and S inherit whatever `scheme` the normal
+    # velocity uses. A `TracerReservoir` instead carries a reservoir value just outside each
+    # boundary point (after MOM6's tracer reservoirs) and relaxes it toward the upstream value
+    # over a length scale: the exterior value on inflow, the adjacent interior value on outflow.
+    # With `outflow_length_scale = 0` an outflowing cell simply takes the interior value, which
+    # is the zero-gradient behaviour you want when water is leaving.
+    #
+    # This is what NestingValidation's canary setup runs, and it is also the configuration that
+    # sidesteps their ObliqueRadiation-on-tracers divergence: the tracer boundary no longer
+    # carries a tangential phase speed at all, so a land-adjacent cell has nothing to go wrong.
+    tracer_bc(value) = tracer_scheme === :same ?
+        ValueBoundaryCondition(value; scheme) :
+        ValueBoundaryCondition(value; scheme=tracer_scheme)
     if is_x_periodic
         @info " -> Longitude is Periodic (circumpolar): applying South & North boundary conditions."
         u_bcs = FieldBoundaryConditions(
@@ -2353,14 +2372,14 @@ function bsose_open_boundary_conditions(grid;
         )
 
         T_bcs = FieldBoundaryConditions(
-            south=ValueBoundaryCondition(T_south; scheme),
-            north=ValueBoundaryCondition(T_north; scheme),
+            south=tracer_bc(T_south),
+            north=tracer_bc(T_north),
             top=top_T_bc
         )
 
         S_bcs = FieldBoundaryConditions(
-            south=ValueBoundaryCondition(S_south; scheme),
-            north=ValueBoundaryCondition(S_north; scheme),
+            south=tracer_bc(S_south),
+            north=tracer_bc(S_north),
             top=top_S_bc
         )
 
@@ -2383,18 +2402,18 @@ function bsose_open_boundary_conditions(grid;
         )
 
         T_bcs = FieldBoundaryConditions(
-            west=ValueBoundaryCondition(T_west; scheme),
-            east=ValueBoundaryCondition(T_east; scheme),
-            south=ValueBoundaryCondition(T_south; scheme),
-            north=ValueBoundaryCondition(T_north; scheme),
+            west=tracer_bc(T_west),
+            east=tracer_bc(T_east),
+            south=tracer_bc(T_south),
+            north=tracer_bc(T_north),
             top=top_T_bc
         )
 
         S_bcs = FieldBoundaryConditions(
-            west=ValueBoundaryCondition(S_west; scheme),
-            east=ValueBoundaryCondition(S_east; scheme),
-            south=ValueBoundaryCondition(S_south; scheme),
-            north=ValueBoundaryCondition(S_north; scheme),
+            west=tracer_bc(S_west),
+            east=tracer_bc(S_east),
+            south=tracer_bc(S_south),
+            north=tracer_bc(S_north),
             top=top_S_bc
         )
     end

@@ -17,7 +17,8 @@ using SeawaterPolynomials
 using Oceananigans.TurbulenceClosures
 using Oceananigans.Grids: φnode
 using Oceananigans.Operators: Azᶜᶜᶜ, Ax_qᶠᶜᶜ, Ay_qᶜᶠᶜ
-using Oceananigans.BoundaryConditions: PerturbationAdvection, NormalRadiation, ObliqueRadiation
+using Oceananigans.BoundaryConditions: PerturbationAdvection, NormalRadiation, ObliqueRadiation,
+                                       TracerReservoir
 using Oceananigans.Diagnostics: NaNChecker
 using Oceanostics.ProgressMessengers: TimedMessenger
 
@@ -39,215 +40,94 @@ else
 end
 
 # ==============================================================================
-# Run name
+# CONFIGURATION -- everything you change between runs lives here and nowhere else.
 #
-# Every file this run writes is prefixed with it:
-#
-#     RUN_NAME_surface.nc        surface fields, daily
-#     RUN_NAME_midlon.nc         mid-longitude transect, daily
-#     RUN_NAME_free_surface.nc   free-surface height, daily          (BOUNDARY_DIAGNOSTICS)
-#
-# Change it for each experiment so runs do not overwrite one another, then animate
-# the result with `./run_animate_simulation RUN_NAME`.
+# The reasoning behind these values is NOT repeated here. It is in the architecture note,
+# vhieuvault/Research (GATO)/SoWinWaRP/Model Architecture.md, which carries the measurements,
+# the disproven theories and the traps. Keep that file current when you change this one.
 # ==============================================================================
-const RUN_NAME = "20D_bsose_dirichlet"
 
-# flags
+# ---- run identity -------------------------------------------------------------------------
+# Prefixes every output file: RUN_NAME_surface.nc, _midlon.nc, _free_surface.nc.
+# Change it per experiment or runs overwrite each other. Animate: ./run_animate_simulation NAME
+const RUN_NAME = "20D_bsose_v1"
 
-const OBCS = true # open boundary conditions (NormalFlow with PerturbationAdvection)
-# Off. MITgcm's `obcs` does not compile a sponge at all (`ALLOW_OBCS_SPONGE` is `#undef` in
-# Ito & Timmermans' setup), and adding one at the same time as a boundary change would make
-# the result uninterpretable. Set `true` to A/B it once the boundary is understood.
-const SPONGE_LAYERS = false # sponge layer restoring (DatasetRestoring) near open boundary edges
-const WINDS = false # time-varying surface wind forcing from BSOSE data (oceTAUX and oceTAUY)
-# Surface heat and salt fluxes from BSOSE (TFLUX and SFLUX). Without these the ocean exchanges
-# nothing with the atmosphere but momentum: it cannot cool in winter or warm in summer, and its
-# surface temperature drifts away from BSOSE as water crosses the domain.
-const SURFACE_FLUXES = false
+# ---- period and domain --------------------------------------------------------------------
+const START_DATE = DateTime("2014-06-01")
+const END_DATE   = DateTime("2014-06-21")   # 20 days: a boundary test, not a science run
 
-# Distribute the solar part of the surface heat flux through the water column by Beer's law
-# instead of depositing all of it in the top cell.
+const SCALING    = 6        # horizontal resolution = 1/SCALING degrees (1/6 ~ 15 km)
+const DZ_SURFACE = 5        # m, upper-ocean spacing -> ~135 levels, 100 of them above 500 m
+const DZ_BOTTOM  = 200      # m, deep spacing
+const CIRCUMPOLAR = false   # true = 0-360 degrees, Periodic in x (west/east BCs then unused)
+
+const BSOSE_ITERATION = 156 # 156 covers 2013-2024, 105 covers 2008-2012. No fallback: a
+                            # missing file is an error. Filenames: BSOSE_FILES in setup_bsose.jl
+
+# ---- open boundaries ----------------------------------------------------------------------
+const OBCS = true                           # false = whole-region restoring instead
+
+const OBC_SCHEME    = "NormalRadiation"     # normal u/v: NormalRadiation | PerturbationAdvection
+                                            #             | ObliqueRadiation | clamped
+const TANGENTIAL_BC = :radiation            # tangential u/v: :radiation | :clamped | :gradient
+                                            #   | :oblique | :perturbation_advection | ...
+const RADIATION_TAU_IN = 6hours             # inflow nudging; outflow is Inf throughout
+const OBLIQUE_TAU_IN   = 3days              # ObliqueRadiation only
+const OBLIQUE_TAU_OUT  = 360days
+
+# Tracers. :same gives T and S whatever OBC_SCHEME the normal flow uses.
+const TRACER_SCHEME = TracerReservoir(inflow_length_scale = 5000, outflow_length_scale = 0)
+
+# Do not set ObliqueRadiation here, for two independent reasons.
 #
-# BSOSE's TFLUX is the TOTAL heat flux, sunlight included. Sunlight is not absorbed at the
-# surface: 58% of it goes within 0.35 m but the blue-green remainder decays over 23 m, so for
-# the 5 m top cell here a third of it belongs deeper. Applying TFLUX whole as a top flux puts
-# all of it in that one cell. Over Nov-Feb at 60-65S that is +344 W m⁻² into the top 5 m where
-# it should be +97, and in February it heats a cell that ought to be cooling. The run that
-# produced 2YS6_surface_flux did exactly this: a summer SST 7-9 C too warm over a mixed layer
-# 3 m deep against BSOSE's 22 m, with the heat missing from 25-120 m underneath.
+# 1. It buys nothing. NestingValidation's truncation experiment puts oblique and normal within
+#    noise of each other (enstrophy 0.184 vs 0.187); the whole gain, +32%, comes from having a
+#    TANGENTIAL condition at all, which TANGENTIAL_BC provides either way.
 #
-# `true` splits TFLUX into its solar and non-solar parts: oceQsw goes to a TwoColorRadiation
-# forcing and TFLUX - oceQsw stays on the top boundary. Needs oceQsw in data/.
-# ON, because the run now reaches December-January and the point is to see whether the warm
-# bloom is gone. The |w| tripwire at day 1 keeps this from being a confounded test: with the
-# split on and everything else at baseline, |w| grew 6x over day 1 (0.012 -> 0.073) where the
-# baseline decayed it to 0.0076. That number arrives on day 1, long before the bloom does.
-const PENETRATING_SHORTWAVE = false
+# 2. It diverges next to land, and most of our faces have some. West and east are genuine
+#    open-ocean ACC boundaries -- about 132 of 150 rows wet -- but the domain runs to 70S and
+#    the Wilkes Land coast is at 66-68S, so the southern ~18 rows of every zonal face are
+#    continent, and the south face is land across its whole length. The criterion is not "is
+#    this face mostly ocean" but "does any wet cell on it have a land neighbour along the face":
+#    six land cells out of 575 diverged a NestingValidation run, and oblique is what
+#    destabilised this model once already. North, at 45S, is probably the one clean face.
+#
+# The startup log prints each face's wet fraction, which is the measurement, not an inference.
 
-# Surface forcing: where the atmosphere comes from.
-#
-#   :era5   ERA5PrescribedAtmosphere + ERA5PrescribedRadiation,
-#           coupled through OceanOnlyModel, so the surface fluxes come from bulk formulae
-#           against a real atmosphere instead of being prescribed. Needs the
-#           CopernicusClimateDataStore backend AND a CDS API key in ~/.cdsapirc -- a different
-#           account from the Copernicus Marine one.
-#   :none   BSOSE wind stress and surface heat/salt fluxes, as before.
-#
-# `:era5` turns the BSOSE surface forcing off: the coupler computes the stress and the heat and
-# salt fluxes itself, so leaving WINDS or SURFACE_FLUXES on would apply them twice.
-#
-# It also makes PENETRATING_SHORTWAVE work properly rather than through the oceQsw callback.
-# The `TwoColorRadiation` handed to `ocean_simulation` has always been there; what was missing
-# is anything to fill its surface flux, which is exactly what a coupled model does. The BSOSE
-# oceQsw hack exists only because this file had no atmosphere.
-const ATMOSPHERE = :none
+# ---- barotropic mode and the free surface -------------------------------------------------
+# Not optional. The split-explicit corrector overwrites the depth mean of u/v at every face
+# with the barotropic solution, so without these the net transport is driven to zero whatever
+# the 3-D conditions say.
+const BAROTROPIC_OBC    = true
+const BAROTROPIC_SCHEME = :pinned   # :pinned (Flather + target_transport) | :flather
+const BAROTROPIC_FACES  = :all      # :all | :zonal -- keep :all, the :zonal theory was
+                                    # disproven (north carries -31 Sv, 18% of the zonal flow)
+const EXTERIOR_SSH      = true      # eta_ext and the initial eta from B-SOSE ETAN.
+                                    # Only safe with :pinned, which protects the net transport
+                                    # from the ~5 Sv/cm Flather sensitivity to the eta datum.
 
-# How many ERA5 variables to request from CDS at once. The backend defaults to one thread per
-# variable -- six concurrent requests -- and CDS rejects the batch with "Number queued requests
-# for this dataset is temporarily limited". One at a time is what gets through.
-const ERA5_THREADS = 1
+# ---- surface forcing ----------------------------------------------------------------------
+const WINDS                = false  # BSOSE oceTAUX / oceTAUY
+const SURFACE_FLUXES       = false  # BSOSE TFLUX / SFLUX
+const PENETRATING_SHORTWAVE = false # split oceQsw out of TFLUX into TwoColorRadiation
+const SPONGE_LAYERS        = false  # interior restoring near the open edges
+const ATMOSPHERE           = :none  # :none | :era5 (bulk formulae; needs ~/.cdsapirc)
+const ERA5_THREADS         = 1      # CDS rejects concurrent queued requests
 
-# Derived: the BSOSE surface forcing is only used when there is no coupled atmosphere, which
-# would otherwise compute the stress and the heat and salt fluxes itself and double-count them.
+# Derived: BSOSE surface forcing only applies when no coupled atmosphere is computing it.
 const BSOSE_WINDS     = WINDS && ATMOSPHERE === :none
 const BSOSE_FLUXES    = SURFACE_FLUXES && ATMOSPHERE === :none
 const BSOSE_SHORTWAVE = PENETRATING_SHORTWAVE && ATMOSPHERE === :none
 
-const CHECKPOINTS = false # save state and restart if the model crashes. If false, the model will start from scratch.
-const BOUNDARY_DIAGNOSTICS = true # write free-surface height and a per-face volume transport log
+# ---- physics and run control ---------------------------------------------------------------
+const CLOSURE_CONFIG = "ito"   # ito | bsose | henyey_gm | biharmonic | none (built below)
+const STOP_ITERATION = Inf     # cut the run short for a smoke test
+const CHECKPOINTS    = false   # write restart checkpoints every 30 days
+const BOUNDARY_DIAGNOSTICS = true  # free-surface file, per-face transport log, 30-min eta watch
 
-# Barotropic (depth-integrated) open boundary conditions: Flather on U and V, fed the BSOSE
-# depth-integrated transport, with the companion Chapman condition added to η automatically.
-#
-# Without this the split-explicit corrector overwrites the depth mean of the prescribed u/v at
-# every face with the default impenetrable barotropic solution, so no net transport can cross
-# the boundary no matter which scheme OBC_SCHEME selects — which is why every face transport
-# reads 0.00 Sv and a jet sits on the western edge.
-#
-# ηᵉˣᵗ is still 0, so the Flather condition carries transport only. That is a placeholder, not
-# a neutral choice: the real sea surface drops of order a metre between 45S and the Antarctic
-# margin, and a zero tells the boundary it is flat. SSH_bsoseI156_2013to2024_monthly.nc is the
-# fix and is not yet wired in. Read the face transports the barotropic setup now logs before
-# reading anything into the run: they should be west +180, east +205, north -25 Sv.
-const BAROTROPIC_OBC = true
-
-# ηᵉˣᵗ for the Flather condition: BSOSE's sea surface, or zero.
-#
-# `false` here is deliberate. The idealised sandbox (obc_tests/flather_sandbox.jl) measures
-# the boundary's response as
-#
-#     transport = 0.815 x Uᵉˣᵗ  +  60.8 Sv per metre of ηᵉˣᵗ tilt
-#
-# linear to three digits. BSOSE's ETAN drops 2.05 m across this domain, which on that face is
-# ~125 Sv of tilt-driven transport on top of the ~197 Sv being prescribed. That only cancels
-# if the model's own η sustains the same tilt, and it does not: supplying the real SSH made
-# the transports worse, not better. A uniform ηᵉˣᵗ, by contrast, only moves the datum --
-# 0 to 0.04 m changed the transport by 0.3%.
-#
-# So ηᵉˣᵗ = 0 is the conservative setting until the interior can be shown to hold the tilt.
-# Set `true` to use the SSH field, which also initialises η to match (the two must agree, or
-# the boundary sees a 2 m error on the first step).
-# ηᵉˣᵗ, used only by the Flather barotropic scheme. With BAROTROPIC_SCHEME = :prescribed
-# nothing reads it, so `false` also skips loading ETAN and skips initialising the free
-# surface from it.
-#
-# Leaving the η initialisation off is deliberate. It existed to stop Flather seeing a 0.7 m
-# error on day one. Without Flather there is nothing to protect, and initialising from BSOSE
-# only buys a day-one shock: max|η| fell 3.40 -> 1.32 m in 24 h as the field radiated into
-# balance with the model's own dynamics. Starting flat lets the surface build its own tilt
-# from the prescribed transport and the wind, which is the tilt the interior can actually
-# hold. Set this back to `true` only alongside BAROTROPIC_SCHEME = :flather.
-const EXTERIOR_SSH = false
-
-# How the barotropic mode is constrained: `:pinned` or `:flather`. See the long note in
-# `bsose_open_boundary_conditions` for the measurements behind this.
-#
-# Flather alone prescribes Uᵇ - √(gH)ηᵇ, not transport, at 5.1 Sv/cm on west/east and 9.5 Sv/cm
-# on north. Two runs bracket zero -- ηᵉˣᵗ = 0 gave north +213 to +219 Sv, ηᵉˣᵗ = BSOSE gave -393
-# to -437, against a prescribed -31. Same magnitude, opposite sign: too stiff, not mis-signed.
-#
-# `:pinned` keeps Flather for the shape and hands it Oceananigans' `target_transport`, which
-# rescales the face uniformly after every barotropic substep so the integral matches. The free
-# surface can then redistribute transport along a face but cannot change the net. The target is
-# materialised once, so it is the time mean: the seasonal swing of the net is given up, the
-# shape and all baroclinic structure are not.
-const BAROTROPIC_SCHEME = :pinned
-
-# Which faces get a Flather condition: `:all` (west, east, north, south) or `:zonal`
-# (west and east only, north/south depth-integrated flux held at zero).
-#
-# `:zonal` was added on the theory that the north face was a pure error amplifier: large
-# area, almost no prescribed signal, so any (ηᵇ - ηᵉˣᵗ) error there becomes huge transport.
-# tools/inspect_bsose_boundaries.jl measured that theory against BSOSE directly and it does
-# not hold. On iteration 105, 2008-06 to 2009-01:
-#
-#     west +173.0   east +204.0   south +0.0   north -31.1 Sv     (monthly means)
-#     four-face net -0.007 Sv    west+east-only net +31.1 Sv
-#
-# The four faces balance to 0.007 Sv out of ~200 Sv gross, so BSOSE does conserve volume
-# here and the integral is trustworthy. But the north face carries -31 Sv, 18% of the zonal
-# transport, not the 1.3% previously assumed -- +31 Sv genuinely enters from the north and
-# leaves through the east, which is why east exceeds west by that much. Closing it forces
-# that 31 Sv to zero, a 12% distortion of the face-mean velocity.
-#
-# The area ratio was also wrong: north/(west+east) is 1.10x on BSOSE's mask, not 1.9x. The
-# 1.9x compared the north face to a single zonal face rather than to the pair.
-#
-# So `:all` stays the default. The sandbox result that motivated `:zonal` (a third of the
-# throughflow leaking away when north/south are opened) was measured with Vᵉˣᵗ = 0, where no
-# meridional flux should exist at all -- it is not the configuration the model runs, and it
-# does not justify closing a face that carries 31 Sv. The real failure to explain is north
-# reporting +213 to +219 Sv against a prescribed -31: an error of ~250 Sv, which points at
-# ηᵉˣᵗ on that face rather than at the face being open.
-#
-# Re-run the tool on iteration 156 over the actual window before trusting these numbers.
-const BAROTROPIC_FACES = :all
-
-# Open boundary matching scheme for the NORMAL flow: "ObliqueRadiation",
-# "PerturbationAdvection", "NormalRadiation", or "clamped".
-#
-# "clamped" sets `scheme = nothing`, which makes `NormalFlowBoundaryCondition(u_west; scheme)`
-# and `ValueBoundaryCondition(T_west; scheme)` plain Dirichlet -- the B-SOSE value written
-# straight into the boundary cell every step, with no radiation and no relaxation timescale.
-# Together with TANGENTIAL_BC = :clamped that makes u, v, T and S all Dirichlet on all four
-# faces: MITgcm's `useOBCSprescribe`, which is what Ito & Timmermans' SODA-forced setup runs.
-const OBC_SCHEME = "clamped"
-
-# Condition for the TANGENTIAL velocity (u on south/north, v on west/east). One of :oblique,
-# :oblique_boundary_velocity, :gradient, :clamped, :radiation, :radiation_boundary_velocity,
-# :perturbation_advection or :perturbation_advection_gravity; see
-# `bsose_tangential_boundary_condition`.
-#
-# :oblique with OBC_SCHEME = "ObliqueRadiation" is the configuration the MAB sandbox runs —
-# the same two-dimensional radiation on the normal flow and the tangential component alike.
-#
-# :clamped is `ValueBoundaryCondition(value)` with no scheme -- the prescribed B-SOSE tangential
-# velocity, exactly as MITgcm's `obcs_apply_uv.F` writes OBNu/OBEv into the boundary cell.
-const TANGENTIAL_BC = :clamped
-
-# Nudging timescales for ObliqueRadiation, on inflow and on outflow (MAB's values). The
-# other schemes below use 1 day and Inf; the difference is deliberate.
-const OBLIQUE_TAU_IN = 3days
-const OBLIQUE_TAU_OUT = 360days
-
-# Turbulence closure set: "ito", "bsose", "henyey_gm", "biharmonic", or "none". Each is
-# described where the closures are built below.
-const CLOSURE_CONFIG = "ito"
-
-# Stop the run early after this many time steps, for a smoke test. Inf runs the full period.
-const STOP_ITERATION = Inf
-
-# domain related parameters
-const SCALING = 6 # horizontal resolution = 1 / SCALING degrees. 1/6 = ~15km, 1/2 = 50km
-const DZ_SURFACE = 5 # m (gives ~135 vertical levels total, with 100 levels in upper 500m)
-const DZ_BOTTOM = 200 # m
-const CIRCUMPOLAR = false # if true, we will use a circumpolar domain
-
-# Which BSOSE iteration to read. This picks the filenames directly (see `BSOSE_FILES` in
-# src/setup_bsose.jl): iteration 156 covers 2013-2024, iteration 105 covers 2008-2012.
-# Nothing is auto-detected and nothing falls back -- a missing file is an error.
-const BSOSE_ITERATION = 156
-
+# ==============================================================================
+# End of configuration. Nothing below needs editing for a routine run.
+# ==============================================================================
 
 # Domain setup
 
@@ -309,71 +189,35 @@ grid = ImmersedBoundaryGrid(grid, GridFittedBottom(bottom_height))
 
 @info grid
 
+# Wet fraction of each open face.
+#
+# NestingValidation's rule is that ObliqueRadiation needs a side that does not terminate in
+# coast: six land cells out of 575 was enough to diverge their run, and they fall back to
+# NormalRadiation on their southern boundary precisely because it is only 58% wet. Our own
+# history agrees -- ObliqueRadiation is what destabilised this model once already.
+#
+# So print it, and treat anything short of 100% as disqualifying for oblique on that side.
+# A 0% face is entirely land: it carries no transport, contributes no area to the balance,
+# and its boundary condition is inert.
+for side in (:west, :east, :south, :north)
+    widths, depths = face_geometry(side, grid)
+    nwet = count(>(0), depths)
+    @info @sprintf(" -> %-5s face: %3d/%3d columns wet (%3.0f%%), wet area %.3e m^2",
+                   side, nwet, length(depths), 100 * nwet / max(length(depths), 1),
+                   sum(widths .* depths))
+end
+
 # dataset conditonal
 
 dataset = BSOSEMonthly(iteration=BSOSE_ITERATION)
 
 @info "Dataset: $(summary(dataset)) -- boundaries, forcing and initial conditions"
 
-# ==============================================================================
-# Simulation window
-#
-# The period the model simulates: it starts at start_date and stops at end_date. These
-# two lines are the only place the period is set — the stop time, the monthly records
-# loaded for the boundary conditions, winds and sponges, and the date the initial
-# condition is read from all follow from them.
-#
-# BSOSE iteration 156 (HPC) covers 2013-2024; iteration 105 (local CPU) covers
-# 2008-2012, so a local test run needs dates inside that earlier range.
-# ==============================================================================
-# Eight months, to December-January, so the run carries a full seasonal cycle into the warm
-# bloom. PENETRATING_SHORTWAVE stays OFF: this run is the barotropic/balance test, and leaving
-# the shortwave out makes it something we have never had -- the bloom reproduced on top of a
-# boundary that actually passes the ACC. That is the clean control the shortwave fix has been
-# missing, and it costs nothing extra to collect it here.
-#
-# (Previous header, from the ninety-day version:)
-# Ninety days. The fourteen-day A/B answered its question -- PerturbationAdvection on the
-# normal flow with GradientBoundaryCondition(0) on the tangential reproduces 54021db's log
-# almost exactly on current packages (day 13: |u| 0.83, |v| 1.17, |w| 0.0175, Δt 17.2 min
-# against 0.83 / 1.17 / 0.018 / 17.16), so the package bump was never the problem and the
-# oblique schemes were.
-#
-# This run adds the one thing that configuration lacks: a barotropic boundary, so the ACC's
-# ~180 Sv can actually cross instead of turning and running along the edges. Every previous
-# barotropic attempt paired it with the oblique schemes now known to be unstable, so Flather
-# with PA + Gradient(0) has never been tried.
-#
-# Ninety days because the western boundary jet builds over a ~20-day cycle; at 14 days every
-# configuration still looks acceptable. About 2.4 hours at the rate the A/B ran.
-#
-# That commit ran PerturbationAdvection on the normal flow, GradientBoundaryCondition(0) on the
-# tangential, no barotropic condition, on Oceananigans 0.111.0 / NumericalEarth 0.7.0. Current
-# main had changed all three settings AND both packages, and every comparison since has been
-# treating the 54021db run as "the same thing minus the shortwave", which it never was.
-#
-# The flags below reproduce 54021db's boundary configuration on today's packages. Compare
-# |u|, |v|, |w| and Δt day-for-day against its log:
-#
-#     day  1:  |u| 0.91  |v| 0.91  |w| 0.0076   Δt  7.56 min
-#     day  6:  |u| 0.77  |v| 1.01  |w| 0.013    Δt  6.24 min
-#     day 13:  |u| 0.83  |v| 1.17  |w| 0.018    Δt 17.16 min
-#
-# Matching those means the schemes are what broke it and the package bump is innocent.
-# Still slow means the bump is implicated and the schemes are not the story.
-#
-# (Original eight-month header, for when this goes back to being a science run:)
-# Eight months, June 2014 to February 2015. The start matches 2YS6_surface_flux so that |u|,
-# |v|, |w| and Δt compare day-for-day against the log of a run that stayed stable, and the end
-# reaches past the warm bloom: January 2015 is where the baseline ran SST +7.02 C too warm
-# over a 3.1 m mixed layer against BSOSE's 21.8 m. Three questions, one run -- face transports
-# at startup, the |w| tripwire on day 1, the bloom around day 200.
-start_date = DateTime("2014-06-01")
-end_date = DateTime("2014-06-21")   # 20 days: a boundary test, not a science run
-
-# option if need to do tests on CPU
-# start_date = DateTime("2009-06-01")
-# end_date = DateTime("2011-06-01")
+# The run window comes from START_DATE / END_DATE in the configuration block above. Everything
+# downstream follows from them: the stop time, the monthly B-SOSE records selected for the
+# boundaries and forcing, and the date the initial condition is read from.
+start_date = START_DATE
+end_date   = END_DATE
 
 end_date > start_date || error("end_date ($end_date) must be later than start_date ($start_date).")
 
@@ -442,7 +286,7 @@ if OBCS
     elseif OBC_SCHEME == "PerturbationAdvection"
         PerturbationAdvection(inflow_timescale=1days, outflow_timescale=Inf)
     elseif OBC_SCHEME == "NormalRadiation"
-        NormalRadiation(inflow_timescale=1days, outflow_timescale=Inf)
+        NormalRadiation(inflow_timescale=RADIATION_TAU_IN, outflow_timescale=Inf)
     elseif OBC_SCHEME == "clamped" || OBC_SCHEME == "none"
         nothing
     else
@@ -463,7 +307,9 @@ if OBCS
         exterior_free_surface=exterior_η,
         winds=WINDS, surface_fluxes=SURFACE_FLUXES,
         penetrating_shortwave=SURFACE_FLUXES && PENETRATING_SHORTWAVE, scheme=obc_scheme,
-        tangential_bc_kind=TANGENTIAL_BC, oblique_inflow_timescale=OBLIQUE_TAU_IN,
+        tangential_bc_kind=TANGENTIAL_BC, tracer_scheme=TRACER_SCHEME,
+        radiation_inflow_timescale=RADIATION_TAU_IN,
+        oblique_inflow_timescale=OBLIQUE_TAU_IN,
         oblique_outflow_timescale=OBLIQUE_TAU_OUT, reference_date=start_date,
         barotropic=BAROTROPIC_OBC, barotropic_faces=BAROTROPIC_FACES,
         barotropic_scheme=BAROTROPIC_SCHEME)
@@ -602,27 +448,26 @@ ocean = ocean_simulation(grid;
 
 bsose_initial_conditions!(ocean.model; dataset=dataset, date=start_date, velocities=true)
 
-    # Initialise the free surface too. Setting u, v, T, S from BSOSE while leaving η flat is
-    # internally inconsistent: BSOSE's velocities are in geostrophic balance with a sea
-    # surface that drops about 2 m from 45S to the Antarctic margin, and starting without it
-    # leaves the model to build that tilt from scratch. Every run so far has done this --
-    # max|η| jumps from 0 to about 2.5 m on day 1 in all of them, which is the model
-    # manufacturing the sea surface it should have been handed.
-    #
-    # With Flather it is worse than a spin-up transient: ηᵉˣᵗ carries the tilt while ηᵇ starts
-    # at zero, so the condition sees a 0.7 m error on day one and answers it with hundreds of
-    # Sverdrups. The 2D field below shares the datum removed from the face values, so the
-    # interior and the boundary agree at t = 0 by construction.
-    if exterior_η isa NamedTuple
-        set!(ocean.model.free_surface.displacement, exterior_η.initial)
-        fill_halo_regions!(ocean.model.free_surface.displacement)
-        # `mean` over a GPU view calls `first(A)`, which is scalar indexing. Julia's logging
-        # swallows the exception, so the line silently vanishes instead of failing -- the
-        # third time this has bitten in this file. Copy to the host first.
-        local η₀ = Array(interior(ocean.model.free_surface.displacement))
-        @info @sprintf(" -> free surface initialised from BSOSE ETAN: mean %+.3f m, range %+.3f to %+.3f m",
-            mean(η₀), minimum(η₀), maximum(η₀))
-    end
+# Initialise the free surface too. Setting u, v, T, S from BSOSE while leaving η flat is
+# internally inconsistent: BSOSE's velocities are in geostrophic balance with a sea
+# surface that drops about 2 m from 45S to the Antarctic margin, and starting without it
+# leaves the model to build that tilt from scratch. Every run so far has done this --
+# max|η| jumps from 0 to about 2.5 m on day 1 in all of them, which is the model
+# manufacturing the sea surface it should have been handed.
+#
+# With Flather it is worse than a spin-up transient: ηᵉˣᵗ carries the tilt while ηᵇ starts
+# at zero, so the condition sees a 0.7 m error on day one and answers it with hundreds of
+# Sverdrups. The 2D field below shares the datum removed from the face values, so the
+# interior and the boundary agree at t = 0 by construction.
+if exterior_η isa NamedTuple
+    set!(ocean.model.free_surface.displacement, exterior_η.initial)
+    fill_halo_regions!(ocean.model.free_surface.displacement)
+    # `mean` over a GPU view calls `first(A)`, which is scalar indexing. Julia's logging
+    # swallows the exception, so the line silently vanishes instead of failing -- the
+    # third time this has bitten in this file. Copy to the host first.
+    local η₀ = Array(interior(ocean.model.free_surface.displacement))
+    @info @sprintf(" -> free surface initialised from BSOSE ETAN: mean %+.3f m, range %+.3f to %+.3f m",
+        mean(η₀), minimum(η₀), maximum(η₀))
 end
 
 # ── TEOS10 sqrt guard ─────────────────────────────────────────────────────────
