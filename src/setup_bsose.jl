@@ -2719,3 +2719,57 @@ function bsose_sponge_forcing(grid;
 
     return forcings
 end
+
+
+# ==============================================================================
+# ERA5 pre-fetch
+#
+# Rescued from src/glorys_obc.jl when that file was deleted (2026-10-23). It has nothing to do
+# with GLORYS -- it only happened to live there because that was where the ERA5 path was first
+# wired up -- and `src/model.jl` still calls it on the `ATMOSPHERE = :era5` path.
+# ==============================================================================
+
+using NumericalEarth.DataWrangling: MetadataSet
+
+"""
+    prefetch_era5!(; start_date, end_date, region, dir, threads = 1,
+                   dataset = ERA5HourlySingleLevel())
+
+Download every ERA5 variable the atmosphere and radiation need, `threads` requests at a time.
+
+`ERA5PrescribedAtmosphere` and `prescribed_radiation` each bundle their variables into one
+`MetadataSet` and call `Downloads.download(mset)` with no keyword arguments, and the
+CopernicusClimateDataStore backend then defaults to one era5cli thread PER VARIABLE -- six
+concurrent CDS requests for the atmosphere, two for the radiation. CDS refuses that:
+
+    Number queued requests for this dataset is temporarily limited.
+    Please configure your scripts accordingly
+
+and all six come back `Rejected` within seconds. Worse, the client only raises on status
+`failed`, so a `rejected` request is polled until `max_wait` (an hour) instead of erroring.
+
+The backend does take a `threads` keyword, it just is not reachable through those constructors.
+So the download happens here first, serially, and because `skip_existing = true` the
+constructors then find every file cached and issue no requests of their own.
+
+One variable at a time is slower but it is the difference between finishing and not. Raise
+`threads` if CDS loosens the limit.
+"""
+function prefetch_era5!(; start_date, end_date, region, dir,
+                        threads = 1, dataset = ERA5HourlySingleLevel())
+    atmos_vars = (:eastward_velocity, :northward_velocity, :temperature,
+                  :dewpoint_temperature, :surface_pressure, :total_precipitation)
+    rad_vars   = (:downwelling_shortwave_radiation, :downwelling_longwave_radiation)
+
+    all_vars = (atmos_vars..., rad_vars...)
+    @info @sprintf(" -> pre-fetching %d ERA5 variables %d request(s) at a time (CDS limits concurrent queued requests)",
+                   length(all_vars), threads)
+
+    for (n, v) in enumerate(all_vars)
+        @info "    [$n/$(length(all_vars))] $v"
+        mset = MetadataSet(v; dataset, start_date, end_date, dir, region)
+        Downloads.download(mset; threads)
+    end
+    @info " -> ERA5 pre-fetch complete; the atmosphere and radiation will read from cache."
+    return nothing
+end
