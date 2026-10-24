@@ -633,6 +633,45 @@ if BAROTROPIC_OBC
     simulation.callbacks[:eta_watch] = Callback(log_eta_watch, TimeInterval(30minutes))
 end
 
+# WHERE is the fastest cell?
+#
+# The progress messenger prints |u⃗|ₘₐₓ over the whole 3-D field but never says where it is.
+# On 20D_bsose_v1 that number reached 32.6 m/s and grew linearly at ~1.2 m/s/day while every
+# SURFACE diagnostic we had -- the maps, the edge profiles, the interior/boundary series --
+# peaked at 2.84 m/s. The feature was at depth and we were blind to it for three runs.
+#
+# Worse, the per-face transport log read EXACTLY on target the whole time, because
+# `target_transport` pins ∮U·dl by construction: a face can carry 30 m/s in one thin column,
+# compensate elsewhere, and still integrate perfectly. A uniform transport correction ΔU
+# becomes a velocity ΔU/H, so a shallow column turns a modest transport error into an enormous
+# speed. That is why this prints the column DEPTH alongside the location.
+#
+# Read it as: if the fastest cell sits in shallow water within a cell or two of a face, the
+# boundary is pushing transport through a column too thin to carry it.
+# `bottom_height` is a bare 3-D OffsetArray with a singleton third axis, and on GPU it wraps a
+# CuArray -- so copy `parent` to the host once and index through the offset, rather than
+# touching it element-by-element from the callback.
+let zc = Array(znodes(grid, Center())),
+    B  = grid.immersed_boundary.bottom_height,
+    Bh = Array(parent(grid.immersed_boundary.bottom_height))
+
+    ox = 1 - first(axes(B, 1))
+    oy = 1 - first(axes(B, 2))
+    seafloor(i, j) = Bh[clamp(i, 1, grid.Nx) + ox, clamp(j, 1, grid.Ny) + oy, 1]
+
+    function log_velocity_argmax(sim)
+        for (name, f) in (("u", ocean.model.velocities.u), ("v", ocean.model.velocities.v))
+            val, idx = findmax(abs, Array(interior(f)))
+            i, j, k = Tuple(idx)
+            @info @sprintf("        [max|%s|] %7.3f m/s at (i=%3d, j=%3d, k=%3d)  z = %8.1f m  seafloor = %8.1f m  |  %3d cells from west/east, %3d from south/north",
+                           name, val, i, j, k, zc[clamp(k, 1, length(zc))], seafloor(i, j),
+                           min(i - 1, grid.Nx - i), min(j - 1, grid.Ny - j))
+        end
+        flush(stdout)
+    end
+    simulation.callbacks[:velocity_argmax] = Callback(log_velocity_argmax, TimeInterval(output_interval))
+end
+
 # output writers
 
 u, v, w = ocean.model.velocities

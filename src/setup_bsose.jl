@@ -1208,9 +1208,26 @@ function bsose_barotropic_transport(bts, side, grid)
         H[n] += Δz[k]
     end
 
+    # The z location must be `Center`, not `Nothing`, even though these series carry no depth.
+    #
+    # `getbc` dispatches on the location triple. The west/east halo fill calls
+    # `getbc(bc, j, k, grid, clock)` with k = 1, because the barotropic fields are `Nothing` in
+    # z and the kernel is one cell deep. {Nothing, Center, Nothing} is `YFTS`, whose `getbc` is
+    #
+    #     getbc(f::YFTS, i1, i2, grid, clock) = (Nx, _, Nz = size(grid);
+    #                                            j = ifelse(Nz == 1, i1, i2); f[1, j, 1, t])
+    #
+    # a guess the Oceananigans source itself calls "not really well defined". It asks whether
+    # the GRID is two-dimensional -- but these are built on the full 3-D grid (Nz = 135), so it
+    # takes i2 = k = 1 and EVERY column of the west and east faces reads element j = 1. On this
+    # domain j = 1 is in the dry Antarctic band, so both zonal faces were fed a single constant.
+    #
+    # {Nothing, Center, Center} is `YZFTS`, whose `getbc` is unambiguous, f[1, j, k, t], and the
+    # one-cell z window makes k = 1 the only valid index. South/north were always correct
+    # (`XFTS` uses only the first index); they move to `XZFTS` for symmetry.
     Uts = along_x ?
-          FieldTimeSeries{Center,Nothing,Nothing}(cpu_bts.grid, times; indices=(:, 1, 1), time_indexing) :
-          FieldTimeSeries{Nothing,Center,Nothing}(cpu_bts.grid, times; indices=(1, :, 1), time_indexing)
+          FieldTimeSeries{Center,Nothing,Center}(cpu_bts.grid, times; indices=(:, 1, 1), time_indexing) :
+          FieldTimeSeries{Nothing,Center,Center}(cpu_bts.grid, times; indices=(1, :, 1), time_indexing)
 
     # Width of each boundary column, for the face integral reported below. The barotropic
     # transport lives at (Face, Center) on west/east and (Center, Face) on south/north, so
@@ -1653,9 +1670,10 @@ function bsose_exterior_free_surface(grid;
 
     series(side) = begin
         along_x = side === :south || side === :north
+        # Same `getbc` index trap as `bsose_barotropic_transport`; see the note there.
         fts = along_x ?
-              FieldTimeSeries{Center,Nothing,Nothing}(cpu_grid, times; indices=(:, 1, 1), time_indexing=Cyclical()) :
-              FieldTimeSeries{Nothing,Center,Nothing}(cpu_grid, times; indices=(1, :, 1), time_indexing=Cyclical())
+              FieldTimeSeries{Center,Nothing,Center}(cpu_grid, times; indices=(:, 1, 1), time_indexing=Cyclical()) :
+              FieldTimeSeries{Nothing,Center,Center}(cpu_grid, times; indices=(1, :, 1), time_indexing=Cyclical())
         for t in eachindex(times)
             along_x ? (interior(fts[t], :, 1, 1) .= faces[side][:, t]) :
                       (interior(fts[t], 1, :, 1) .= faces[side][:, t])
