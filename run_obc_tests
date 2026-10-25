@@ -26,6 +26,21 @@
 # Also: every result from the previous version is void. It predates the barotropic boundary
 # condition existing at all (2026-10-03) and the west/east exterior-profile index bug
 # (2026-10-23). See sections 4.6.2 and 4.5 of Model Architecture.md.
+#
+# THE BATHYMETRY CACHE RACE, and why there is a prep job
+#
+# `regrid_bathymetry` caches under a key that includes Nz, e.g.
+# `field_bottom_height_360x150x135_8ffd3b13.jld2`. Arms that differ only in a boundary scheme
+# share one key and are harmless. But two arms with the same NEW vertical grid -- `flat_upper`
+# and `flat_upper_radiation` -- would both find the key missing and both start writing it.
+# Concurrent writers to one JLD2 file can corrupt it and lose both jobs.
+#
+# So: arms are grouped by vertical grid, one CPU-only prep job per distinct grid builds the
+# cache, and every arm in that group is submitted with `--dependency=afterok:<prep>`. Arms in
+# different groups are independent, so the whole set still runs concurrently -- it just waits a
+# few minutes for its own cache first. The prep job is CPU-only because the cache key does not
+# include the architecture, so it costs no GPU allocation; when the cache already exists it
+# loads it and exits in seconds.
 # ---------------------------------------------------------------------------------------------
 
 set -euo pipefail
@@ -121,6 +136,49 @@ mkdir -p obc_tests logs
 echo "set=$SET_NAME  days=$DAYS  walltime=$WALLTIME"
 echo
 
+# The vertical grid an arm will use: its own overrides where given, else src/model.jl's values.
+# Two arms with the same signature share a bathymetry cache key.
+read_default() {
+    grep -E "^const $1 *=" src/model.jl | head -1 | sed -E 's/^[^=]*= *([0-9]+).*/\1/'
+}
+DEF_Z_EXTENT=$(read_default Z_EXTENT)
+DEF_DZ_SURFACE=$(read_default DZ_SURFACE)
+DEF_DZ_BOTTOM=$(read_default DZ_BOTTOM)
+for v in DEF_Z_EXTENT DEF_DZ_SURFACE DEF_DZ_BOTTOM; do
+    [ -n "${!v}" ] || { echo "error: could not read ${v#DEF_} from src/model.jl" >&2; exit 1; }
+done
+echo "vertical grid defaults from src/model.jl: Z_EXTENT=$DEF_Z_EXTENT DZ_SURFACE=$DEF_DZ_SURFACE DZ_BOTTOM=$DEF_DZ_BOTTOM"
+echo
+
+# Pull one override's value out of a `;`-separated list, or echo the default.
+override_or() {
+    local key="$1" default="$2" list="$3"
+    # `base` has no overrides at all, and under `set -u` expanding an empty array is an error
+    # in bash 3.2 -- so return before building one.
+    [ -n "$list" ] || { echo "$default"; return; }
+    local -a pair=()
+    IFS=';' read -ra pair <<< "$list"
+    for p in "${pair[@]}"; do
+        [ "${p%%=*}" = "$key" ] && { echo "${p#*=}"; return; }
+    done
+    echo "$default"
+}
+
+# sig -> prep job id, as parallel arrays (bash 3.2 has no associative arrays, and --list is
+# often run on a laptop).
+SIGS=()
+SIG_JIDS=()
+
+sig_jid() {
+    [ ${#SIGS[@]} -eq 0 ] && { echo ""; return; }   # empty array + set -u, as above
+    local i=0
+    for s in "${SIGS[@]}"; do
+        [ "$s" = "$1" ] && { echo "${SIG_JIDS[$i]}"; return; }
+        i=$((i + 1))
+    done
+    echo ""
+}
+
 # Rewrite one `const` in a generated variant, tolerating any alignment, and VERIFY it.
 # A silent miss here means a job runs for an hour testing the committed configuration under
 # another name, which is worse than not running it.
@@ -133,6 +191,57 @@ set_const() {
         echo "error: failed to set ${name} = ${value} in ${file}" >&2; exit 1; }
 }
 
+# ---- one prep job per distinct vertical grid ----
+for entry in "${CONFIGS[@]}"; do
+    IFS='|' read -r name overrides <<< "$entry"
+
+    if [ ${#SELECTED[@]} -gt 0 ]; then
+        wanted=0
+        for want in "${SELECTED[@]}"; do [ "$want" = "$name" ] && wanted=1; done
+        [ $wanted -eq 1 ] || continue
+    fi
+
+    zext=$(override_or Z_EXTENT   "$DEF_Z_EXTENT"   "$overrides")
+    dzs=$(override_or  DZ_SURFACE "$DEF_DZ_SURFACE" "$overrides")
+    dzb=$(override_or  DZ_BOTTOM  "$DEF_DZ_BOTTOM"  "$overrides")
+    sig="${zext}_${dzs}_${dzb}"
+
+    [ -n "$(sig_jid "$sig")" ] && continue   # this grid already has a prep job
+
+    if [ $LIST_ONLY -eq 1 ]; then
+        echo "prep (grid Z_EXTENT=$zext DZ_SURFACE=$dzs DZ_BOTTOM=$dzb) <- first needed by $name"
+        SIGS+=("$sig"); SIG_JIDS+=("dry-run")
+        continue
+    fi
+
+    jid=$(sbatch --parsable --job-name="obc_prep_${sig}" <<EOF
+#!/bin/bash
+#SBATCH --account=gts-ldove6-paid
+#SBATCH --output=logs/%x-%j.out
+#SBATCH --error=logs/%x-%j.err
+#SBATCH --time=01:00:00
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=4
+#SBATCH --mem=16G
+
+set -uo pipefail
+module purge
+module load julia/1.12.5
+unset LD_LIBRARY_PATH
+export JULIA_CPU_TARGET=\${JULIA_CPU_TARGET:-generic}
+export JULIA_PKGIMAGES=\${JULIA_PKGIMAGES:-no}
+
+echo "prep: Z_EXTENT=${zext} DZ_SURFACE=${dzs} DZ_BOTTOM=${dzb}"
+Z_EXTENT=${zext} DZ_SURFACE=${dzs} DZ_BOTTOM=${dzb} \\
+    stdbuf -o0 -e0 julia --project=. tools/prebuild_bathymetry.jl
+EOF
+)
+    echo "prep job $jid  (grid Z_EXTENT=$zext DZ_SURFACE=$dzs DZ_BOTTOM=$dzb, first needed by $name)"
+    SIGS+=("$sig"); SIG_JIDS+=("$jid")
+done
+echo
+
+# ---- the runs ----
 for entry in "${CONFIGS[@]}"; do
     IFS='|' read -r name overrides <<< "$entry"
 
@@ -162,10 +271,17 @@ for entry in "${CONFIGS[@]}"; do
         done
     fi
 
-    printf '%-22s %3sd  %s\n' "$name" "$DAYS" "${overrides:-<src/model.jl as committed>}"
+    zext=$(override_or Z_EXTENT   "$DEF_Z_EXTENT"   "$overrides")
+    dzs=$(override_or  DZ_SURFACE "$DEF_DZ_SURFACE" "$overrides")
+    dzb=$(override_or  DZ_BOTTOM  "$DEF_DZ_BOTTOM"  "$overrides")
+    prep=$(sig_jid "${zext}_${dzs}_${dzb}")
+    [ -n "$prep" ] || { echo "error: no prep job for $name (grid ${zext}_${dzs}_${dzb})" >&2; exit 1; }
+
+    printf '%-22s %3sd  after %-10s  %s\n' \
+        "$name" "$DAYS" "$prep" "${overrides:-<src/model.jl as committed>}"
     [ $LIST_ONLY -eq 1 ] && continue
 
-    sbatch --job-name="obc_${run_name}" <<EOF
+    sbatch --job-name="obc_${run_name}" --dependency=afterok:${prep} <<EOF
 #!/bin/bash
 #SBATCH --account=gts-ldove6-paid
 #SBATCH --output=logs/%x-%j.out
