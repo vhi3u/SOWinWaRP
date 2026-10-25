@@ -50,7 +50,7 @@ end
 # ---- run identity -------------------------------------------------------------------------
 # Prefixes every output file: RUN_NAME_surface.nc, _midlon.nc, _free_surface.nc.
 # Change it per experiment or runs overwrite each other. Animate: ./run_animate_simulation NAME
-const RUN_NAME = "20D_bsose_bathyfix"
+const RUN_NAME = "20D_bsose_bathyfix_tgrad"
 
 # ---- period and domain --------------------------------------------------------------------
 const START_DATE = DateTime("2014-06-01")
@@ -80,7 +80,7 @@ const OBCS = true                           # false = whole-region restoring ins
 
 const OBC_SCHEME    = "NormalRadiation"     # normal u/v: NormalRadiation | PerturbationAdvection
                                             #             | ObliqueRadiation | clamped
-const TANGENTIAL_BC = :radiation            # tangential u/v: :radiation | :clamped | :gradient
+const TANGENTIAL_BC = :gradient             # tangential u/v: :radiation | :clamped | :gradient
                                             #   | :oblique | :perturbation_advection | ...
 const RADIATION_TAU_IN = 6hours             # inflow nudging; outflow is Inf throughout
 const OBLIQUE_TAU_IN   = 3days              # ObliqueRadiation only
@@ -88,6 +88,23 @@ const OBLIQUE_TAU_OUT  = 360days
 
 # Tracers. :same gives T and S whatever OBC_SCHEME the normal flow uses.
 const TRACER_SCHEME = TracerReservoir(inflow_length_scale = 5000, outflow_length_scale = 0)
+
+# TANGENTIAL_BC = :gradient as of 2026-10-25, changed from :radiation on this evidence from
+# the 20D_bsose_bathyfix run: max|v| sat at i=3 -- two cells in from the west face -- on every
+# one of days 5 through 20, confined to k=131-135 (the top 22 m), growing +0.187 m/s/day with
+# no saturation (1.08 at day 5, 3.65 at day 20) while its j migrated north at ~1 cell/day. The
+# seafloor there is 3500-3700 m, so no thin column is involved.
+#
+# v is the TANGENTIAL component on a zonal face, and the split-explicit free surface gives the
+# barotropic tangential velocity a zero-gradient condition at west/east whatever the 3D field
+# carries. So :radiation's Value left the two halves inconsistent and the residual had to land
+# in the shear -- which is why the feature is surface-confined rather than depth-uniform.
+# :gradient matches what the barotropic mode already does. See
+# `bsose_tangential_boundary_condition` in setup_bsose.jl, which names this jet directly.
+#
+# The cost: :gradient imposes nothing, so the BSOSE tangential value no longer reaches the
+# west/east faces and SPONGE_LAYERS = false means nothing else carries it there. Throughput is
+# unaffected -- that is the normal component plus the barotropic pin.
 
 # DO NOT SET OBC_SCHEME = "clamped" HERE. Tested 2026-10-24 and it DIVERGES: NaN in u at
 # day 3.1, with Δt collapsing 5.6 -> 1.2 min and max|η| quadrupling 1.22 -> 4.86 m, against a
