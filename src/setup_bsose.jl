@@ -1181,6 +1181,35 @@ how a boundary comes to demand metres per second of depth-mean inflow. The repor
 `max |Uᵉˣᵗ|/H` makes that visible — it should be a sane depth-mean velocity (order
 0.1 m/s here), not order 1.
 """
+"""
+    face_profile_grid(cpu_grid)
+
+A flat, single-level `LatitudeLongitudeGrid` for the 1-D boundary profiles (Uᵉˣᵗ, ηᵉˣᵗ).
+
+These series carry no depth. They need the right horizontal extent and the right location
+triple and nothing else -- `getbc` on an `XZFTS`/`YZFTS` reads `f[i,1,k,t]` / `f[1,j,k,t]` and
+never consults the grid.
+
+Building them on the model's 135-level `ImmersedBoundaryGrid` instead allocates a windowed
+field over that large immersed grid for every face and every time level, and on Julia 1.12 that
+reproducibly corrupts the heap:
+
+    malloc_consolidate(): invalid chunk size        (V100 / linux, 2026-10-24)
+    signal 11 in gc_mark_objarray                   (arm64 macOS, same day)
+
+Both die while BUILDING the second or later series, not while reading them. The same
+construction on this flat grid builds all four faces and interpolates in time without
+complaint, which is what `glorys_obc.jl` moved to before it was deleted.
+"""
+function face_profile_grid(cpu_grid)
+    underlying = cpu_grid isa ImmersedBoundaryGrid ? cpu_grid.underlying_grid : cpu_grid
+    Nx, Ny, _ = size(underlying)
+    return LatitudeLongitudeGrid(CPU(); size = (Nx, Ny, 1),
+                                 longitude = (underlying.λᶠᵃᵃ[1], underlying.λᶠᵃᵃ[Nx + 1]),
+                                 latitude  = (underlying.φᵃᶠᵃ[1], underlying.φᵃᶠᵃ[Ny + 1]),
+                                 z = (-1, 0), halo = (7, 7, 1))
+end
+
 function bsose_barotropic_transport(bts, side, grid)
     bts === nothing && return nothing
 
@@ -1225,9 +1254,10 @@ function bsose_barotropic_transport(bts, side, grid)
     # {Nothing, Center, Center} is `YZFTS`, whose `getbc` is unambiguous, f[1, j, k, t], and the
     # one-cell z window makes k = 1 the only valid index. South/north were always correct
     # (`XFTS` uses only the first index); they move to `XZFTS` for symmetry.
+    profile_grid = face_profile_grid(cpu_grid)
     Uts = along_x ?
-          FieldTimeSeries{Center,Nothing,Center}(cpu_bts.grid, times; indices=(:, 1, 1), time_indexing) :
-          FieldTimeSeries{Nothing,Center,Center}(cpu_bts.grid, times; indices=(1, :, 1), time_indexing)
+          FieldTimeSeries{Center,Nothing,Center}(profile_grid, times; indices=(:, 1, 1), time_indexing) :
+          FieldTimeSeries{Nothing,Center,Center}(profile_grid, times; indices=(1, :, 1), time_indexing)
 
     # Width of each boundary column, for the face integral reported below. The barotropic
     # transport lives at (Face, Center) on west/east and (Center, Face) on south/north, so
@@ -1668,12 +1698,15 @@ function bsose_exterior_free_surface(grid;
     faces = (west = stack[1, :, :], east = stack[Nx, :, :],
              south = stack[:, 1, :], north = stack[:, Ny, :])
 
+    profile_grid = face_profile_grid(cpu_grid)
+
     series(side) = begin
         along_x = side === :south || side === :north
-        # Same `getbc` index trap as `bsose_barotropic_transport`; see the note there.
+        # Same `getbc` index trap as `bsose_barotropic_transport`, and the same reason for the
+        # flat grid; see the notes on that function and on `face_profile_grid`.
         fts = along_x ?
-              FieldTimeSeries{Center,Nothing,Center}(cpu_grid, times; indices=(:, 1, 1), time_indexing=Cyclical()) :
-              FieldTimeSeries{Nothing,Center,Center}(cpu_grid, times; indices=(1, :, 1), time_indexing=Cyclical())
+              FieldTimeSeries{Center,Nothing,Center}(profile_grid, times; indices=(:, 1, 1), time_indexing=Cyclical()) :
+              FieldTimeSeries{Nothing,Center,Center}(profile_grid, times; indices=(1, :, 1), time_indexing=Cyclical())
         for t in eachindex(times)
             along_x ? (interior(fts[t], :, 1, 1) .= faces[side][:, t]) :
                       (interior(fts[t], 1, :, 1) .= faces[side][:, t])
