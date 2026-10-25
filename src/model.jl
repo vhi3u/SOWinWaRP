@@ -102,9 +102,16 @@ const BAROTROPIC_OBC    = true
 const BAROTROPIC_SCHEME = :pinned   # :pinned (Flather + target_transport) | :flather
 const BAROTROPIC_FACES  = :all      # :all | :zonal -- keep :all, the :zonal theory was
                                     # disproven (north carries -31 Sv, 18% of the zonal flow)
-const EXTERIOR_SSH      = true      # eta_ext and the initial eta from B-SOSE ETAN.
-                                    # Only safe with :pinned, which protects the net transport
-                                    # from the ~5 Sv/cm Flather sensitivity to the eta datum.
+const EXTERIOR_SSH      = false     # eta_ext and the initial eta from B-SOSE ETAN.
+                                    # OFF (2026-10-24). `bsose_exterior_free_surface` aborts the
+                                    # process on the GPU -- SIGBUS / SIGABRT / corrupted heap, at
+                                    # the same point every run, surviving a full depot wipe. This
+                                    # skips the function entirely. It also takes eta_ext out of
+                                    # the loop, which is worth doing on its own: its residual
+                                    # range is -3.44 to +1.30 m, a 4.74 m span where the real
+                                    # SSH drop across this domain is ~2 m. With eta_ext = 0 and
+                                    # BAROTROPIC_SCHEME = :pinned the net transport is still
+                                    # fixed, so only the along-face shape is given up.
 
 # ---- surface forcing ----------------------------------------------------------------------
 const WINDS                = false  # BSOSE oceTAUX / oceTAUY
