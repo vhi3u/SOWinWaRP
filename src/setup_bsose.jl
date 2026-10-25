@@ -1163,25 +1163,6 @@ function boundary_vertical_spacing(grid)
 end
 
 """
-    bsose_barotropic_transport(bts, side, grid)
-
-Depth-integrated transport `Uᵉˣᵗ = ∫ u·dz` (m² s⁻¹) along one open boundary, returned as a
-`FieldTimeSeries` shaped for the barotropic velocity's halo on that side — `(Nothing,
-Center, Nothing)` on west/east, `(Center, Nothing, Nothing)` on south/north.
-
-`bts` must be the boundary slice of the *normal* velocity for `side` **after**
-[`mask_immersed_boundary_normal_flow!`](@ref) has zeroed its dry cells, so that summing the
-whole column already gives the transport through the model's wet column alone.
-
-That ordering is what keeps this integral honest, and it is the easiest thing to get wrong.
-BSOSE land is inpainted with nearest-neighbour ocean values
-(`DataWrangling.default_inpainting`), so the raw slice carries plausible-looking velocity in
-cells below the sea floor; integrating those and then dividing by a shallow shelf depth is
-how a boundary comes to demand metres per second of depth-mean inflow. The reported
-`max |Uᵉˣᵗ|/H` makes that visible — it should be a sane depth-mean velocity (order
-0.1 m/s here), not order 1.
-"""
-"""
     face_profile_grid(cpu_grid)
 
 A flat, single-level `LatitudeLongitudeGrid` for the 1-D boundary profiles (Uᵉˣᵗ, ηᵉˣᵗ).
@@ -1210,6 +1191,26 @@ function face_profile_grid(cpu_grid)
                                  z = (-1, 0), halo = (7, 7, 1))
 end
 
+"""
+    bsose_barotropic_transport(bts, side, grid)
+
+Depth-integrated transport `Uᵉˣᵗ = ∫ u·dz` (m² s⁻¹) along one open boundary, returned as a
+`FieldTimeSeries` shaped for the barotropic velocity's halo on that side — `(Nothing,
+Center, Center)` on west/east, `(Center, Nothing, Center)` on south/north, each with a
+one-cell `z` window. The `Center` in `z` is load-bearing: see `face_profile_grid`.
+
+`bts` must be the boundary slice of the *normal* velocity for `side` **after**
+[`mask_immersed_boundary_normal_flow!`](@ref) has zeroed its dry cells, so that summing the
+whole column already gives the transport through the model's wet column alone.
+
+That ordering is what keeps this integral honest, and it is the easiest thing to get wrong.
+BSOSE land is inpainted with nearest-neighbour ocean values
+(`DataWrangling.default_inpainting`), so the raw slice carries plausible-looking velocity in
+cells below the sea floor; integrating those and then dividing by a shallow shelf depth is
+how a boundary comes to demand metres per second of depth-mean inflow. The reported
+`max |Uᵉˣᵗ|/H` makes that visible — it should be a sane depth-mean velocity (order
+0.1 m/s here), not order 1.
+"""
 function bsose_barotropic_transport(bts, side, grid)
     bts === nothing && return nothing
 
