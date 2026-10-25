@@ -2828,3 +2828,88 @@ function prefetch_era5!(; start_date, end_date, region, dir,
     @info " -> ERA5 pre-fetch complete; the atmosphere and radiation will read from cache."
     return nothing
 end
+
+
+# ==============================================================================
+# Boundary topography conditioning
+# ==============================================================================
+
+"""
+    fix_boundary_topography!(bottom_height, grid; minimum_boundary_depth = 100)
+
+Condition the sea floor along the open boundaries. Two operations, in order:
+
+1. **Mask columns too thin to carry transport.** The barotropic corrector sets
+   `depth_mean(u) = U` whatever the column depth, so a transport correction ΔU becomes a
+   velocity `ΔU/H`. On the east face `(360,10)` is **42 m** against neighbours of ~438 m --
+   a 75x amplifier on a face averaging 3146 m, carrying ~0.00008 Sv. Masking it loses nothing
+   and removes the amplification. The default 100 m threshold catches that column and nothing
+   else: `(1,20)` at 297 m and `(1,21)` at 483 m are real shelf-break and are kept.
+
+2. **MITgcm's `OBCSfixtopo`.** Raise any boundary column deeper than the cell inside it, so
+   `d(topo)/dn >= 0` outward. MITgcm applies this unconditionally whatever the parent dataset.
+   Measured here: 79 such columns on west, 68 on east, 218 on north -- 365 in all, worst 924 m.
+
+Must be called BEFORE the `ImmersedBoundaryGrid` is built, since that is what freezes the wet
+column the barotropic transport is computed over. Returns `(n_masked, n_raised)`.
+
+This is a deliberate modification of the bathymetry and re-keys nothing on its own, but the
+immersed grid built from it differs, so runs before and after are not directly comparable.
+"""
+function fix_boundary_topography!(bottom_height, grid; minimum_boundary_depth = 100)
+    underlying = grid isa ImmersedBoundaryGrid ? grid.underlying_grid : grid
+    Nx, Ny, _ = size(underlying)
+
+    B = Array(interior(bottom_height))          # (Nx, Ny, 1), negative below sea level
+    depth(i, j) = -B[i, j, 1]
+
+    # which (i,j) sit on an open boundary, and which cell is "inward" from each
+    edges = Tuple{Int,Int,Int,Int}[]            # (i, j, i_inward, j_inward)
+    for j in 1:Ny
+        push!(edges, (1, j, 2, j))
+        push!(edges, (Nx, j, Nx - 1, j))
+    end
+    for i in 1:Nx
+        push!(edges, (i, 1, i, 2))
+        push!(edges, (i, Ny, i, Ny - 1))
+    end
+
+    # ---- 1. mask columns too thin to carry transport ----
+    masked = Tuple{Int,Int,Float64}[]
+    for (i, j, _, _) in edges
+        d = depth(i, j)
+        if 0 < d < minimum_boundary_depth
+            push!(masked, (i, j, d))
+            B[i, j, 1] = 0.0                    # land
+        end
+    end
+
+    # ---- 2. OBCSfixtopo ----
+    raised = Float64[]
+    for (i, j, ii, jj) in edges
+        db, di = depth(i, j), depth(ii, jj)
+        if db > 0 && di > 0 && db > di
+            push!(raised, db - di)
+            B[i, j, 1] = -di
+        end
+    end
+
+    set!(bottom_height, B)
+    fill_halo_regions!(bottom_height)
+
+    if isempty(masked)
+        @info @sprintf(" -> boundary topography: no column shallower than %d m to mask", minimum_boundary_depth)
+    else
+        @info @sprintf(" -> boundary topography: masked %d column(s) under %d m: %s",
+                       length(masked), minimum_boundary_depth,
+                       join([@sprintf("(%d,%d) %.0fm", i, j, d) for (i, j, d) in masked], ", "))
+    end
+    if isempty(raised)
+        @info " -> OBCSfixtopo: no boundary column was deeper than its inward neighbour"
+    else
+        @info @sprintf(" -> OBCSfixtopo: raised %d boundary column(s), mean %.0f m, worst %.0f m",
+                       length(raised), sum(raised) / length(raised), maximum(raised))
+    end
+
+    return length(masked), length(raised)
+end

@@ -50,7 +50,7 @@ end
 # ---- run identity -------------------------------------------------------------------------
 # Prefixes every output file: RUN_NAME_surface.nc, _midlon.nc, _free_surface.nc.
 # Change it per experiment or runs overwrite each other. Animate: ./run_animate_simulation NAME
-const RUN_NAME = "20D_bsose_flather"
+const RUN_NAME = "20D_bsose_bathyfix"
 
 # ---- period and domain --------------------------------------------------------------------
 const START_DATE = DateTime("2014-06-01")
@@ -63,6 +63,17 @@ const CIRCUMPOLAR = false   # true = 0-360 degrees, Periodic in x (west/east BCs
 
 const BSOSE_ITERATION = 156 # 156 covers 2013-2024, 105 covers 2008-2012. No fallback: a
                             # missing file is an error. Filenames: BSOSE_FILES in setup_bsose.jl
+
+# Condition the sea floor on the open boundaries (see `fix_boundary_topography!`).
+#
+# The model's fastest cell has been the BOTTOM cell of a column on an open boundary in every
+# run: (1,21,39) in a 483 m column, growing ~0.3 m/s/day. Three scheme hypotheses have been
+# tested and eliminated -- missing bottom drag (no, it is active), the radiation stencil at
+# immersed-adjacent cells (no, Dirichlet diverges in 3 days), and the transport pin amplifying
+# ΔU/H (no, identical growth without it). The bathymetry is what is left, and the east face
+# carries a 42 m column at (360,10) against neighbours of ~438 m: a 75x velocity amplifier.
+const FIX_BOUNDARY_TOPOGRAPHY = true
+const MINIMUM_BOUNDARY_DEPTH  = 100   # m; masks (360,10) at 42 m and nothing else
 
 # ---- open boundaries ----------------------------------------------------------------------
 const OBCS = true                           # false = whole-region restoring instead
@@ -109,29 +120,24 @@ const TRACER_SCHEME = TracerReservoir(inflow_length_scale = 5000, outflow_length
 # with the barotropic solution, so without these the net transport is driven to zero whatever
 # the 3-D conditions say.
 const BAROTROPIC_OBC    = true
-const BAROTROPIC_SCHEME = :flather  # :pinned (Flather + target_transport) | :flather
+const BAROTROPIC_SCHEME = :pinned   # :pinned (Flather + target_transport) | :flather
 #
-# PIN OFF for this run (2026-10-24), testing whether `target_transport` is what drives the
-# growing bottom-cell velocities. The pin corrects by a UNIFORM SHIFT IN TRANSPORT across every
-# wet column, so the velocity it induces is ΔU/H -- 7.9x larger in the 483 m column at
-# (1,21) than on the face average, and 75x in the 42 m column at (360,10). Both of the model's
-# fastest cells sit in exactly those places. NestingValidation tested the same correction and
-# REMOVED it: two runs with exterior nets differing by 3.0e5 m³/s were indistinguishable,
-# because Flather restores rather than integrates.
+# DO NOT SET :flather WITHOUT A CORRECT eta_ext. Tested 2026-10-25 and the circulation INVERTS:
 #
-# READ THE TRANSPORTS AND η TOGETHER, AND EXPECT THEM TO MOVE. With EXTERIOR_SSH = false the
-# Flather reference is a FLAT ZERO sea surface, while the model's mean η settles near -0.09 m.
-# At the measured ~5 Sv per cm that is tens of Sv of push on each zonal face which the pin has
-# been absorbing. So this run is NOT comparable to the others on transport -- W/E/N will no
-# longer read +186.82 / +215.38 / -28.56, and mean η will drift toward zero. That is the
-# scheme working as designed, not a failure.
+#     face      :pinned     :flather
+#     west       +186.8      +234.3
+#     east       +215.4       -60.3   <- sign flipped, ACC enters through BOTH zonal faces
+#     north       -28.6      +295.2   <- and exits north
 #
-# What IS comparable: the `[max|u|]` location and magnitude. If (1,21,39) stops growing, the
-# pin was the amplifier. If it keeps climbing at ~0.3 m/s/day, the pin is exonerated and the
-# bathymetry is next.
+# with mean eta drifting -0.44 -> -0.53 m over ten days and still going. The cause is
+# EXTERIOR_SSH = false: Flather's reference is a flat zero sea surface while the model sits near
+# -0.5 m, and at the measured ~5 Sv/cm that is ~250 Sv of spurious forcing. The pin has been
+# absorbing it. NestingValidation removed this same correction with no effect, but their own
+# caveat applies -- they tested a 719 km^2 section carrying 24-45 Sv, not a basin carrying 200.
 #
-# `bsose_open_boundary_conditions` will warn that :flather with no exterior free surface is
-# not the conservative setting. That warning is expected here.
+# The test was worth running anyway: |u| at (1,21,39) grew at 0.30 m/s/day WITHOUT the pin
+# against 0.32 WITH it. Same cell, same rate. The pin is not the amplifier.
+#
 const BAROTROPIC_FACES  = :all      # :all | :zonal -- keep :all, the :zonal theory was
                                     # disproven (north carries -31 Sv, 18% of the zonal flow)
 const EXTERIOR_SSH      = false     # eta_ext and the initial eta from B-SOSE ETAN.
@@ -223,6 +229,14 @@ bottom_height = regrid_bathymetry(grid,
 # MITgcm's `OBCSfixtopo` (a boundary column is never deeper than its inward neighbour). The
 # blend was GLORYS-specific and does not apply here, but OBCSfixtopo is not -- MITgcm applies it
 # whatever the parent. It is recoverable from git at 142f2c1 if we want it back for B-SOSE.
+
+# Condition the sea floor along the open boundaries before the immersed grid freezes it.
+# Masks columns too thin to carry transport and applies MITgcm's OBCSfixtopo; see
+# `fix_boundary_topography!` for what each does and the numbers behind the threshold.
+if FIX_BOUNDARY_TOPOGRAPHY
+    fix_boundary_topography!(bottom_height, grid;
+                             minimum_boundary_depth = MINIMUM_BOUNDARY_DEPTH)
+end
 
 grid = ImmersedBoundaryGrid(grid, GridFittedBottom(bottom_height))
 
