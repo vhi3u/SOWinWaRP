@@ -50,7 +50,7 @@ end
 # ---- run identity -------------------------------------------------------------------------
 # Prefixes every output file: RUN_NAME_surface.nc, _midlon.nc, _free_surface.nc.
 # Change it per experiment or runs overwrite each other. Animate: ./run_animate_simulation NAME
-const RUN_NAME = "20D_bsose_v1"
+const RUN_NAME = "20D_bsose_dirichlet"
 
 # ---- period and domain --------------------------------------------------------------------
 const START_DATE = DateTime("2014-06-01")
@@ -67,16 +67,37 @@ const BSOSE_ITERATION = 156 # 156 covers 2013-2024, 105 covers 2008-2012. No fal
 # ---- open boundaries ----------------------------------------------------------------------
 const OBCS = true                           # false = whole-region restoring instead
 
-const OBC_SCHEME    = "NormalRadiation"     # normal u/v: NormalRadiation | PerturbationAdvection
+const OBC_SCHEME    = "clamped"             # normal u/v: NormalRadiation | PerturbationAdvection
                                             #             | ObliqueRadiation | clamped
-const TANGENTIAL_BC = :radiation            # tangential u/v: :radiation | :clamped | :gradient
+const TANGENTIAL_BC = :clamped              # tangential u/v: :radiation | :clamped | :gradient
                                             #   | :oblique | :perturbation_advection | ...
 const RADIATION_TAU_IN = 6hours             # inflow nudging; outflow is Inf throughout
 const OBLIQUE_TAU_IN   = 3days              # ObliqueRadiation only
 const OBLIQUE_TAU_OUT  = 360days
 
-# Tracers. :same gives T and S whatever OBC_SCHEME the normal flow uses.
-const TRACER_SCHEME = TracerReservoir(inflow_length_scale = 5000, outflow_length_scale = 0)
+# Tracers. :same gives T and S whatever OBC_SCHEME the normal flow uses, so with
+# OBC_SCHEME = "clamped" they are Dirichlet too.
+const TRACER_SCHEME = :same
+
+# WHY EVERYTHING IS DIRICHLET THIS RUN (2026-10-24).
+#
+# With NormalRadiation, |u| grew steadily at ONE cell -- (i=1, j=21, k=39), 1.82 -> 4.05 m/s
+# over days 5-12, still climbing -- and |v| did the same at (i=296, j=151, k=6). Both are the
+# DEEPEST WET CELL of their column on an open boundary. The second sits in 4900 m of water, so
+# a thin column cannot be the explanation; what the two share is solid below and an open
+# boundary beside. The SURFACE diagnostics plateaued at ~1.4 m/s throughout and never saw it.
+#
+# NestingValidation found ObliqueRadiation diverges at cells next to land because "the released
+# stencil clamps indices and has no land or immersed-boundary check". They tested adjacency
+# ALONG a face; a bottom cell is adjacency BENEATH it, and NormalRadiation also derives a phase
+# speed from local differences. Dirichlet computes no phase speed anywhere, so if the growth
+# stops, that is the mechanism.
+#
+# Ruled out first, by reading the code rather than guessing: bottom drag IS active (mu = 0.003)
+# -- `ocean_simulation`'s `merge_boundary_conditions` merges side-by-side, so our unspecified
+# `bottom` and `immersed` sides inherit its quadratic drag.
+#
+# BAROTROPIC_SCHEME stays :pinned so this run changes one thing.
 
 # Do not set ObliqueRadiation here, for two independent reasons.
 #
