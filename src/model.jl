@@ -57,6 +57,7 @@ const START_DATE = DateTime("2014-06-01")
 const END_DATE   = DateTime("2014-06-21")   # 20 days: a boundary test, not a science run
 
 const SCALING    = 6        # horizontal resolution = 1/SCALING degrees (1/6 ~ 15 km)
+const Z_EXTENT   = 5800     # m, depth of the vertical grid
 const DZ_SURFACE = 5        # m, upper-ocean spacing -> ~135 levels, 100 of them above 500 m
 const DZ_BOTTOM  = 200      # m, deep spacing
 const CIRCUMPOLAR = false   # true = 0-360 degrees, Periodic in x (west/east BCs then unused)
@@ -74,6 +75,22 @@ const BSOSE_ITERATION = 156 # 156 covers 2013-2024, 105 covers 2008-2012. No fal
 # carries a 42 m column at (360,10) against neighbours of ~438 m: a 75x velocity amplifier.
 const FIX_BOUNDARY_TOPOGRAPHY = true
 const MINIMUM_BOUNDARY_DEPTH  = 100   # m; masks (360,10) at 42 m and nothing else
+
+# 0 = real bathymetry. Anything > 0 sets every WET column to that uniform depth, which removes
+# all depth variation -- so no thin columns, no U/H amplification, no OBCSfixtopo steps -- while
+# leaving the COASTLINE exactly where it is.
+#
+# Keeping the coastline is the whole point. Flattening the entire box would turn the Antarctic
+# continent into ocean, and B-SOSE has no data there: its land is inpainted with
+# nearest-neighbour ocean values, so prescribing boundary conditions from it would re-create the
+# bug of 2026-10-25 (Uᵉˣᵗ integrated through land) deliberately and across a far larger area.
+#
+# For a self-consistent simplified case, pair a SHALLOW depth with a matching Z_EXTENT:
+# B-SOSE has valid data in the top ~1000 m of every wet column, so a flat 1000 m ocean is a
+# case where the prescribed transport is real data rather than inpainted filler, and the volume
+# budget should still close. √(gH) drops from 198 to 99 m/s, which also doubles the barotropic
+# substep. Note this is NOT the ACC: a 1000 m channel carries far less transport than 3500 m.
+const FLAT_BOTTOM_DEPTH = 0   # m
 
 # ---- open boundaries ----------------------------------------------------------------------
 const OBCS = true                           # false = whole-region restoring instead
@@ -173,6 +190,32 @@ const WINDS                = false  # BSOSE oceTAUX / oceTAUY
 const SURFACE_FLUXES       = false  # BSOSE TFLUX / SFLUX
 const PENETRATING_SHORTWAVE = false # split oceQsw out of TFLUX into TwoColorRadiation
 const SPONGE_LAYERS        = false  # interior restoring near the open edges
+const SPONGE_WIDTH         = 3.0    # degrees; 18 cells at 1/6 deg
+const SPONGE_TIMESCALE     = 12hours # restoring timescale -- see the note below
+
+# SPONGE_TIMESCALE was 30days until 2026-10-25, and that is why earlier sponge arms proved
+# nothing. NestingValidation's canary setup -- our closest published analogue -- runs
+# `rate = 1/12hours`, so our sponge was **60x too weak**. Read from their source, not from our
+# earlier note about it, which recorded "a 1/12-day rate" and was wrong.
+#
+# The WIDTH was never the mismatch, which the same note also got wrong. Canary's nominal 0.25 deg
+# at 0.02 deg is 12.5 cells, and its Gaussian exp(-(d/w)^2) still carries 0.37 AT the nominal
+# width, so its effective reach is ~20 cells. Our raised cosine 0.5(1+cos(pi d/w)) has compact
+# support, reaching exactly 0 at the width, so 3 deg = 18 cells is the closer match -- and it is
+# the value already in use. Changing the timescale alone keeps this to one variable.
+#
+# Our mask takes `min` over the edge distances and then tapers, which is equivalent to canary's
+# `max(edge(distance))`: the nearest edge gives the strongest restoring, so corners are not
+# double-counted either way. The south edge is entirely land, so its share of the mask lands on
+# immersed cells and does nothing.
+#
+# WHY THIS ARM. `TANGENTIAL_BC = :gradient` imposes nothing, so with the sponge off there was no
+# path at all for the parent's tangential velocity -- and the growing signal IS tangential v on
+# the west wall at i=1-3, inside this sponge. Canary supplies boundary-adjacent u and v through
+# exactly this mechanism, not through a boundary condition.
+#
+# COST: the outer 3 deg is no longer a free model solution, so it must be excluded from any
+# analysis. That is the same band Ito et al. exclude anyway.
 const ATMOSPHERE           = :none  # :none | :era5 (bulk formulae; needs ~/.cdsapirc)
 const ERA5_THREADS         = 1      # CDS rejects concurrent queued requests
 
@@ -204,13 +247,13 @@ end
 
 # z stretching so that the upper 500 meters of the ocean has dz = 5 meters, and the deeper ocean will gradually stretch to 200 m vertical resolution. 
 if arch isa CPU
-    z = ReferenceToStretchedDiscretization(; extent=5800,
+    z = ReferenceToStretchedDiscretization(; extent=Z_EXTENT,
         constant_spacing=10,
         maximum_spacing=1000,
         constant_spacing_extent=500,
         stretching=PowerLawStretching(1.15))
 else
-    z = ReferenceToStretchedDiscretization(; extent=5800,
+    z = ReferenceToStretchedDiscretization(; extent=Z_EXTENT,
         constant_spacing=DZ_SURFACE,
         maximum_spacing=DZ_BOTTOM,
         constant_spacing_extent=500,
@@ -246,6 +289,20 @@ bottom_height = regrid_bathymetry(grid,
 # MITgcm's `OBCSfixtopo` (a boundary column is never deeper than its inward neighbour). The
 # blend was GLORYS-specific and does not apply here. OBCSfixtopo was brought back on 2026-10-25
 # as `fix_boundary_topography!` below, and it is what removed the west-face velocity pileup.
+
+# Flatten every wet column, if asked. Done BEFORE `fix_boundary_topography!` on purpose: a
+# genuinely flat field has no thin columns and no inward steps, so that function should then
+# report "masked 0" and "raised 0", which verifies the flattening rather than asserting it.
+if FLAT_BOTTOM_DEPTH > 0
+    let B = interior(bottom_height)
+        nwet_before = count(<(0), Array(B))
+        B .= ifelse.(B .< 0, -Float64(FLAT_BOTTOM_DEPTH), B)
+        fill_halo_regions!(bottom_height)
+        @info @sprintf(" -> FLAT BOTTOM: %d wet columns set to %d m, coastline unchanged. \
+                        Not the ACC -- see the note on FLAT_BOTTOM_DEPTH.",
+                       nwet_before, FLAT_BOTTOM_DEPTH)
+    end
+end
 
 # Condition the sea floor along the open boundaries before the immersed grid freezes it.
 # Masks columns too thin to carry transport and applies MITgcm's OBCSfixtopo; see
@@ -385,9 +442,11 @@ if OBCS
         barotropic_scheme=BAROTROPIC_SCHEME)
 
     if SPONGE_LAYERS
-        sponge_timescale = 30days
-        @info "Configuring boundary edge sponge layers (3.0° width, $(sponge_timescale) restoring timescale)..."
-        forcings = bsose_sponge_layer_forcing(grid; dataset=dataset, dates=bc_dates, sponge_width=3.0, timescale=sponge_timescale, restore_velocities=true, reference_date=start_date)
+        @info @sprintf("Configuring boundary edge sponge layers (%.1f° width = %.0f cells, %s restoring timescale)...",
+                       SPONGE_WIDTH, SPONGE_WIDTH * SCALING, prettytime(SPONGE_TIMESCALE))
+        forcings = bsose_sponge_layer_forcing(grid; dataset=dataset, dates=bc_dates,
+                                              sponge_width=SPONGE_WIDTH, timescale=SPONGE_TIMESCALE,
+                                              restore_velocities=true, reference_date=start_date)
     else
         forcings = NamedTuple()
     end

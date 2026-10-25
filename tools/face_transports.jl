@@ -141,6 +141,51 @@ end
 
 series = transports_over(sweep_dates)
 
+# ------------------------------------------------------- guards: is this output trustworthy?
+#
+# Both of these fired on the first real run (2026-10-25) and the table below was meaningless.
+# They are checked BEFORE anything is reported, because a confident-looking table of Sv is
+# exactly the kind of output that gets believed.
+contaminated = String[]
+
+# 1. A face with no wet columns must carry EXACTLY zero. `bsose_barotropic_transport` integrates
+#    `Δz * slice` with no immersed mask (its `H` above it IS masked), so an all-land face picks
+#    up B-SOSE's inpainted nearest-neighbour ocean values and reports tens of Sv through solid
+#    rock. The south face here is 0/360 wet, which makes this detectable rather than subtle.
+for side in SIDES
+    _, depths = face_geometry(side, grid)
+    if sum(depths) == 0 && !all(iszero, series[side])
+        push!(contaminated,
+              @sprintf("%s face has ZERO wet columns but reports %+.1f to %+.1f Sv -- Uᵉˣᵗ is being integrated through land",
+                       side, minimum(series[side]), maximum(series[side])))
+    end
+end
+
+# 2. Bit-identical consecutive records mean the series did not deliver distinct snapshots. A
+#    dataset-backed FieldTimeSeries holds only a couple of records in memory and reloads from
+#    disk, and `boundary_slice_time_series` copies `fts[t]` eagerly for every t -- so a stale
+#    read gets baked in permanently and silently.
+let dupes = [t for t in 2:length(sweep_dates)
+             if all(series[s][t] == series[s][t-1] for s in SIDES)]
+    isempty(dupes) || push!(contaminated,
+        @sprintf("records %s are bit-identical to the one before them (%d of %d) -- the time series is repeating snapshots, not loading them",
+                 join([Dates.format(bsose_window_center(sweep_dates[t]), "yyyy-mm") for t in dupes], ", "),
+                 length(dupes), length(sweep_dates)))
+end
+
+if !isempty(contaminated)
+    println()
+    println("!"^92)
+    println("DO NOT READ THE NUMBERS BELOW AS PHYSICS. This output is contaminated:")
+    for (n, c) in enumerate(contaminated)
+        println("  $n. $c")
+    end
+    println()
+    println("The table still prints so the pattern is visible, but no verdict from it is valid")
+    println("until these are fixed. See section 4.6.9 of Model Architecture.md.")
+    println("!"^92)
+end
+
 # ------------------------------------------------------------------ the table
 println()
 println(BALANCE ? "transports AFTER balance_barotropic_transports!, as the pin sees them" :

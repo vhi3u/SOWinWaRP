@@ -1259,8 +1259,21 @@ function bsose_barotropic_transport(bts, side, grid)
     face_transports = Float64[]
     for t in 1:length(times)
         slice = along_x ? interior(cpu_bts[t], :, 1, :) : interior(cpu_bts[t], 1, :, :)
+        # Masked exactly as `H` above is. BSOSE inpaints land with nearest-neighbour OCEAN
+        # values, so an UNMASKED integral sums real velocities through solid rock. Before this
+        # was fixed (2026-10-25) the all-land south face reported -32.4 Sv over 0 wet columns,
+        # which is how the bug was caught -- but the faces that mattered were west and east,
+        # with 19 and 10 dry columns along the Antarctic coast. `target_transport` pins the face
+        # INTEGRAL, so a phantom in those dry columns was being spread across the wet ones by
+        # the rescale, corrupting the PROFILE while the net stayed perfect. The north face is
+        # 360/360 wet, so this changes nothing there.
         U = zeros(N)
         for n in 1:N, k in 1:Nz
+            if cpu_grid isa ImmersedBoundaryGrid
+                i = along_x ? n : (side === :west ? 1 : Nx)
+                j = along_x ? (side === :south ? 1 : Ny) : n
+                immersed_cell(i, j, k, cpu_grid) && continue
+            end
             U[n] += Δz[k] * slice[n, k]
         end
 
@@ -1503,7 +1516,16 @@ proportion to its own depth and the vertical structure of the prescribed transpo
 alone. Faces that are entirely land contribute no area and take no correction.
 """
 function balance_barotropic_transports!(Us, grid)
-    sides = [s for s in (:west, :east, :south, :north) if getproperty(Us, s) !== nothing]
+    # A face with no wet area cannot carry transport and must not take part. It would
+    # contribute to `net` through its WIDTHS -- which come from the underlying grid and are
+    # always positive -- while receiving none of the correction, which is distributed by DEPTH
+    # and is therefore zero for it. So an all-land face injects a phantom imbalance that the
+    # real faces then pay for. Found 2026-10-25 on the all-land south face, where the
+    # pre-balance net read -63.92 Sv against BSOSE's own documented closure of +0.151 Sv. The
+    # pinned-target code in `bsose_open_boundary_conditions` already filters this way; this
+    # makes the balance agree with it.
+    sides = [s for s in (:west, :east, :south, :north)
+             if getproperty(Us, s) !== nothing && sum(face_geometry(s, grid)[2]) > 0]
     isempty(sides) && return Us
 
     outward = (west=-1.0, east=+1.0, south=-1.0, north=+1.0)
