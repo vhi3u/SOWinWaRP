@@ -26,6 +26,11 @@
 #     DIR     where the .nc files live (default: working directory)
 #     DAYS    comma-separated output indices, or "first,mid,last" (default)
 #     OUTDIR  where figures go (tools/boundary_maps)
+#     TRIM_CORNERS  drop N cells from each end of every face line (default 0). Run it twice.
+#                   A face's inward lines span the whole perpendicular extent, so a feature on
+#                   a NEIGHBOURING wall is counted in this face's numbers too -- which is how
+#                   the north face came to report its normal component RISING inward to 2.99 m/s
+#                   on 2026-10-25 when the signal was the west wall's v at (i=1, j~130).
 # ==============================================================================
 
 using NCDatasets, CairoMakie, Printf, Statistics
@@ -33,6 +38,7 @@ using NCDatasets, CairoMakie, Printf, Statistics
 const RUN    = get(ENV, "RUN_NAME", length(ARGS) > 0 ? ARGS[1] : "20D_bsose_v1")
 const DIR    = get(ENV, "DIR", ".")
 const OUTDIR = get(ENV, "OUTDIR", joinpath(@__DIR__, "boundary_maps"))
+const TRIM   = parse(Int, get(ENV, "TRIM_CORNERS", "0"))
 mkpath(OUTDIR)
 
 sf = joinpath(DIR, "$(RUN)_surface.nc")
@@ -57,15 +63,23 @@ South/north: normal = v, tangential = u.
 """
 function face_lines(u, v, side, d)
     Nx, Ny = size(u, 1) - 1, size(v, 2) - 1
-    if side === :west
-        return u[1 + d, 1:Ny],       v[1 + d, 1:Ny]
+    n, t = if side === :west
+        u[1 + d, 1:Ny],       v[1 + d, 1:Ny]
     elseif side === :east
-        return u[Nx + 1 - d, 1:Ny],  v[Nx - d, 1:Ny]
+        u[Nx + 1 - d, 1:Ny],  v[Nx - d, 1:Ny]
     elseif side === :south
-        return v[1:Nx, 1 + d],       u[1:Nx, 1 + d]
+        v[1:Nx, 1 + d],       u[1:Nx, 1 + d]
     else
-        return v[1:Nx, Ny + 1 - d],  u[1:Nx, Ny - d]
+        v[1:Nx, Ny + 1 - d],  u[1:Nx, Ny - d]
     end
+    return trim_corners(n), trim_corners(t)
+end
+
+"""Drop `TRIM` cells from each end of a face line, leaving it untouched if that would empty it."""
+function trim_corners(x)
+    TRIM <= 0 && return x
+    n = length(x)
+    return 2TRIM >= n ? x : x[(TRIM + 1):(n - TRIM)]
 end
 
 finite(x) = filter(isfinite, x)
@@ -73,6 +87,10 @@ peak(x) = (f = finite(abs.(x)); isempty(f) ? NaN : maximum(f))
 p99(x)  = (f = finite(abs.(x)); isempty(f) ? NaN : quantile(f, 0.99))
 
 # ------------------------------------------------------------------ the table
+println()
+println(TRIM > 0 ?
+        "corners trimmed: $TRIM cells off each end of every face line" :
+        "corners NOT trimmed -- rerun with TRIM_CORNERS=30 to see which face owns each signal")
 println()
 @printf("%-6s %4s | %18s | %18s | %s\n", "face", "day", "NORMAL max (p99)", "TANGENTIAL max (p99)", "verdict at the edge")
 println("-"^92)
@@ -111,7 +129,8 @@ end
 for t in days
     u, v = slab("u", t), slab("v", t)
     fig = Figure(size = (1400, 950))
-    Label(fig[0, 1:2], "$(RUN) — day $(t-1): boundary velocity by component",
+    Label(fig[0, 1:2], "$(RUN) — day $(t-1): boundary velocity by component" *
+                       (TRIM > 0 ? "  (corners trimmed $TRIM)" : ""),
           fontsize = 20, font = :bold)
 
     for (k, side) in enumerate((:west, :east, :south, :north))
@@ -149,4 +168,7 @@ Reading this:
     is not, the PROFILE along the face is wrong while its integral is right -- which is what
     `target_transport` guarantees by construction and cannot detect.
   * Both comparable, decaying within 1-2 cells => a halo artifact rather than a jet.
+  * A component that RISES inward is not a boundary pileup. Rerun with TRIM_CORNERS=30: if it
+    collapses, you were reading a feature on the adjoining wall, because every face's inward
+    lines span the full perpendicular extent and `peak` maxes over all of it.
 """)

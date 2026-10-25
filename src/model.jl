@@ -50,7 +50,7 @@ end
 # ---- run identity -------------------------------------------------------------------------
 # Prefixes every output file: RUN_NAME_surface.nc, _midlon.nc, _free_surface.nc.
 # Change it per experiment or runs overwrite each other. Animate: ./run_animate_simulation NAME
-const RUN_NAME = "20D_bsose_bathyfix_tgrad"
+const RUN_NAME = "20D_bsose_tgrad_eta"
 
 # ---- period and domain --------------------------------------------------------------------
 const START_DATE = DateTime("2014-06-01")
@@ -742,7 +742,42 @@ let zc = Array(znodes(grid, Center())),
         end
         flush(stdout)
     end
+
+    # Where is max|eta|? The `free surface` line below reports its VALUE but no location, and
+    # `maximum(abs, eta)` sweeps immersed columns too -- it has read 9 m while the ocean itself
+    # peaked at 1.19 m, so the bare number cannot be acted on. This prints the raw argmax with
+    # the local seafloor (so a land cell is visible as such) and, separately, the maximum over
+    # WET columns only, which is the physical one.
+    #
+    # Read it as: a wet max|eta| sitting on or beside a face is an exterior-SSH mismatch. With
+    # EXTERIOR_SSH = false we feed eta_ext = 0 while B-SOSE ETAN averages -0.95 m over this
+    # domain, and at 55S a 0.41 m step across one 9.9 km cell is geostrophically worth 3.4 m/s
+    # -- the amplitude of the surface jet on the western wall. If instead the wet max is in the
+    # interior, that mismatch is not driving it and the hypothesis is dead.
+    function log_eta_argmax(sim)
+        H = Array(interior(ocean.model.free_surface.displacement))[:, :, 1]
+
+        raw, ridx = findmax(abs, H)
+        ri, rj = Tuple(ridx)
+
+        wv, wi, wj = -1.0, 0, 0
+        for j in axes(H, 2), i in axes(H, 1)
+            if seafloor(i, j) < 0 && abs(H[i, j]) > wv
+                wv, wi, wj = abs(H[i, j]), i, j
+            end
+        end
+
+        # eta is Center-located in x and y, so cell 1 IS the boundary cell: distance 0.
+        @info @sprintf("        [max|eta|] raw %6.3f at (i=%3d, j=%3d) seafloor %8.1f m [%s]  |  wet %6.3f at (i=%3d, j=%3d), %3d cells from west/east, %3d from south/north",
+                       raw, ri, rj, seafloor(ri, rj), seafloor(ri, rj) < 0 ? "wet" : "LAND",
+                       wv, wi, wj,
+                       max(0, min(wi - 1, grid.Nx - wi)),
+                       max(0, min(wj - 1, grid.Ny - wj)))
+        flush(stdout)
+    end
+
     simulation.callbacks[:velocity_argmax] = Callback(log_velocity_argmax, TimeInterval(output_interval))
+    simulation.callbacks[:eta_argmax] = Callback(log_eta_argmax, TimeInterval(output_interval))
 end
 
 # output writers
