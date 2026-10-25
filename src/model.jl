@@ -50,7 +50,7 @@ end
 # ---- run identity -------------------------------------------------------------------------
 # Prefixes every output file: RUN_NAME_surface.nc, _midlon.nc, _free_surface.nc.
 # Change it per experiment or runs overwrite each other. Animate: ./run_animate_simulation NAME
-const RUN_NAME = "20D_bsose_dirichlet"
+const RUN_NAME = "20D_bsose_flather"
 
 # ---- period and domain --------------------------------------------------------------------
 const START_DATE = DateTime("2014-06-01")
@@ -67,37 +67,26 @@ const BSOSE_ITERATION = 156 # 156 covers 2013-2024, 105 covers 2008-2012. No fal
 # ---- open boundaries ----------------------------------------------------------------------
 const OBCS = true                           # false = whole-region restoring instead
 
-const OBC_SCHEME    = "clamped"             # normal u/v: NormalRadiation | PerturbationAdvection
+const OBC_SCHEME    = "NormalRadiation"     # normal u/v: NormalRadiation | PerturbationAdvection
                                             #             | ObliqueRadiation | clamped
-const TANGENTIAL_BC = :clamped              # tangential u/v: :radiation | :clamped | :gradient
+const TANGENTIAL_BC = :radiation            # tangential u/v: :radiation | :clamped | :gradient
                                             #   | :oblique | :perturbation_advection | ...
 const RADIATION_TAU_IN = 6hours             # inflow nudging; outflow is Inf throughout
 const OBLIQUE_TAU_IN   = 3days              # ObliqueRadiation only
 const OBLIQUE_TAU_OUT  = 360days
 
-# Tracers. :same gives T and S whatever OBC_SCHEME the normal flow uses, so with
-# OBC_SCHEME = "clamped" they are Dirichlet too.
-const TRACER_SCHEME = :same
+# Tracers. :same gives T and S whatever OBC_SCHEME the normal flow uses.
+const TRACER_SCHEME = TracerReservoir(inflow_length_scale = 5000, outflow_length_scale = 0)
 
-# WHY EVERYTHING IS DIRICHLET THIS RUN (2026-10-24).
+# DO NOT SET OBC_SCHEME = "clamped" HERE. Tested 2026-10-24 and it DIVERGES: NaN in u at
+# day 3.1, with Δt collapsing 5.6 -> 1.2 min and max|η| quadrupling 1.22 -> 4.86 m, against a
+# NormalRadiation run that reached day 20. A hard Dirichlet over-specifies an OUTFLOW boundary,
+# and the ACC leaves through the east face at +215 Sv; the eddies arriving there had nowhere to
+# go. Radiation with outflow_timescale = Inf is what lets them out.
 #
-# With NormalRadiation, |u| grew steadily at ONE cell -- (i=1, j=21, k=39), 1.82 -> 4.05 m/s
-# over days 5-12, still climbing -- and |v| did the same at (i=296, j=151, k=6). Both are the
-# DEEPEST WET CELL of their column on an open boundary. The second sits in 4900 m of water, so
-# a thin column cannot be the explanation; what the two share is solid below and an open
-# boundary beside. The SURFACE diagnostics plateaued at ~1.4 m/s throughout and never saw it.
-#
-# NestingValidation found ObliqueRadiation diverges at cells next to land because "the released
-# stencil clamps indices and has no land or immersed-boundary check". They tested adjacency
-# ALONG a face; a bottom cell is adjacency BENEATH it, and NormalRadiation also derives a phase
-# speed from local differences. Dirichlet computes no phase speed anywhere, so if the growth
-# stops, that is the mechanism.
-#
-# Ruled out first, by reading the code rather than guessing: bottom drag IS active (mu = 0.003)
-# -- `ocean_simulation`'s `merge_boundary_conditions` merges side-by-side, so our unspecified
-# `bottom` and `immersed` sides inherit its quadratic drag.
-#
-# BAROTROPIC_SCHEME stays :pinned so this run changes one thing.
+# The divergence started at (i=355, j=11) and (i=359, j=87) -- the thin-column cluster on the
+# east face, where (360,10) is 42 m against neighbours of ~438 m. That is evidence the thin
+# columns GENERATE the problem and radiation has been letting it escape, not causing it.
 
 # Do not set ObliqueRadiation here, for two independent reasons.
 #
@@ -120,7 +109,29 @@ const TRACER_SCHEME = :same
 # with the barotropic solution, so without these the net transport is driven to zero whatever
 # the 3-D conditions say.
 const BAROTROPIC_OBC    = true
-const BAROTROPIC_SCHEME = :pinned   # :pinned (Flather + target_transport) | :flather
+const BAROTROPIC_SCHEME = :flather  # :pinned (Flather + target_transport) | :flather
+#
+# PIN OFF for this run (2026-10-24), testing whether `target_transport` is what drives the
+# growing bottom-cell velocities. The pin corrects by a UNIFORM SHIFT IN TRANSPORT across every
+# wet column, so the velocity it induces is ΔU/H -- 7.9x larger in the 483 m column at
+# (1,21) than on the face average, and 75x in the 42 m column at (360,10). Both of the model's
+# fastest cells sit in exactly those places. NestingValidation tested the same correction and
+# REMOVED it: two runs with exterior nets differing by 3.0e5 m³/s were indistinguishable,
+# because Flather restores rather than integrates.
+#
+# READ THE TRANSPORTS AND η TOGETHER, AND EXPECT THEM TO MOVE. With EXTERIOR_SSH = false the
+# Flather reference is a FLAT ZERO sea surface, while the model's mean η settles near -0.09 m.
+# At the measured ~5 Sv per cm that is tens of Sv of push on each zonal face which the pin has
+# been absorbing. So this run is NOT comparable to the others on transport -- W/E/N will no
+# longer read +186.82 / +215.38 / -28.56, and mean η will drift toward zero. That is the
+# scheme working as designed, not a failure.
+#
+# What IS comparable: the `[max|u|]` location and magnitude. If (1,21,39) stops growing, the
+# pin was the amplifier. If it keeps climbing at ~0.3 m/s/day, the pin is exonerated and the
+# bathymetry is next.
+#
+# `bsose_open_boundary_conditions` will warn that :flather with no exterior free surface is
+# not the conservative setting. That warning is expected here.
 const BAROTROPIC_FACES  = :all      # :all | :zonal -- keep :all, the :zonal theory was
                                     # disproven (north carries -31 Sv, 18% of the zonal flow)
 const EXTERIOR_SSH      = false     # eta_ext and the initial eta from B-SOSE ETAN.
