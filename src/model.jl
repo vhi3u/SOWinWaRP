@@ -244,8 +244,8 @@ bottom_height = regrid_bathymetry(grid,
 # NOTE: `match_boundary_bathymetry!` went with glorys_obc.jl. It blended the child bottom
 # toward the GLORYS parent over a 4-cell band at the open edges, and also carried our port of
 # MITgcm's `OBCSfixtopo` (a boundary column is never deeper than its inward neighbour). The
-# blend was GLORYS-specific and does not apply here, but OBCSfixtopo is not -- MITgcm applies it
-# whatever the parent. It is recoverable from git at 142f2c1 if we want it back for B-SOSE.
+# blend was GLORYS-specific and does not apply here. OBCSfixtopo was brought back on 2026-10-25
+# as `fix_boundary_topography!` below, and it is what removed the west-face velocity pileup.
 
 # Condition the sea floor along the open boundaries before the immersed grid freezes it.
 # Masks columns too thin to carry transport and applies MITgcm's OBCSfixtopo; see
@@ -730,15 +730,20 @@ let zc = Array(znodes(grid, Center())),
     seafloor(i, j) = Bh[clamp(i, 1, grid.Nx) + ox, clamp(j, 1, grid.Ny) + oy, 1]
 
     function log_velocity_argmax(sim)
-        for (name, f) in (("u", ocean.model.velocities.u), ("v", ocean.model.velocities.v))
+        # The distance to a face is min(index - 1, extent - index), where `extent` is this
+        # field's own extent in that direction -- Nx+1 for u in x and Ny+1 for v in y, because
+        # those are Face-located and index Nx+1 IS the east face; but Ny for u in y and Nx for
+        # v in x, because in the OTHER direction they are Center-located and the last cell sits
+        # ON the boundary. Using the Face extent for both over-reported the Center direction by
+        # one cell, which read max|u| at j=150 as "1 from north" when it is on the north row.
+        for (name, f, nx, ny) in (("u", ocean.model.velocities.u, grid.Nx + 1, grid.Ny),
+                                  ("v", ocean.model.velocities.v, grid.Nx,     grid.Ny + 1))
             val, idx = findmax(abs, Array(interior(f)))
             i, j, k = Tuple(idx)
             @info @sprintf("        [max|%s|] %7.3f m/s at (i=%3d, j=%3d, k=%3d)  z = %8.1f m  seafloor = %8.1f m  |  %3d cells from west/east, %3d from south/north",
                            name, val, i, j, k, zc[clamp(k, 1, length(zc))], seafloor(i, j),
-                           # u is Face-located in x (i runs to Nx+1), v in y (j to Ny+1), so
-                           # clamp: index Nx+1 IS the east face, distance 0, not -1.
-                           max(0, min(i - 1, grid.Nx + 1 - i)),
-                           max(0, min(j - 1, grid.Ny + 1 - j)))
+                           max(0, min(i - 1, nx - i)),
+                           max(0, min(j - 1, ny - j)))
         end
         flush(stdout)
     end
@@ -777,7 +782,41 @@ let zc = Array(znodes(grid, Center())),
     end
 
     simulation.callbacks[:velocity_argmax] = Callback(log_velocity_argmax, TimeInterval(output_interval))
+
+    # Per-face eta: each boundary row against its inward neighbour, wet columns only.
+    #
+    # `[max|eta|]` above says WHERE the single extreme is. This says whether a whole FACE is
+    # offset, which is the thing that distinguishes a boundary condition holding a face from
+    # the ocean filling it. We feed eta_ext = 0 through Flather/Chapman while B-SOSE ETAN
+    # averages about -0.95 m over this domain, so if that mismatch is doing work, the offset
+    # column below should be large and persistent on the offending face and small on the others.
+    #
+    # eta is Center-located in x and y, so the boundary cell is index 1 / Nx / Ny -- not Nx+1.
+    function log_eta_faces(sim)
+        H = Array(interior(ocean.model.free_surface.displacement))[:, :, 1]
+
+        row(side, d) = side === :west  ? [(1 + d, j)        for j in 1:grid.Ny] :
+                       side === :east  ? [(grid.Nx - d, j)  for j in 1:grid.Ny] :
+                       side === :south ? [(i, 1 + d)        for i in 1:grid.Nx] :
+                                         [(i, grid.Ny - d)  for i in 1:grid.Nx]
+
+        for side in (:west, :east, :south, :north)
+            wet(d) = [H[i, j] for (i, j) in row(side, d) if seafloor(i, j) < 0]
+            v0, v1 = wet(0), wet(1)
+            if isempty(v0)
+                @info @sprintf("        [eta face] %-5s : dry", side)
+            else
+                @info @sprintf("        [eta face] %-5s : row mean %+7.4f m, max|.| %6.3f m, %3d wet  |  one cell in %+7.4f m  |  offset %+7.4f m",
+                               side, mean(v0), maximum(abs, v0), length(v0),
+                               isempty(v1) ? NaN : mean(v1),
+                               isempty(v1) ? NaN : mean(v0) - mean(v1))
+            end
+        end
+        flush(stdout)
+    end
+
     simulation.callbacks[:eta_argmax] = Callback(log_eta_argmax, TimeInterval(output_interval))
+    simulation.callbacks[:eta_faces] = Callback(log_eta_faces, TimeInterval(output_interval))
 end
 
 # output writers

@@ -1554,16 +1554,34 @@ coordinate direction -- the convention `GravityWaveRadiation`'s `target_transpor
 so multiplying by the column width and summing along the face gives m³ s⁻¹ directly.
 """
 function mean_face_transport(fts, side, grid)
-    fts === nothing && return 0.0
+    series = face_transport_series(fts, side, grid)
+    return isempty(series) ? 0.0 : sum(series) / length(series)
+end
+
+
+"""
+    face_transport_series(fts, side, grid)
+
+Net transport through one face for **every record**, `∮U·dl` in m³ s⁻¹, signed positive in the
+positive coordinate direction. Empty if `fts === nothing`.
+
+[`mean_face_transport`](@ref) is the time mean of this, and the pinned `target_transport` is
+that mean -- so this series is exactly what the pin averages away. `tools/face_transports.jl`
+reports it per record, which is the only way to see whether the single pinned number is
+representative of the run window or whether it is holding a face against its own seasonal sign
+reversal. North swings -31 to +16 Sv over a year, so that is not a hypothetical.
+
+Kept as one code path with `mean_face_transport` deliberately: a tool that re-derived this sum
+could drift from what the model actually pins, and then the diagnostic would be measuring
+something the model does not do.
+"""
+function face_transport_series(fts, side, grid)
+    fts === nothing && return Float64[]
     widths, _ = face_geometry(side, grid)
     cpu = architecture(fts) isa GPU ? on_architecture(CPU(), fts) : fts
-    nt = length(cpu.times)
-    total = 0.0
-    for t in 1:nt
-        U = side in (:south, :north) ? interior(cpu[t], :, 1, 1) : interior(cpu[t], 1, :, 1)
-        total += sum(U .* widths)
-    end
-    return total / nt
+    return [sum((side in (:south, :north) ? interior(cpu[t], :, 1, 1) :
+                                            interior(cpu[t], 1, :, 1)) .* widths)
+            for t in 1:length(cpu.times)]
 end
 
 
