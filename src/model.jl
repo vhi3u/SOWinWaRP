@@ -672,7 +672,10 @@ let zc = Array(znodes(grid, Center())),
             i, j, k = Tuple(idx)
             @info @sprintf("        [max|%s|] %7.3f m/s at (i=%3d, j=%3d, k=%3d)  z = %8.1f m  seafloor = %8.1f m  |  %3d cells from west/east, %3d from south/north",
                            name, val, i, j, k, zc[clamp(k, 1, length(zc))], seafloor(i, j),
-                           min(i - 1, grid.Nx - i), min(j - 1, grid.Ny - j))
+                           # u is Face-located in x (i runs to Nx+1), v in y (j to Ny+1), so
+                           # clamp: index Nx+1 IS the east face, distance 0, not -1.
+                           max(0, min(i - 1, grid.Nx + 1 - i)),
+                           max(0, min(j - 1, grid.Ny + 1 - j)))
         end
         flush(stdout)
     end
