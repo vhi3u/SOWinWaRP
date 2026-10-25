@@ -1163,41 +1163,13 @@ function boundary_vertical_spacing(grid)
 end
 
 """
-    face_profile_grid(cpu_grid)
-
-A flat, single-level `LatitudeLongitudeGrid` for the 1-D boundary profiles (Uᵉˣᵗ, ηᵉˣᵗ).
-
-These series carry no depth. They need the right horizontal extent and the right location
-triple and nothing else -- `getbc` on an `XZFTS`/`YZFTS` reads `f[i,1,k,t]` / `f[1,j,k,t]` and
-never consults the grid.
-
-Building them on the model's 135-level `ImmersedBoundaryGrid` instead allocates a windowed
-field over that large immersed grid for every face and every time level, and on Julia 1.12 that
-reproducibly corrupts the heap:
-
-    malloc_consolidate(): invalid chunk size        (V100 / linux, 2026-10-24)
-    signal 11 in gc_mark_objarray                   (arm64 macOS, same day)
-
-Both die while BUILDING the second or later series, not while reading them. The same
-construction on this flat grid builds all four faces and interpolates in time without
-complaint, which is what `glorys_obc.jl` moved to before it was deleted.
-"""
-function face_profile_grid(cpu_grid)
-    underlying = cpu_grid isa ImmersedBoundaryGrid ? cpu_grid.underlying_grid : cpu_grid
-    Nx, Ny, _ = size(underlying)
-    return LatitudeLongitudeGrid(CPU(); size = (Nx, Ny, 1),
-                                 longitude = (underlying.λᶠᵃᵃ[1], underlying.λᶠᵃᵃ[Nx + 1]),
-                                 latitude  = (underlying.φᵃᶠᵃ[1], underlying.φᵃᶠᵃ[Ny + 1]),
-                                 z = (-1, 0), halo = (7, 7, 1))
-end
-
-"""
     bsose_barotropic_transport(bts, side, grid)
 
 Depth-integrated transport `Uᵉˣᵗ = ∫ u·dz` (m² s⁻¹) along one open boundary, returned as a
 `FieldTimeSeries` shaped for the barotropic velocity's halo on that side — `(Nothing,
-Center, Center)` on west/east, `(Center, Nothing, Center)` on south/north, each with a
-one-cell `z` window. The `Center` in `z` is load-bearing: see `face_profile_grid`.
+Center, Center)` on west/east, `(Center, Nothing, Center)` on south/north, full depth, with
+every level carrying the same value. Both the `Center` in `z` and the full-depth window are
+load-bearing; see the comment at the construction.
 
 `bts` must be the boundary slice of the *normal* velocity for `side` **after**
 [`mask_immersed_boundary_normal_flow!`](@ref) has zeroed its dry cells, so that summing the
@@ -1255,10 +1227,25 @@ function bsose_barotropic_transport(bts, side, grid)
     # {Nothing, Center, Center} is `YZFTS`, whose `getbc` is unambiguous, f[1, j, k, t], and the
     # one-cell z window makes k = 1 the only valid index. South/north were always correct
     # (`XFTS` uses only the first index); they move to `XZFTS` for symmetry.
-    profile_grid = face_profile_grid(cpu_grid)
+    # Full-depth window, and `Center` in z -- both load-bearing.
+    #
+    # `Center` in z: `getbc` dispatches on the location triple. With {Nothing,Center,Nothing}
+    # (`YFTS`) it resolves the index through `j = ifelse(size(grid)[3] == 1, i1, i2)`, a guess
+    # the Oceananigans source calls "not really well defined". The barotropic U/V/η live on the
+    # full 3-D grid, so it took i2 = k = 1 and EVERY column of the west and east faces read
+    # element j = 1 -- which on this domain is in the dry Antarctic band. {Nothing,Center,Center}
+    # is `YZFTS`, whose `getbc` is plainly f[1,j,k,t].
+    #
+    # FULL depth rather than a one-cell z window: a one-cell window is a concrete type this GPU
+    # had never compiled, and every variant of it failed on the cluster -- `malloc_consolidate`
+    # abort, SIGBUS, then an indefinite hang, on both the model grid and a flat 1-level grid.
+    # `boundary_slice_time_series` has been building exactly this full-z shape on this GPU all
+    # along without trouble, so reuse it. The cost is 135x a very small array.
+    #
+    # The barotropic halo fill asks for k = 1, so every level is filled with the same value.
     Uts = along_x ?
-          FieldTimeSeries{Center,Nothing,Center}(profile_grid, times; indices=(:, 1, 1), time_indexing) :
-          FieldTimeSeries{Nothing,Center,Center}(profile_grid, times; indices=(1, :, 1), time_indexing)
+          FieldTimeSeries{Center,Nothing,Center}(cpu_bts.grid, times; indices=(:, 1, :), time_indexing) :
+          FieldTimeSeries{Nothing,Center,Center}(cpu_bts.grid, times; indices=(1, :, :), time_indexing)
 
     # Width of each boundary column, for the face integral reported below. The barotropic
     # transport lives at (Face, Center) on west/east and (Center, Face) on south/north, so
@@ -1278,9 +1265,9 @@ function bsose_barotropic_transport(bts, side, grid)
         end
 
         if along_x
-            interior(Uts[t], :, 1, 1) .= U
+            interior(Uts[t], :, 1, :) .= reshape(U, :, 1)   # same value at every level
         else
-            interior(Uts[t], 1, :, 1) .= U
+            interior(Uts[t], 1, :, :) .= reshape(U, :, 1)
         end
         fill_halo_regions!(Uts[t])
 
@@ -1699,18 +1686,15 @@ function bsose_exterior_free_surface(grid;
     faces = (west = stack[1, :, :], east = stack[Nx, :, :],
              south = stack[:, 1, :], north = stack[:, Ny, :])
 
-    profile_grid = face_profile_grid(cpu_grid)
-
     series(side) = begin
         along_x = side === :south || side === :north
-        # Same `getbc` index trap as `bsose_barotropic_transport`, and the same reason for the
-        # flat grid; see the notes on that function and on `face_profile_grid`.
+        # Same shape and the same two reasons as `bsose_barotropic_transport`; see the note there.
         fts = along_x ?
-              FieldTimeSeries{Center,Nothing,Center}(profile_grid, times; indices=(:, 1, 1), time_indexing=Cyclical()) :
-              FieldTimeSeries{Nothing,Center,Center}(profile_grid, times; indices=(1, :, 1), time_indexing=Cyclical())
+              FieldTimeSeries{Center,Nothing,Center}(cpu_grid, times; indices=(:, 1, :), time_indexing=Cyclical()) :
+              FieldTimeSeries{Nothing,Center,Center}(cpu_grid, times; indices=(1, :, :), time_indexing=Cyclical())
         for t in eachindex(times)
-            along_x ? (interior(fts[t], :, 1, 1) .= faces[side][:, t]) :
-                      (interior(fts[t], 1, :, 1) .= faces[side][:, t])
+            along_x ? (interior(fts[t], :, 1, :) .= reshape(faces[side][:, t], :, 1)) :
+                      (interior(fts[t], 1, :, :) .= reshape(faces[side][:, t], :, 1))
             fill_halo_regions!(fts[t])
         end
         arch isa GPU ? on_architecture(arch, fts) : fts

@@ -75,7 +75,7 @@ print("checking the names model.jl needs ... "); flush(stdout)
 needed = [:bsose_open_boundary_conditions, :bsose_surface_wind_stress, :bsose_surface_tracer_fluxes,
           :bsose_penetrating_shortwave, :bsose_sponge_layer_forcing, :bsose_initial_conditions!,
           :bsose_exterior_free_surface, :bsose_region, :bsose_window_center, :face_geometry,
-          :face_profile_grid, :fill_bathymetry_gaps!, :prefetch_era5!, :restore_on_model_clock!,
+          :fill_bathymetry_gaps!, :prefetch_era5!, :restore_on_model_clock!,
           :S_MIN_PHYSICAL, :S_MAX_PHYSICAL, :T_MIN_PHYSICAL, :T_MAX_PHYSICAL,
           :default_bsose_directory, :BoundingBox, :Metadata, :MetadataSet, :BSOSEMonthly,
           :DatasetRestoring, :regrid_bathymetry, :ocean_simulation, :TwoColorRadiation,
