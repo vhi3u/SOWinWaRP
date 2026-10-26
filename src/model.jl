@@ -50,16 +50,41 @@ end
 # ---- run identity -------------------------------------------------------------------------
 # Prefixes every output file: RUN_NAME_surface.nc, _midlon.nc, _free_surface.nc.
 # Change it per experiment or runs overwrite each other. Animate: ./run_animate_simulation NAME
-const RUN_NAME = "20D_bsose_v2"
+const RUN_NAME = "8M_bsose_test1"
 
 # ---- period and domain --------------------------------------------------------------------
 const START_DATE = DateTime("2014-06-01")
-const END_DATE   = DateTime("2014-06-21")   # 20 days: a boundary test, not a science run
+const END_DATE   = DateTime("2015-02-01")   # 8 months: mid-winter through late summer, so the
+                                            # winter mixed layer finishes deepening in-run and
+                                            # the Tmin is then capped by summer warming
 
 const SCALING    = 6        # horizontal resolution = 1/SCALING degrees (1/6 ~ 15 km)
 const Z_EXTENT   = 5800     # m, depth of the vertical grid
-const DZ_SURFACE = 5        # m, upper-ocean spacing -> ~135 levels, 100 of them above 500 m
-const DZ_BOTTOM  = 200      # m, deep spacing
+const DZ_SURFACE = 8        # m, upper-ocean spacing
+const DZ_BOTTOM  = 400      # m, deep spacing
+const Z_CONSTANT_EXTENT = 250  # m, depth over which DZ_SURFACE is held before stretching
+
+# Nz = 53, from 135, chosen 2026-10-26. Computed, not guessed:
+#
+#   DZ_SURFACE / DZ_BOTTOM / const-extent   Nz   cells<200m   dz at 150 m
+#   5  / 200 / 500  (the old default)      135       40          5.0 m
+#   20 / 400 / 500                          43       10         20.0 m
+#   10 / 400 / 300                          50       20         10.0 m
+#   8  / 400 / 250  (this)                  53       25          8.0 m
+#
+# 53 levels is B-SOSE's own count (52) and about 2.5x fewer cells than 135, but the point is the
+# middle column: WINTER WATER IS A SUBSURFACE TEMPERATURE MINIMUM at roughly 50-200 m, so the
+# cells in that band are the ones that decide whether the Tmin is resolved or smeared. This keeps
+# 8 m spacing through all of it with 25 cells above 200 m.
+#
+# DO NOT coarsen to 20/400/500 to save more. It gives 20 m through the Tmin, and it is also the
+# `coarse_z` arm -- the one run of the 2026-10-25 matrix that FAILED, for a reason never
+# diagnosed. See `tail -40 logs/obc_coarse_z_20d-*.err` before trusting any coarser grid.
+#
+# The floor lands at 5815 m and only moves in 400 m steps down there, so Z_EXTENT anywhere in
+# 5500-5800 gives the same grid. 5400 would give Nz=52 and a 5415 m floor, which is worth doing
+# IF B-SOSE's deepest valid level turns out to be shallower than 5815 -- see the depth-cap item
+# in the Upstream OBC Research note. Unverified.
 const CIRCUMPOLAR = false   # true = 0-360 degrees, Periodic in x (west/east BCs then unused)
 
 const BSOSE_ITERATION = 156 # 156 covers 2013-2024, 105 covers 2008-2012. No fallback: a
@@ -202,9 +227,22 @@ const EXTERIOR_SSH      = true      # eta_ext and the initial eta from B-SOSE ET
 # ETAN averages about -0.95 m over this domain.
 
 # ---- surface forcing ----------------------------------------------------------------------
-const WINDS                = false  # BSOSE oceTAUX / oceTAUY
-const SURFACE_FLUXES       = false  # BSOSE TFLUX / SFLUX
-const PENETRATING_SHORTWAVE = false # split oceQsw out of TFLUX into TwoColorRadiation
+const WINDS                = true   # BSOSE oceTAUX / oceTAUY
+const SURFACE_FLUXES       = true   # BSOSE TFLUX / SFLUX
+const PENETRATING_SHORTWAVE = true  # split oceQsw out of TFLUX into TwoColorRadiation
+
+# PENETRATING_SHORTWAVE IS NOT OPTIONAL WHEN SURFACE_FLUXES IS ON. B-SOSE's TFLUX is the TOTAL
+# surface heat flux, sunlight included, and sunlight is not absorbed at the surface. Depositing
+# all of it in the top cell was measured to give summer SST +7 to +9 C too warm over a 3.1 m
+# mixed layer where B-SOSE had 21.8 m -- while the column-mean temperature was only +0.4 off.
+# Redistribution, not import. For 2014-12: TFLUX +130.1 = oceQsw +214.2 + nonsolar -84.1 W/m2,
+# and the split gives +97 instead of +344 W/m2 over Nov-Feb, which this run spans.
+#
+# A 3 m mixed layer would make a Winter Water run meaningless, since WW *is* the remnant winter
+# mixed layer. See section 3.3 of Model Architecture.md for the full measurement.
+#
+# Still un-convicted rather than cleared: the split has never run on top of a working boundary
+# condition. It does now.
 const SPONGE_LAYERS        = true   # interior restoring near the open edges
 const SPONGE_WIDTH         = 3.0    # degrees; 18 cells at 1/6 deg
 const SPONGE_TIMESCALE     = 1days  # 1 day, not 12 hours -- see the note below
@@ -259,7 +297,11 @@ const BSOSE_SHORTWAVE = PENETRATING_SHORTWAVE && ATMOSPHERE === :none
 # ---- physics and run control ---------------------------------------------------------------
 const CLOSURE_CONFIG = "ito"   # ito | bsose | henyey_gm | biharmonic | none (built below)
 const STOP_ITERATION = Inf     # cut the run short for a smoke test
-const CHECKPOINTS    = false   # write restart checkpoints every 30 days
+const CHECKPOINTS    = true    # write restart checkpoints every 30 days
+# ON for the 8-month run. NOTE: `model.jl` can WRITE checkpoints but has no pickup path -- there
+# is no `set!(model, "checkpoint...")` or `pickup=` anywhere in this file. So a checkpoint is
+# currently insurance that the state EXISTS, not a restart we can perform without writing that
+# code first. Worth closing before relying on it.
 const BOUNDARY_DIAGNOSTICS = true  # free-surface file, per-face transport log, 30-min eta watch
 
 # ==============================================================================
@@ -282,13 +324,13 @@ if arch isa CPU
     z = ReferenceToStretchedDiscretization(; extent=Z_EXTENT,
         constant_spacing=10,
         maximum_spacing=1000,
-        constant_spacing_extent=500,
+        constant_spacing_extent=Z_CONSTANT_EXTENT,
         stretching=PowerLawStretching(1.15))
 else
     z = ReferenceToStretchedDiscretization(; extent=Z_EXTENT,
         constant_spacing=DZ_SURFACE,
         maximum_spacing=DZ_BOTTOM,
-        constant_spacing_extent=500,
+        constant_spacing_extent=Z_CONSTANT_EXTENT,
         stretching=PowerLawStretching(1.12))
 end
 
