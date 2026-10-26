@@ -46,7 +46,10 @@
 #
 # Environment knobs:
 #     DIR     where the model .nc files live          (default: working directory)
-#     DAYS    output indices, or "first,mid,last"     (default: first,mid,last)
+#     SEASONS preset for which months to map: 2Y | 8M | 1Y | ALL  (default: auto from run length)
+#             also accepted as the 2nd positional argument: `... 2Y_bsose_dirichlet 2Y`
+#     MONTHS  explicit month numbers, overrides SEASONS, e.g. MONTHS=6,9,12
+#     DAYS    output indices for the section diagnostics (default: the selected months)
 #     OUTDIR  where figures go                        (tools/bsose_comparison)
 #     MLD_DT  density threshold, kg/m3                (default 0.03, de Boyer Montegut)
 # ==============================================================================
@@ -77,17 +80,51 @@ const MLD_DT = parse(Float64, get(ENV, "MLD_DT", "0.03"))
 const WW_MIN = parse(Float64, get(ENV, "WW_MIN", "30"))
 const WW_MAX = parse(Float64, get(ENV, "WW_MAX", "500"))
 
-# Which months get a surface difference map. Calendar month NUMBERS, not year-months, so the
-# selection survives a change of run dates. Default is June, August, October, December, January:
-# a seasonal progression from mid-winter to late summer, which is the Winter Water
-# formation-and-capping cycle.
+# ── Which months get a surface difference map ─────────────────────────────────────────────────
 #
-# JANUARY RATHER THAN FEBRUARY on purpose. A June-February run (END_DATE = 2015-02-01) gives
-# February exactly ONE output day, so its "monthly mean" would be a snapshot subtracted from a
-# month -- mostly a mismatch of averaging windows rather than model error, sitting next to four
-# genuine monthly means as though it were comparable. January gets 30 of its 31 days and is a
-# real mean. Add 2 back only if END_DATE is extended to 2015-03-01.
-const MONTHS = [parse(Int, x) for x in split(get(ENV, "MONTHS", "6,8,10,12,1"), ",") if !isempty(x)]
+# Months are CALENDAR NUMBERS, not year-months, and that is what makes the presets work: on a
+# 2-year run `[6, 1]` picks June 2014, January 2015, June 2015 AND January 2016 -- the same
+# season in consecutive years, which is what a seasonal comparison wants. On an 8-month run the
+# identical list picks June 2014 and January 2015 only. Nothing has to know the run's dates.
+#
+# Resolution order, highest first:
+#   1. MONTHS   -- an explicit list, e.g. MONTHS=6,9,12
+#   2. a preset -- 2nd positional argument or SEASONS, e.g. `... 2Y_bsose_dirichlet 2Y`
+#   3. auto     -- inferred from the run length, so the usual case needs no argument at all
+const PRESETS = Dict(
+    # 2 years: mid-winter and mid-summer in BOTH cycles. The second cycle is the one not
+    # contaminated by the initial condition, so seeing the same two months twice is the point.
+    "2Y" => [6, 1],
+    # 8 months: winter, spring, summer. One pass through the Winter Water formation-and-capping
+    # cycle, which is all a June-February window contains.
+    "8M" => [6, 10, 1],
+    "1Y" => [6, 9, 12, 3],       # quarterly
+    "ALL" => collect(1:12),
+)
+
+const SEASONS = let a = length(ARGS) > 1 ? ARGS[2] : get(ENV, "SEASONS", "")
+    uppercase(strip(a))
+end
+
+"""
+Month numbers for the surface maps, and a one-line account of where they came from.
+
+Auto-detection reads the run LENGTH rather than its dates, so it works on any start date. The
+thresholds are deliberately loose -- they only choose how many panels to draw.
+"""
+function resolve_months(run_days)
+    if haskey(ENV, "MONTHS") && !isempty(strip(ENV["MONTHS"]))
+        return [parse(Int, x) for x in split(ENV["MONTHS"], ",") if !isempty(strip(x))],
+               "set via MONTHS"
+    end
+    if !isempty(SEASONS)
+        haskey(PRESETS, SEASONS) ||
+            error("unknown preset \"$SEASONS\"; choose one of " * join(sort(collect(keys(PRESETS))), ", "))
+        return PRESETS[SEASONS], "preset $SEASONS"
+    end
+    preset = run_days >= 540 ? "2Y" : run_days >= 150 ? "8M" : "ALL"
+    return PRESETS[preset], @sprintf("auto: %.0f-day run -> preset %s", run_days, preset)
+end
 mkpath(OUTDIR)
 
 const SPONGE_CELLS = 18      # 3 degrees at 1/6 deg; keep in step with SPONGE_WIDTH in model.jl
@@ -126,10 +163,9 @@ MID = div(Nx, 2)
 ds = Dataset(surf_file)
 model_times = Float64.(ds["time"][:])
 nt = length(model_times)
-days = let s = get(ENV, "DAYS", "first,mid,last")
-    s == "first,mid,last" ? unique([1, cld(nt, 2), nt]) :
-        [parse(Int, x) for x in split(s, ",") if !isempty(x)]
-end
+run_days = maximum(model_times) / 86400
+MONTHS, months_src = resolve_months(run_days)
+@info "surface maps for month(s) $(join(MONTHS, ", ")) [$months_src]"
 
 start_date = DateTime("2014-06-01")
 dataset = BSOSEMonthly(iteration = 156)
@@ -240,6 +276,26 @@ end
 
 groups = month_groups(model_times, bc_dates, start_date)
 bins = [(0, 2), (3, 5), (6, 11), (12, 17), (18, 23), (24, 35), (36, 59), (60, 200)]
+
+# The section diagnostics (MLD, Winter Water) sample the SAME months as the surface maps, so the
+# report describes one set of times rather than two. Previously these were "first, mid, last",
+# which on a 2-year run lands on arbitrary points of the seasonal cycle and makes the MLD table
+# hard to read against the maps. DAYS still overrides.
+days = let s = strip(get(ENV, "DAYS", ""))
+    if !isempty(s) && s != "first,mid,last"
+        [parse(Int, x) for x in split(s, ",") if !isempty(strip(x))]
+    elseif s == "first,mid,last"
+        unique([1, cld(nt, 2), nt])
+    else
+        sel = Int[]
+        for (n, dd) in enumerate(bc_dates)
+            (isempty(groups[n]) || !(month(bsose_window_center(dd)) in MONTHS)) && continue
+            push!(sel, groups[n][cld(length(groups[n]), 2)])   # mid-month output
+        end
+        isempty(sel) ? unique([1, cld(nt, 2), nt]) : sel
+    end
+end
+@info "section diagnostics at output index/indices $(join(days, ", ")) (day $(join(days .- 1, ", ")))"
 
 """
 Distance-to-nearest-boundary and a wet mask SHAPED TO THE FIELD, not to the tracer grid.
