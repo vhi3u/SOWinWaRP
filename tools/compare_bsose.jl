@@ -221,8 +221,23 @@ function month_groups(times, dates, t0)
 end
 
 groups = month_groups(model_times, bc_dates, start_date)
-dist = [min(i - 1, Nx - i, j - 1, Ny - j) for i in 1:Nx, j in 1:Ny]
 bins = [(0, 2), (3, 5), (6, 11), (12, 17), (18, 23), (24, 35), (36, 59), (60, 200)]
+
+"""
+Distance-to-nearest-boundary and a wet mask SHAPED TO THE FIELD, not to the tracer grid.
+
+`u` is Face-located in x so it is (Nx+1, Ny); `v` is (Nx, Ny+1); `T` and `S` are (Nx, Ny). One
+mask for all four throws a BoundsError on the velocities, which is exactly what happened on the
+first real run of this script. The distance rule is `min(index-1, extent-index)` using THAT
+field's own extent per axis, so index 1 and index `extent` both come out 0 -- the same rule
+`tools/compare_obc_logs.jl` uses for the velocity argmax.
+"""
+function field_metrics(sz)
+    nx, ny = sz
+    dist = [min(i - 1, nx - i, j - 1, ny - j) for i in 1:nx, j in 1:ny]
+    wet  = [wet3(clamp(i, 1, Nx), clamp(j, 1, Ny), Nz) for i in 1:nx, j in 1:ny]
+    return dist, wet
+end
 
 println()
 println("="^100)
@@ -265,14 +280,19 @@ for (n, dd) in enumerate(bc_dates)
     for (f, un, _) in FIELDS; @printf(" %14s", "mean Δ$f ($un)"); end
     println()
     println("-"^(13 + 15 * length(FIELDS)))
+    metrics = Dict(f => field_metrics(size(diffs[f])) for (f, _, _) in FIELDS)
     for (lo_, hi_) in bins
-        m = [dist[i, j] >= lo_ && dist[i, j] <= hi_ && wet3(i, j, Nz) for i in 1:Nx, j in 1:Ny]
-        any(m) || continue
-        @printf("%4d-%-6d |", lo_, hi_)
+        any_row = false
+        vals = String[]
         for (f, _, _) in FIELDS
-            v = filter(isfinite, diffs[f][m])
-            @printf(" %14.5f", isempty(v) ? NaN : mean(abs, v))
+            dist, wet = metrics[f]
+            m = (dist .>= lo_) .& (dist .<= hi_) .& wet
+            v = any(m) ? filter(isfinite, diffs[f][m]) : Float64[]
+            push!(vals, isempty(v) ? "           ---" : @sprintf("%14.5f", mean(abs, v)))
+            any_row |= !isempty(v)
         end
+        any_row || continue
+        @printf("%4d-%-6d |%s", lo_, hi_, join(vals))
         println(hi_ <= SPONGE_CELLS - 1 ? "   in sponge" : lo_ >= SPONGE_CELLS ? "   free" : "   band edge")
     end
 
@@ -283,9 +303,8 @@ for (n, dd) in enumerate(bc_dates)
     λc = Array(λnodes(grid, Center()))
     for (k, (f, un, cmap)) in enumerate(FIELDS)
         D = copy(diffs[f])
-        for i in axes(D, 1), j in axes(D, 2)
-            (i <= Nx && j <= Ny && wet3(min(i, Nx), min(j, Ny), Nz)) || (D[i, j] = NaN)
-        end
+        _, wet = field_metrics(size(D))
+        D[.!wet] .= NaN
         fin = filter(isfinite, D)
         lim = isempty(fin) ? 1.0 : max(quantile(abs.(fin), 0.99), 1e-6)
         ax = Axis(fig[1 + div(k - 1, 2), 1 + 2 * ((k - 1) % 2)],
