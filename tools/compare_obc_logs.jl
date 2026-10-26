@@ -71,7 +71,7 @@ function parse_log(paths)
     result, days = "no RESULT line", 0.0
     dts, cfls, umax3, vmax3 = Float64[], Float64[], Float64[], Float64[]
     daylist = Float64[]
-    uloc, vloc = Tuple{Int,Int,Int,Int}[], Tuple{Int,Int,Int,Int}[]   # i, j, k, dist-to-face
+    uloc, vloc = Tuple{Int,Int,Int,Int,Float64}[], Tuple{Int,Int,Int,Int,Float64}[]  # i,j,k,dface,|vel|
     etawet, etaface = Any[], Dict{String,Float64}()
     trans = nothing
     wet = Dict{String,Tuple{Int,Int}}()
@@ -88,7 +88,7 @@ function parse_log(paths)
         elseif (m = match(RE_UMAX, line)) !== nothing
             push!(umax3, f(m[1])); push!(vmax3, f(m[2])); push!(cfls, f(m[4]))
         elseif (m = match(RE_ARGMAX, line)) !== nothing
-            rec = (i(m[3]), i(m[4]), i(m[5]), min(i(m[7]), i(m[8])))
+            rec = (i(m[3]), i(m[4]), i(m[5]), min(i(m[7]), i(m[8])), f(m[2]))
             m[1] == "u" ? push!(uloc, rec) : push!(vloc, rec)
         elseif (m = match(RE_ETAMAX, line)) !== nothing
             push!(etawet, (f(m[6]), i(m[7]), i(m[8]), min(i(m[9]), i(m[10])), m[5]))
@@ -207,18 +207,31 @@ println("-"^114)
 for a in sort(arms, by = x -> (x.result != "completed", -(isempty(x.vmax3) ? 0.0 : last(x.vmax3))))
     dt1 = isempty(a.dts) ? NaN : first(a.dts)
     dtn = isempty(a.dts) ? NaN : last(a.dts)
-    umx = isempty(a.umax3) ? NaN : last(a.umax3)
-    vmx = isempty(a.vmax3) ? NaN : last(a.vmax3)
-    dv  = growth(a.daylist, a.vmax3)
+
+    # Prefer the [max|u|]/[max|v|] lines over the progress messenger. Those are printed by our
+    # own callback in a format we control; the messenger's line is Oceanostics' and parsing it
+    # is what left every magnitude column NaN on 2026-10-25 while the argmax lines read fine.
+    useries = isempty(a.uloc) ? a.umax3 : [l[5] for l in a.uloc]
+    vseries = isempty(a.vloc) ? a.vmax3 : [l[5] for l in a.vloc]
+    umx = isempty(useries) ? NaN : last(useries)
+    vmx = isempty(vseries) ? NaN : last(vseries)
+
+    # Likewise for the day axis: if `time = N days` did not parse, fall back to the output
+    # index. These runs log once a day, so the slope is still per day; `days*` flags it.
+    days = isempty(a.daylist) ? collect(1.0:length(vseries)) : a.daylist
+    dv  = growth(days, vseries)
+    nd  = isempty(a.daylist) ? @sprintf("%d*", length(vseries)) : @sprintf("%.0f", a.days)
     pinI, pinJ, dface, modal = pinning(a.vloc)
-    @printf("%-24s %-9s %5.0f  %5.1f %5.1f  %6.2f %6.2f  %+7.3f  %5.0f %5.0f %5.1f %-10s%s\n",
-            a.name, a.result, a.days, dt1, dtn, umx, vmx, dv, pinI, pinJ, dface, modal,
+    @printf("%-24s %-9s %5s  %5.1f %5.1f  %6.2f %6.2f  %+7.3f  %5.0f %5.0f %5.1f %-10s%s\n",
+            a.name, a.result, nd, dt1, dtn, umx, vmx, dv, pinI, pinJ, dface, modal,
             a.sawnan ? "  NaN" : "")
 end
 
 # ------------------------------------------------------------- what each column means
 println("""
 
+  days     a trailing * means the progress line did not parse and this is the OUTPUT COUNT,
+           which for these runs is the same thing (one output per day).
   Δt1/Δtn  first and last timestep, minutes. A collapsing Δt is the cheapest sign of trouble.
   max|u|   max|v|   the 3-D maxima at the last output -- NOT the surface values.
   dv/dt    growth of max|v| per day from day $(Int(SPINUP_DAY)) on. Near zero is the goal; the
