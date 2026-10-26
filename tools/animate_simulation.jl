@@ -41,6 +41,21 @@ using Dates
 # handful of extreme cells flatten everything else -- values outside the range are
 # still drawn, in the colormap's end colours, so the extremes stay visible.
 
+# ── Temporary fixed salinity range ────────────────────────────────────────────
+#
+# Salinity normally SCANS like every other field, which rescales the colorbar per
+# run and per depth band and makes two animations impossible to compare by eye.
+# This pins it to a fixed range so a sequence of runs shares one scale.
+#
+# TEMPORARY, and easy to undo: set S_FIXED_LIMS to `nothing` and salinity goes
+# back to scanning. An explicit `S_LIMS` environment variable still overrides it,
+# so this changes the DEFAULT, not the precedence.
+#
+# Values outside the range are drawn in the colormap's end colours rather than
+# clamped silently, so fresh coastal water below the floor stays visible as
+# saturated dark blue rather than vanishing.
+const S_FIXED_LIMS = (32.5, 35.5)
+
 """
     env_lims(key)
 
@@ -66,10 +81,19 @@ function env_lims(key)
     end
 end
 
-"Use the limits from `key` if it is set, otherwise the scanned ones."
-function resolve_lims(key, scanned)
+"""
+Limits for `key`: the environment variable if set, else `fixed` if one is given,
+else the scanned range.
+
+`fixed` exists for salinity, which is currently pinned rather than scanned — see
+S_FIXED_LIMS above. The source string is reported either way, so the output always
+says which of the three applied.
+"""
+function resolve_lims(key, scanned; fixed=nothing)
     given = env_lims(key)
-    return given === nothing ? (scanned, "scanned") : (given, "set via $key")
+    given !== nothing && return (given, "set via $key")
+    fixed !== nothing && return (fixed, "fixed range (S_FIXED_LIMS)")
+    return (scanned, "scanned")
 end
 
 quantile_of(v, p) = (s = sort(v); s[clamp(round(Int, p * length(s)), 1, length(s))])
@@ -275,7 +299,8 @@ function animate_surface(surface_file, output; framerate, clim_q, start_date=not
     valid_v = filter(!isnan, v_data)
 
     T_lims, T_src = resolve_lims("T_LIMS", scan_lims(valid_T, (-2.0, 20.0); clim_q))
-    S_lims, S_src = resolve_lims("S_LIMS", scan_lims(valid_S, (32.5, 35.5); clim_q))
+    S_lims, S_src = resolve_lims("S_LIMS", scan_lims(valid_S, (32.5, 35.5); clim_q);
+        fixed=S_FIXED_LIMS)
     u_lims, u_src = resolve_lims("U_LIMS", scan_sym_lims(valid_u, (-0.5, 0.5); clim_q))
     v_lims, v_src = resolve_lims("V_LIMS", scan_sym_lims(valid_v, (-0.3, 0.3); clim_q))
 
@@ -373,7 +398,8 @@ function animate_midlon(midlon_file, output, output_focus; framerate, clim_q, fo
         valid_u, valid_v = valid(u_data), valid(v_data)
 
         T_lims, T_src = resolve_lims("T_LIMS", scan_lims(valid_T, (-2.0, 15.0); clim_q))
-        S_lims, S_src = resolve_lims("S_LIMS", scan_lims(valid_S, (33.0, 35.5); clim_q))
+        S_lims, S_src = resolve_lims("S_LIMS", scan_lims(valid_S, (33.0, 35.5); clim_q);
+            fixed=S_FIXED_LIMS)
         u_lims, u_src = resolve_lims("U_LIMS", scan_sym_lims(valid_u, (-0.5, 0.5); clim_q))
         v_lims, v_src = resolve_lims("V_LIMS", scan_sym_lims(valid_v, (-0.3, 0.3); clim_q))
 
