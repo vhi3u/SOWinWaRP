@@ -139,13 +139,27 @@ all_logs = sort(filter(p -> endswith(p, ".out") && occursin("obc_", basename(p))
                        readdir(LOGDIR; join = true)))
 isempty(all_logs) && error("no obc_*.out files in $LOGDIR/")
 
+# Report the raw file count FIRST. The first version of this script printed "1 arms in the most
+# recent batch" while the directory held twenty-one logs, and because the dropped ones appeared
+# in neither the kept list nor the excluded list there was no way to see that from the output.
+# A filter that can discard most of its input must show its working.
+@printf("found %d obc_*.out file(s) in %s/\n", length(all_logs), LOGDIR)
+if get(ENV, "VERBOSE", "0") != "0"
+    for p in all_logs
+        @printf("    %-52s  %s\n", basename(p), Libc.strftime("%Y-%m-%d %H:%M", mtime(p)))
+    end
+end
+
 newest = maximum(mtime, all_logs)
 cutoff = newest - SINCE_HOURS * 3600
 recent = filter(p -> mtime(p) >= cutoff, all_logs)
 stale  = filter(p -> mtime(p) < cutoff, all_logs)
 
-arms = [parse_log(p) for p in recent]
-filter!(a -> !isempty(a.dts) || a.result == "FAILED", arms)   # drop prep jobs and empties
+parsed = [parse_log(p) for p in recent]
+arms = filter(a -> !isempty(a.dts) || a.result != "no RESULT line", parsed)
+dropped = setdiff(basename.(getproperty.(parsed, :path)), basename.(getproperty.(arms, :path)))
+isempty(dropped) || @printf("skipped %d log(s) with no progress output (prep jobs, empties): %s\n",
+                            length(dropped), join(sort(dropped), ", "))
 
 # One arm resubmitted keeps only its newest log.
 by_name = Dict{String,Any}()
@@ -162,8 +176,8 @@ for a in arms
 end
 arms = collect(values(by_name))
 
-@printf("%d arms in the most recent batch (within %.0f h of the newest log)\n",
-        length(arms), SINCE_HOURS)
+@printf("%d arm(s) kept, within %.0f h of the newest log: %s\n",
+        length(arms), SINCE_HOURS, join(sort(getproperty.(arms, :name)), ", "))
 if !isempty(stale)
     @printf("EXCLUDED %d older log(s) from an earlier batch: %s\n", length(stale),
             join(sort(unique(replace.(basename.(stale), r"-[^-]*\.out$" => "", r"\.out$" => ""))), ", "))
