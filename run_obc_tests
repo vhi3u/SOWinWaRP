@@ -144,9 +144,11 @@ read_default() {
 DEF_Z_EXTENT=$(read_default Z_EXTENT)
 DEF_DZ_SURFACE=$(read_default DZ_SURFACE)
 DEF_DZ_BOTTOM=$(read_default DZ_BOTTOM)
+DEFAULT_SIG=""
 for v in DEF_Z_EXTENT DEF_DZ_SURFACE DEF_DZ_BOTTOM; do
     [ -n "${!v}" ] || { echo "error: could not read ${v#DEF_} from src/model.jl" >&2; exit 1; }
 done
+DEFAULT_SIG="${DEF_Z_EXTENT}_${DEF_DZ_SURFACE}_${DEF_DZ_BOTTOM}"
 echo "vertical grid defaults from src/model.jl: Z_EXTENT=$DEF_Z_EXTENT DZ_SURFACE=$DEF_DZ_SURFACE DZ_BOTTOM=$DEF_DZ_BOTTOM"
 echo
 
@@ -179,6 +181,23 @@ sig_jid() {
     echo ""
 }
 
+# Submit a job script that has been written to disk, after checking it parses.
+#
+# WHY NOT A BARE HEREDOC INTO sbatch. Two failures in a row came from heredoc expansion, and in
+# both cases the script that SLURM actually received was unavailable to look at -- the only
+# evidence was "line 18: : command not found" from a job that no longer existed. Writing the
+# script to obc_tests/, linting it with `bash -n`, and submitting the file fixes both: a
+# malformed script never reaches the queue, and the exact bytes stay on disk.
+#
+# Inside the heredocs below: no backticks (they are command substitution in an unquoted
+# heredoc and WILL run at submit time -- that is what broke the prep job), no line
+# continuations, and no prose. Explanation goes here, outside, where it is inert.
+submit_job() {
+    local job="$1"; shift
+    bash -n "$job" || { echo "error: generated job script $job is malformed; not submitting" >&2; exit 1; }
+    sbatch --parsable "$@" "$job"
+}
+
 # Rewrite one `const` in a generated variant, tolerating any alignment, and VERIFY it.
 # A silent miss here means a job runs for an hour testing the committed configuration under
 # another name, which is worse than not running it.
@@ -208,13 +227,20 @@ for entry in "${CONFIGS[@]}"; do
 
     [ -n "$(sig_jid "$sig")" ] && continue   # this grid already has a prep job
 
-    if [ $LIST_ONLY -eq 1 ]; then
-        echo "prep (grid Z_EXTENT=$zext DZ_SURFACE=$dzs DZ_BOTTOM=$dzb) <- first needed by $name"
-        SIGS+=("$sig"); SIG_JIDS+=("dry-run")
+    # The production grid's cache already exists -- every run in the logs loads
+    # `field_bottom_height_360x150x135_*.jld2` -- so the arms on it need neither a prep job nor
+    # a dependency, and gating eleven of fifteen arms on one two-second job made a single point
+    # of failure out of nothing. If that cache is ever genuinely missing, build it once by hand
+    # (`julia --project=. tools/prebuild_bathymetry.jl`) before submitting, or the arms sharing
+    # it will race to write it.
+    if [ "$sig" = "$DEFAULT_SIG" ]; then
+        SIGS+=("$sig"); SIG_JIDS+=("none")
+        echo "no prep needed for the production grid ($sig) -- its cache already exists"
         continue
     fi
 
-    jid=$(sbatch --parsable --job-name="obc_prep_${sig}" <<EOF
+    prep_job="obc_tests/job_prep_${sig}.sh"
+    cat > "$prep_job" <<EOF
 #!/bin/bash
 #SBATCH --account=gts-ldove6-paid
 #SBATCH --output=logs/%x-%j.out
@@ -225,17 +251,37 @@ for entry in "${CONFIGS[@]}"; do
 #SBATCH --mem=16G
 
 set -uo pipefail
+
+echo "--- prep environment ---"
+echo "bash  : \$BASH_VERSION"
+echo "pwd   : \$(pwd)"
+ls -l tools/prebuild_bathymetry.jl || echo "MISSING tools/prebuild_bathymetry.jl on this filesystem"
+
 module purge
 module load julia/1.12.5
 unset LD_LIBRARY_PATH
 export JULIA_CPU_TARGET=\${JULIA_CPU_TARGET:-generic}
 export JULIA_PKGIMAGES=\${JULIA_PKGIMAGES:-no}
 
-echo "prep: Z_EXTENT=${zext} DZ_SURFACE=${dzs} DZ_BOTTOM=${dzb}"
-Z_EXTENT=${zext} DZ_SURFACE=${dzs} DZ_BOTTOM=${dzb} \\
-    stdbuf -o0 -e0 julia --project=. tools/prebuild_bathymetry.jl
+echo "julia : \$(command -v julia || echo NOT-FOUND)"
+echo "------------------------"
+
+export Z_EXTENT=${zext}
+export DZ_SURFACE=${dzs}
+export DZ_BOTTOM=${dzb}
+echo "prep: Z_EXTENT=\$Z_EXTENT DZ_SURFACE=\$DZ_SURFACE DZ_BOTTOM=\$DZ_BOTTOM"
+
+julia --project=. tools/prebuild_bathymetry.jl
 EOF
-)
+
+    if [ $LIST_ONLY -eq 1 ]; then
+        bash -n "$prep_job" || { echo "error: $prep_job is malformed" >&2; exit 1; }
+        echo "prep (grid Z_EXTENT=$zext DZ_SURFACE=$dzs DZ_BOTTOM=$dzb, lints OK) <- first needed by $name"
+        SIGS+=("$sig"); SIG_JIDS+=("dry-run")
+        continue
+    fi
+
+    jid=$(submit_job "$prep_job" --job-name="obc_prep_${sig}")
     echo "prep job $jid  (grid Z_EXTENT=$zext DZ_SURFACE=$dzs DZ_BOTTOM=$dzb, first needed by $name)"
     SIGS+=("$sig"); SIG_JIDS+=("$jid")
 done
@@ -275,13 +321,18 @@ for entry in "${CONFIGS[@]}"; do
     dzs=$(override_or  DZ_SURFACE "$DEF_DZ_SURFACE" "$overrides")
     dzb=$(override_or  DZ_BOTTOM  "$DEF_DZ_BOTTOM"  "$overrides")
     prep=$(sig_jid "${zext}_${dzs}_${dzb}")
-    [ -n "$prep" ] || { echo "error: no prep job for $name (grid ${zext}_${dzs}_${dzb})" >&2; exit 1; }
+    [ -n "$prep" ] || { echo "error: no prep entry for $name (grid ${zext}_${dzs}_${dzb})" >&2; exit 1; }
+
+    if [ "$prep" = "none" ] || [ "$prep" = "dry-run" ]; then
+        dep=()
+    else
+        dep=(--dependency=afterok:${prep})
+    fi
 
     printf '%-22s %3sd  after %-10s  %s\n' \
         "$name" "$DAYS" "$prep" "${overrides:-<src/model.jl as committed>}"
-    [ $LIST_ONLY -eq 1 ] && continue
-
-    sbatch --job-name="obc_${run_name}" --dependency=afterok:${prep} <<EOF
+    job="obc_tests/job_${run_name}.sh"
+    cat > "$job" <<EOF
 #!/bin/bash
 #SBATCH --account=gts-ldove6-paid
 #SBATCH --output=logs/%x-%j.out
@@ -296,7 +347,6 @@ set -uo pipefail
 
 echo "=========================================================="
 echo " Config    : ${run_name}"
-echo " Overrides : ${overrides:-<src/model.jl as committed>}"
 echo " Days      : ${DAYS}"
 echo " Node      : \$(hostname)"
 echo " Start     : \$(date)"
@@ -305,21 +355,24 @@ echo "=========================================================="
 module purge
 module load julia/1.12.5
 unset LD_LIBRARY_PATH
-
 export JULIA_CPU_TARGET=\${JULIA_CPU_TARGET:-generic}
 export JULIA_PKGIMAGES=\${JULIA_PKGIMAGES:-no}
 
-# A configuration that diverges does so in the first minutes, so a failure is a RESULT, not an
-# error: record it and let the other configurations carry on. stdbuf keeps the Julia output
-# interleaved with these echoes instead of arriving in one block at the end.
-if stdbuf -o0 -e0 julia --project=. "${variant}"; then
+if stdbuf -o0 -e0 julia --project=. ${variant}; then
     echo "RESULT ${run_name}: completed ${DAYS} days"
 else
-    echo "RESULT ${run_name}: FAILED (exit \$?) -- see above for where it diverged"
+    echo "RESULT ${run_name}: FAILED exit \$? -- see above for where it diverged"
 fi
 
 echo " Finished  : \$(date)"
 EOF
+
+    if [ $LIST_ONLY -eq 1 ]; then
+        bash -n "$job" || { echo "error: $job is malformed" >&2; exit 1; }
+        continue
+    fi
+
+    submit_job "$job" --job-name="obc_${run_name}" ${dep[@]+"${dep[@]}"} > /dev/null
 done
 
 if [ $LIST_ONLY -eq 0 ]; then
