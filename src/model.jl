@@ -50,7 +50,7 @@ end
 # ---- run identity -------------------------------------------------------------------------
 # Prefixes every output file: RUN_NAME_surface.nc, _midlon.nc, _free_surface.nc.
 # Change it per experiment or runs overwrite each other. Animate: ./run_animate_simulation NAME
-const RUN_NAME = "20D_bsose_tgrad_eta"
+const RUN_NAME = "20D_bsose_v2"
 
 # ---- period and domain --------------------------------------------------------------------
 const START_DATE = DateTime("2014-06-01")
@@ -95,9 +95,9 @@ const FLAT_BOTTOM_DEPTH = 0   # m
 # ---- open boundaries ----------------------------------------------------------------------
 const OBCS = true                           # false = whole-region restoring instead
 
-const OBC_SCHEME    = "NormalRadiation"     # normal u/v: NormalRadiation | PerturbationAdvection
+const OBC_SCHEME    = "clamped"             # normal u/v: NormalRadiation | PerturbationAdvection
                                             #             | ObliqueRadiation | clamped
-const TANGENTIAL_BC = :gradient             # tangential u/v: :radiation | :clamped | :gradient
+const TANGENTIAL_BC = :clamped              # tangential u/v: :radiation | :clamped | :gradient
                                             #   | :oblique | :perturbation_advection | ...
 const RADIATION_TAU_IN = 6hours             # inflow nudging; outflow is Inf throughout
 const OBLIQUE_TAU_IN   = 3days              # ObliqueRadiation only
@@ -106,32 +106,42 @@ const OBLIQUE_TAU_OUT  = 360days
 # Tracers. :same gives T and S whatever OBC_SCHEME the normal flow uses.
 const TRACER_SCHEME = TracerReservoir(inflow_length_scale = 5000, outflow_length_scale = 0)
 
-# TANGENTIAL_BC = :gradient as of 2026-10-25, changed from :radiation on this evidence from
-# the 20D_bsose_bathyfix run: max|v| sat at i=3 -- two cells in from the west face -- on every
-# one of days 5 through 20, confined to k=131-135 (the top 22 m), growing +0.187 m/s/day with
-# no saturation (1.08 at day 5, 3.65 at day 20) while its j migrated north at ~1 cell/day. The
-# seafloor there is 3500-3700 m, so no thin column is involved.
+# Set from the 14-arm matrix of 2026-10-25 (`./run_obc_tests --set all`, compared with
+# `tools/compare_obc_logs.jl`). dv/dt is the growth of max|v| per day from day 5, and the
+# boundary eta offset is the boundary row minus the cell one inside it:
 #
-# v is the TANGENTIAL component on a zonal face, and the split-explicit free surface gives the
-# barotropic tangential velocity a zero-gradient condition at west/east whatever the 3D field
-# carries. So :radiation's Value left the two halves inconsistent and the residual had to land
-# in the shear -- which is why the feature is surface-confined rather than depth-uniform.
-# :gradient matches what the barotropic mode already does. See
-# `bsose_tangential_boundary_condition` in setup_bsose.jl, which names this jet directly.
+#     arm                dv/dt    max|v|   eta offset W / N
+#     sponge_1d          +0.005     1.01     +0.013  +0.014
+#     normal_clamped     +0.011     1.42     +0.053  +0.023
+#     normal_pa          +0.026     1.30     +0.050  +0.037
+#     ext_ssh            +0.047     1.79     +0.026  +0.019
+#     tang_clamped       +0.047     1.65     +0.054  +0.064
+#     base               +0.137     3.42     +0.163  +0.167   <- NormalRadiation + :gradient
+#     tang_radiation     +0.168     3.65     +0.083  +0.098
 #
-# The cost: :gradient imposes nothing, so the BSOSE tangential value no longer reaches the
-# west/east faces and SPONGE_LAYERS = false means nothing else carries it there. Throughput is
-# unaffected -- that is the normal component plus the barotropic pin.
-
-# DO NOT SET OBC_SCHEME = "clamped" HERE. Tested 2026-10-24 and it DIVERGES: NaN in u at
-# day 3.1, with Δt collapsing 5.6 -> 1.2 min and max|η| quadrupling 1.22 -> 4.86 m, against a
-# NormalRadiation run that reached day 20. A hard Dirichlet over-specifies an OUTFLOW boundary,
-# and the ACC leaves through the east face at +215 Sv; the eddies arriving there had nowhere to
-# go. Radiation with outflow_timescale = Inf is what lets them out.
+# The eta offset tracks dv/dt across the whole matrix, which is the mechanism: the step in the
+# free surface at the boundary row is geostrophically worth metres per second at this latitude
+# (g/|f| = 8.2e4 at 55S, so 0.16 m over one 9.9 km cell is ~1.3 m/s). The exception is
+# :radiation on the TANGENTIAL component, which grows fast despite a modest offset.
 #
-# The divergence started at (i=355, j=11) and (i=359, j=87) -- the thin-column cluster on the
-# east face, where (360,10) is 42 m against neighbours of ~438 m. That is evidence the thin
-# columns GENERATE the problem and radiation has been letting it escape, not causing it.
+# This configuration takes the best arm on each axis. They were measured one at a time, so the
+# combination is not guaranteed additive -- that is what this run tests.
+#
+# SUPERSEDED, both of them (2026-10-25):
+#
+# 1. "DO NOT SET OBC_SCHEME = clamped. Tested 2026-10-24 and it DIVERGES: NaN in u at day 3.1."
+#    It no longer does -- `normal_clamped` ran 20 days and is the BEST normal condition in the
+#    matrix (+0.011). That divergence started at (355,11) and (359,87), the thin-column cluster
+#    on the east face, and the Uᵉˣᵗ masking fix of 2026-10-25 is the likely reason it is gone:
+#    Uᵉˣᵗ had been integrating B-SOSE's inpainted LAND values through those columns.
+#
+# 2. ":gradient on the tangential, because a prescribed Value leaves the baroclinic and
+#    barotropic halves of the face inconsistent." The reasoning may be sound but the outcome is
+#    not: :clamped measured +0.047 against :gradient's +0.137, and :radiation was worst at
+#    +0.168. Whatever the halves are doing, a prescribed tangential beats imposing nothing here.
+#
+# Both were stated confidently in this file for a week on the strength of a single run each.
+# ObliqueRadiation is still not advisable -- see the land-adjacency note below.
 
 # Do not set ObliqueRadiation here, for two independent reasons.
 #
@@ -172,27 +182,49 @@ const BAROTROPIC_SCHEME = :pinned   # :pinned (Flather + target_transport) | :fl
 # The test was worth running anyway: |u| at (1,21,39) grew at 0.30 m/s/day WITHOUT the pin
 # against 0.32 WITH it. Same cell, same rate. The pin is not the amplifier.
 #
+# Reconfirmed in the 2026-10-25 matrix: `bt_flather` inverted again (E -59.85, N +331.82) and
+# had the worst west eta offset of all fourteen arms, +0.193. But note that arm also ran with
+# EXTERIOR_SSH = false, so :flather WITH a correct eta_ext -- which is what this file now sets
+# -- has still never been tested. It is the obvious next A/B once this configuration is known.
+#
 const BAROTROPIC_FACES  = :all      # :all | :zonal -- keep :all, the :zonal theory was
                                     # disproven (north carries -31 Sv, 18% of the zonal flow)
-const EXTERIOR_SSH      = false     # eta_ext and the initial eta from B-SOSE ETAN.
-                                    # OFF (2026-10-24). `bsose_exterior_free_surface` aborts the
-                                    # process on the GPU -- SIGBUS / SIGABRT / corrupted heap, at
-                                    # the same point every run, surviving a full depot wipe. This
-                                    # skips the function entirely. It also takes eta_ext out of
-                                    # the loop, which is worth doing on its own: its residual
-                                    # range is -3.44 to +1.30 m, a 4.74 m span where the real
-                                    # SSH drop across this domain is ~2 m. With eta_ext = 0 and
-                                    # BAROTROPIC_SCHEME = :pinned the net transport is still
-                                    # fixed, so only the along-face shape is given up.
+const EXTERIOR_SSH      = true      # eta_ext and the initial eta from B-SOSE ETAN
+# ON as of 2026-10-25. The note that stood here said `bsose_exterior_free_surface` aborts the
+# process on the GPU with SIGBUS / a corrupted heap at the same point every run. It does not any
+# more: the `ext_ssh` arm completed 20 days. That crash was almost certainly the invented
+# one-cell-z-window FieldTimeSeries construction, fixed by moving to the full-depth form that
+# was already working elsewhere in setup_bsose.jl -- the same cause as the three "JIT crashes".
+#
+# And it earns its place on the physics: `ext_ssh` cut the west/north eta offset from
+# +0.163/+0.167 to +0.026/+0.019 and had the LOWEST max|u| of any arm (0.79 against base's
+# 1.59). eta_ext = 0 was asking Flather to radiate toward a flat zero sea surface while B-SOSE
+# ETAN averages about -0.95 m over this domain.
 
 # ---- surface forcing ----------------------------------------------------------------------
 const WINDS                = false  # BSOSE oceTAUX / oceTAUY
 const SURFACE_FLUXES       = false  # BSOSE TFLUX / SFLUX
 const PENETRATING_SHORTWAVE = false # split oceQsw out of TFLUX into TwoColorRadiation
-const SPONGE_LAYERS        = false  # interior restoring near the open edges
+const SPONGE_LAYERS        = true   # interior restoring near the open edges
 const SPONGE_WIDTH         = 3.0    # degrees; 18 cells at 1/6 deg
-const SPONGE_TIMESCALE     = 12hours # restoring timescale -- see the note below
+const SPONGE_TIMESCALE     = 1days  # 1 day, not 12 hours -- see the note below
 
+# MEASURED 2026-10-25: 30 days does nothing, 1 day and 12 hours are indistinguishable.
+#
+#     sponge_30d   dv/dt +0.118   eta offset W +0.148   <- base is +0.137 / +0.163
+#     sponge_1d    dv/dt +0.005   eta offset W +0.013
+#     sponge_12h   dv/dt +0.004   eta offset W +0.008
+#
+# So 1 day is the setting: 12 hours buys 0.001 m/s/day and constrains the outer 3 degrees harder
+# for nothing. A 30-day sponge is within 10% of no sponge at all, which is the quantitative
+# version of the paragraph below.
+#
+# CAVEAT WORTH KEEPING IN VIEW. The sponge gives the lowest max|v| of any arm (1.01) and moves
+# the maximum 20 cells off the wall, but a sponge that suppresses the feature is not the same as
+# a boundary condition that does not create it. `flat_upper` still pinned at i=1 on a flat
+# 1000 m ocean, so there is a boundary-condition problem here that a strong sponge would mask.
+# Do not read a clean sponged run as proof the boundaries are right.
+#
 # SPONGE_TIMESCALE was 30days until 2026-10-25, and that is why earlier sponge arms proved
 # nothing. NestingValidation's canary setup -- our closest published analogue -- runs
 # `rate = 1/12hours`, so our sponge was **60x too weak**. Read from their source, not from our
