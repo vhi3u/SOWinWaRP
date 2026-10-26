@@ -69,6 +69,14 @@ const DIR    = get(ENV, "DIR", ".")
 const OUTDIR = get(ENV, "OUTDIR", joinpath(@__DIR__, "bsose_comparison"))
 const MLD_DT = parse(Float64, get(ENV, "MLD_DT", "0.03"))
 
+# Depth band searched for the Winter Water core. WW is the remnant of the winter mixed layer and
+# lives at roughly 50-200 m; the first version of this script searched from the mixed-layer base
+# to the SEA FLOOR and duly reported the abyssal minimum -- Tmin depths of 1894 to 5126 m, which
+# is Antarctic Bottom Water, not Winter Water. Below WW_MAX it is a different water mass and
+# does not belong in this diagnostic.
+const WW_MIN = parse(Float64, get(ENV, "WW_MIN", "30"))
+const WW_MAX = parse(Float64, get(ENV, "WW_MAX", "500"))
+
 # Which months get a surface difference map. Calendar month NUMBERS, not year-months, so the
 # selection survives a change of run dates. Default is June, August, October, December, January:
 # a seasonal progression from mid-winter to late summer, which is the Winter Water
@@ -180,12 +188,17 @@ end
 """
 Subsurface temperature minimum -- the Winter Water core -- as (value, depth), or `nothing`.
 
-Only a minimum that is genuinely INTERIOR counts: it must sit below the mixed layer and have
-warmer water both above and below it. A monotonic winter column has no WW signature and should
-report nothing rather than its coldest cell.
+Only a minimum that is genuinely INTERIOR counts: it must sit below the mixed layer, inside the
+WW_MIN..WW_MAX band, and have warmer water both above and below it. A monotonic winter column has
+no WW signature and should report nothing rather than its coldest cell.
+
+The depth band is not cosmetic. Without it this returns the coldest local minimum anywhere below
+the mixed layer, and in the Southern Ocean the deep water wins in most columns -- the first run
+of this script reported Tmin depths of 1894-5126 m, i.e. Antarctic Bottom Water.
 """
 function winter_water(T, zs, mld_m)
-    kk = [k for k in eachindex(zs) if isfinite(T[k]) && -zs[k] > max(mld_m, 20)]
+    kk = [k for k in eachindex(zs)
+          if isfinite(T[k]) && -zs[k] > max(mld_m, WW_MIN) && -zs[k] <= WW_MAX]
     length(kk) < 3 && return nothing
     best = nothing
     for n in 2:(length(kk) - 1)
@@ -393,7 +406,11 @@ if isfile(sect_file)
             col == 2 && Colorbar(fig[2, 3], hm, label = "°C")
             # the WW core, where one exists
             for j in jm
-                w = winter_water(A, zc, mld(A[j, :], (col == 1 ? Ss : Sps)[j, :], zc))
+                # A[j, :], NOT A. Passing the whole (Ny, Nz) matrix made Julia index it linearly,
+                # comparing temperatures at different LATITUDES at one depth, which drew a flat
+                # line of meaningless dots across the first version of this figure.
+                Scol = (col == 1 ? Ss : Sps)[j, :]
+                w = winter_water(A[j, :], zc, mld(A[j, :], Scol, zc))
                 w === nothing || scatter!(ax, [φc[j]], [-w[2]], color = :cyan, markersize = 4)
             end
         end
