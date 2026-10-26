@@ -52,6 +52,11 @@
 # ==============================================================================
 
 using Oceananigans, Oceananigans.Units, Oceananigans.Grids
+
+# `Time` is exported by BOTH Dates and Oceananigans.Units, and this script needs both modules, so
+# an unqualified `Time` is ambiguous and errors at the first `fts[Time(t)]`. The one wanted here
+# is Oceananigans', which is how a FieldTimeSeries is indexed in time.
+using Oceananigans.Units: Time
 using NumericalEarth, NumericalEarth.ECCO
 using NCDatasets, CairoMakie, Printf, Statistics, Dates
 using SeawaterPolynomials
