@@ -65,8 +65,9 @@ f(x) = parse(Float64, x)
 i(x) = parse(Int, x)
 
 """Everything worth knowing from one arm's log."""
-function parse_log(path)
-    name = replace(basename(path), r"^obc_" => "", r"-\d+\.out$" => "", r"\.out$" => "")
+function parse_log(paths)
+    path = first(paths)
+    name = replace(basename(path), r"^obc_" => "", r"-\d+$" => "", r"\.(out|err)$" => "")
     result, days = "no RESULT line", 0.0
     dts, cfls, umax3, vmax3 = Float64[], Float64[], Float64[], Float64[]
     daylist = Float64[]
@@ -76,7 +77,7 @@ function parse_log(path)
     wet = Dict{String,Tuple{Int,Int}}()
     flat, fixtopo, sawnan = nothing, nothing, false
 
-    for line in eachline(path)
+    for line in Iterators.flatten(eachline(p) for p in paths if isfile(p))
         if (m = match(RE_CONFIG, line)) !== nothing;  name = m[1]
         elseif (m = match(RE_RESULT, line)) !== nothing; result = m[2]
         elseif (m = match(RE_WET, line)) !== nothing;   wet[m[1]] = (i(m[2]), i(m[3]))
@@ -135,27 +136,38 @@ function pinning(locs)
     return (pi_, pj_, mean(l[4] for l in locs), @sprintf("(%d,%d)", mi, mj))
 end
 
-all_logs = sort(filter(p -> endswith(p, ".out") && occursin("obc_", basename(p)),
-                       readdir(LOGDIR; join = true)))
-isempty(all_logs) && error("no obc_*.out files in $LOGDIR/")
+# One ARM is a stem with up to two files beside it: NAME-JOBID.out and NAME-JOBID.err.
+#
+# Julia's `@info` writes to STDERR, so every diagnostic -- the progress blocks, [max|u|],
+# [max|eta|], [eta face], the transports -- is in `.err`, and only the shell `echo` lines
+# (Config, RESULT) reach `.out`. Reading `.out` alone yields a full list of arms with every
+# number NaN, which is what the first version of this script printed as if it were data.
+raw = filter(p -> occursin(r"\.(out|err)$", p) && occursin("obc_", basename(p)),
+             readdir(LOGDIR; join = true))
+isempty(raw) && error("no obc_*.{out,err} files in $LOGDIR/")
+all_logs = sort(unique(replace.(raw, r"\.(out|err)$" => "")))
 
 # Report the raw file count FIRST. The first version of this script printed "1 arms in the most
 # recent batch" while the directory held twenty-one logs, and because the dropped ones appeared
 # in neither the kept list nor the excluded list there was no way to see that from the output.
 # A filter that can discard most of its input must show its working.
-@printf("found %d obc_*.out file(s) in %s/\n", length(all_logs), LOGDIR)
+@printf("found %d arm log(s) in %s/ (%d files, .out + .err)\n",
+        length(all_logs), LOGDIR, length(raw))
+stem_mtime(st) = maximum(mtime(f) for f in (st * ".out", st * ".err") if isfile(f))
 if get(ENV, "VERBOSE", "0") != "0"
     for p in all_logs
-        @printf("    %-52s  %s\n", basename(p), Libc.strftime("%Y-%m-%d %H:%M", mtime(p)))
+        @printf("    %-52s  %s  %s\n", basename(p),
+                Libc.strftime("%Y-%m-%d %H:%M", stem_mtime(p)),
+                join([e for e in (".out", ".err") if isfile(p * e)], " "))
     end
 end
 
-newest = maximum(mtime, all_logs)
+newest = maximum(stem_mtime, all_logs)
 cutoff = newest - SINCE_HOURS * 3600
-recent = filter(p -> mtime(p) >= cutoff, all_logs)
-stale  = filter(p -> mtime(p) < cutoff, all_logs)
+recent = filter(p -> stem_mtime(p) >= cutoff, all_logs)
+stale  = filter(p -> stem_mtime(p) < cutoff, all_logs)
 
-parsed = [parse_log(p) for p in recent]
+parsed = [parse_log([st * ".out", st * ".err"]) for st in recent]
 arms = filter(a -> !isempty(a.dts) || a.result != "no RESULT line", parsed)
 dropped = setdiff(basename.(getproperty.(parsed, :path)), basename.(getproperty.(arms, :path)))
 isempty(dropped) || @printf("skipped %d log(s) with no progress output (prep jobs, empties): %s\n",
@@ -180,7 +192,7 @@ arms = collect(values(by_name))
         length(arms), SINCE_HOURS, join(sort(getproperty.(arms, :name)), ", "))
 if !isempty(stale)
     @printf("EXCLUDED %d older log(s) from an earlier batch: %s\n", length(stale),
-            join(sort(unique(replace.(basename.(stale), r"-[^-]*\.out$" => "", r"\.out$" => ""))), ", "))
+            join(sort(unique(replace.(basename.(stale), r"-\d+$" => ""))), ", "))
     println("         pass SINCE_HOURS=100000 to include them -- but pre-2026-10-23 results are void.")
 end
 isempty(dupes) || println("DEDUPLICATED: ", join(dupes, "; "))
