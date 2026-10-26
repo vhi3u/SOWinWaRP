@@ -178,19 +178,6 @@ bc_dates = available[lo:hi]
 @info "B-SOSE records: $(length(bc_dates)), $(first(bc_dates)) to $(last(bc_dates))"
 
 region = bsose_region(grid)
-# time_indices_in_memory = the full length ON PURPOSE. The default is 2, and with a long record
-# that reloads from disk and has been measured to hand back stale, duplicated snapshots
-# (tools/face_transports.jl, 12 records requested and 9 distinct returned). For an analysis we
-# want every record resident.
-Tb = FieldTimeSeries(Metadata(:temperature; dataset, dates = bc_dates, region), grid;
-                     time_indices_in_memory = length(bc_dates))
-Sb = FieldTimeSeries(Metadata(:salinity;    dataset, dates = bc_dates, region), grid;
-                     time_indices_in_memory = length(bc_dates))
-ub = FieldTimeSeries(Metadata(:u_velocity;  dataset, dates = bc_dates, region), grid;
-                     time_indices_in_memory = length(bc_dates))
-vb = FieldTimeSeries(Metadata(:v_velocity;  dataset, dates = bc_dates, region), grid;
-                     time_indices_in_memory = length(bc_dates))
-offset = model_clock_offset(Metadata(:temperature; dataset, dates = bc_dates, region), start_date)
 
 slab(d, var, t) = (v = d[var]; A = ndims(v) == 4 ? v[:, :, 1, t] : v[:, :, t];
                    Float64.(coalesce.(A, NaN)))
@@ -297,6 +284,36 @@ days = let s = strip(get(ENV, "DAYS", ""))
 end
 @info "section diagnostics at output index/indices $(join(days, ", ")) (day $(join(days .- 1, ", ")))"
 
+# ── Load ONLY the B-SOSE records the selected months need ─────────────────────────────────────
+#
+# Every record is held resident (`time_indices_in_memory` = the subset length) because the
+# default of 2 reloads from disk and has been measured to hand back stale, duplicated snapshots
+# -- 12 requested, 9 distinct (tools/face_transports.jl). But residency must be paid for, and
+# the first 2-year run of this script was KILLED by the OOM reaper for asking for all of it:
+#
+#     one regridded field WITH HALOS = 374 x 164 x 67 x 8 B = 33 MB
+#     26 records x 4 fields          = 3.4 GB      <- what it used to load
+#     4 records x 4 fields           = 0.5 GB      <- what preset 2Y actually uses
+#
+# Preset 2Y touches 4 of 26 records; the other 22 were loaded and never read. So: subset first,
+# then make the subset fully resident. `bc_dates` stays complete, because `month_groups` needs
+# every record to assign model outputs to the right month.
+sel = [n for (n, dd) in enumerate(bc_dates)
+       if !isempty(groups[n]) && month(bsose_window_center(dd)) in MONTHS]
+isempty(sel) && error("no B-SOSE record matches month(s) $(join(MONTHS, ", ")) inside this run")
+sel_dates = bc_dates[sel]
+pos = Dict(n => k for (k, n) in enumerate(sel))    # bc_dates index -> position in the loaded series
+
+@info @sprintf("loading %d of %d B-SOSE records (%s) -- about %.1f GB resident for 4 fields",
+               length(sel), length(bc_dates),
+               join(Dates.format.(bsose_window_center.(sel_dates), "yyyy-mm"), ", "),
+               4 * length(sel) * 33e6 / 1e9)
+
+resident(var) = FieldTimeSeries(Metadata(var; dataset, dates = sel_dates, region), grid;
+                                time_indices_in_memory = length(sel_dates))
+Tb, Sb, ub, vb = resident(:temperature), resident(:salinity), resident(:u_velocity), resident(:v_velocity)
+offset = model_clock_offset(Metadata(:temperature; dataset, dates = sel_dates, region), start_date)
+
 """
 Distance-to-nearest-boundary and a wet mask SHAPED TO THE FIELD, not to the tracer grid.
 
@@ -344,7 +361,7 @@ for (n, dd) in enumerate(bc_dates)
             acc = acc === nothing ? copy(A) : (acc .+= A)
         end
         model_month = acc ./ length(groups[n])
-        parent = Array(interior(getfield((T = Tb, S = Sb, u = ub, v = vb), Symbol(f))[n]))
+        parent = Array(interior(getfield((T = Tb, S = Sb, u = ub, v = vb), Symbol(f))[pos[n]]))
         diffs[f] = model_month .- parent[:, :, Nz]
     end
 
@@ -412,9 +429,11 @@ if isfile(sect_file)
     for t in days
         Ts = Float64.(coalesce.(dsec["T"][1, :, :, t], NaN))   # (Ny, Nz)
         Ss = Float64.(coalesce.(dsec["S"][1, :, :, t], NaN))
-        tb = model_times[t] + offset
-        Tps = Array(interior(Tb[Time(tb)]))[MID, :, :]
-        Sps = Array(interior(Sb[Time(tb)]))[MID, :, :]
+        # The record whose month contains this output, indexed DIRECTLY. Interpolating with
+        # `Time(t)` across a subset whose records are months apart would blend June into January.
+        k = something(findfirst(n -> t in groups[n], sel), 1)
+        Tps = Array(interior(Tb[pos[sel[k]]]))[MID, :, :]
+        Sps = Array(interior(Sb[pos[sel[k]]]))[MID, :, :]
 
         mm, mp, wm, wp = Float64[], Float64[], Float64[], Float64[]
         dm, dp = Float64[], Float64[]
@@ -437,9 +456,9 @@ if isfile(sect_file)
     let t = last(days)
         Ts = Float64.(coalesce.(dsec["T"][1, :, :, t], NaN))
         Ss = Float64.(coalesce.(dsec["S"][1, :, :, t], NaN))
-        tb = model_times[t] + offset
-        Tps = Array(interior(Tb[Time(tb)]))[MID, :, :]
-        Sps = Array(interior(Sb[Time(tb)]))[MID, :, :]
+        k = something(findfirst(n -> t in groups[n], sel), 1)
+        Tps = Array(interior(Tb[pos[sel[k]]]))[MID, :, :]
+        Sps = Array(interior(Sb[pos[sel[k]]]))[MID, :, :]
 
         fig = Figure(size = (1250, 820))
         Label(fig[0, 1:2], "$(RUN) — day $(t-1) at $(round(λ₁ + (MID-0.5)/SCALING, digits=1))°E: model vs B-SOSE",
@@ -485,19 +504,30 @@ println()
 println("="^96)
 println("4. SURFACE DRIFT: wet-mean model minus B-SOSE, whole domain, over time")
 println("="^96)
-@printf("\n%6s | %10s %10s | %10s %10s | %9s %9s\n",
-        "day", "T model", "T parent", "S model", "S parent", "ΔT", "ΔS")
-println("-"^78)
-for t in 1:nt
-    (t == 1 || t == nt || t % max(1, cld(nt, 12)) == 0) || continue
-    Tm, Sm = slab(ds, "T", t), slab(ds, "S", t)
-    tb = model_times[t] + offset
-    Tp = Array(interior(Tb[Time(tb)]))[:, :, Nz]
-    Sp = Array(interior(Sb[Time(tb)]))[:, :, Nz]
-    m = [wet3(i, j, Nz) for i in 1:Nx, j in 1:Ny]
+# Monthly means on both sides, at the selected months -- the same comparison as section 1,
+# reduced to a domain number. It used to sample ~12 evenly spaced DAYS and interpolate the parent
+# to each with `Time(t)`, which compared a snapshot against a month; and with the record subset
+# now sparse, that interpolation would blend June into January.
+@printf("\n%-9s | %10s %10s | %10s %10s | %9s %9s\n",
+        "month", "T model", "T parent", "S model", "S parent", "ΔT", "ΔS")
+println("-"^80)
+let m = [wet3(i, j, Nz) for i in 1:Nx, j in 1:Ny]
     mo(A) = (f = filter(isfinite, A[m]); isempty(f) ? NaN : mean(f))
-    @printf("%6d | %10.3f %10.3f | %10.4f %10.4f | %+9.3f %+9.4f\n",
-            t - 1, mo(Tm), mo(Tp), mo(Sm), mo(Sp), mo(Tm) - mo(Tp), mo(Sm) - mo(Sp))
+    for n in sel
+        label = Dates.format(bsose_window_center(bc_dates[n]), "yyyy-mm")
+        acc_T, acc_S = nothing, nothing
+        for t in groups[n]
+            A, B = slab(ds, "T", t), slab(ds, "S", t)
+            acc_T = acc_T === nothing ? copy(A) : (acc_T .+= A)
+            acc_S = acc_S === nothing ? copy(B) : (acc_S .+= B)
+        end
+        nd = length(groups[n])
+        Tm, Sm = acc_T ./ nd, acc_S ./ nd
+        Tp = Array(interior(Tb[pos[n]]))[:, :, Nz]
+        Sp = Array(interior(Sb[pos[n]]))[:, :, Nz]
+        @printf("%-9s | %10.3f %10.3f | %10.4f %10.4f | %+9.3f %+9.4f\n",
+                label, mo(Tm), mo(Tp), mo(Sm), mo(Sp), mo(Tm) - mo(Tp), mo(Sm) - mo(Sp))
+    end
 end
 close(ds)
 
