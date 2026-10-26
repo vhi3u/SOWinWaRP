@@ -50,13 +50,31 @@ end
 # ---- run identity -------------------------------------------------------------------------
 # Prefixes every output file: RUN_NAME_surface.nc, _midlon.nc, _free_surface.nc.
 # Change it per experiment or runs overwrite each other. Animate: ./run_animate_simulation NAME
-const RUN_NAME = "8M_bsose_test1"
+const RUN_NAME = "2Y_bsose_dirichlet"
 
 # ---- period and domain --------------------------------------------------------------------
 const START_DATE = DateTime("2014-06-01")
-const END_DATE   = DateTime("2015-02-01")   # 8 months: mid-winter through late summer, so the
-                                            # winter mixed layer finishes deepening in-run and
-                                            # the Tmin is then capped by summer warming
+const END_DATE   = DateTime("2016-06-01")   # 2 years = 731 days. Two full seasonal cycles, so
+                                            # Winter Water forms, is capped, and forms AGAIN --
+                                            # and the SECOND cycle is the one not contaminated by
+                                            # the initial condition.
+#
+# THREE THINGS GET WORSE AT THIS LENGTH, and none of them showed up in the 8-month run:
+#
+# 1. THE TRANSPORT PIN BECOMES A 2-YEAR MEAN. `target_transport` is materialised once at
+#    free-surface construction, so it is one number per face for the whole run, and the note at
+#    BAROTROPIC_SCHEME records north swinging -31 to +16 Sv over a year. Over 8 months the pin
+#    was a ~10-month mean and merely blunt; over 2 years it holds a face against its own flow for
+#    a large part of the run. `tools/face_transports.jl` with this window measures it, no GPU.
+#
+# 2. NO RESTART PATH. CHECKPOINTS writes state but `model.jl` has no `pickup=` anywhere, so a
+#    job that dies at month 20 loses everything. At 8 months that was a tolerable risk; at 2
+#    years it is the most likely way this run fails.
+#
+# 3. `time_indices_in_memory` IS STILL UNSET, so it defaults to 2. With ~26 monthly records the
+#    boundary and sponge series reload constantly, and that is the regime where stale, duplicated
+#    snapshots were measured (12 records requested, 9 distinct returned). See the Upstream OBC
+#    Research note.
 
 const SCALING    = 6        # horizontal resolution = 1/SCALING degrees (1/6 ~ 15 km)
 const Z_EXTENT   = 5800     # m, depth of the vertical grid

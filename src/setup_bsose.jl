@@ -989,6 +989,32 @@ function fill_bathymetry_gaps!(data, valid_min=S_MIN_PHYSICAL, valid_max=S_MAX_P
 end
 
 """
+    resident_fts(metadata, grid; kw...)
+
+`FieldTimeSeries` from `Metadata` with EVERY record held in memory, instead of the default 2.
+
+NumericalEarth's `FieldTimeSeries(::Metadata, grid)` defaults `time_indices_in_memory = 2`: two
+snapshots resident, the rest reloaded from disk on demand. That is a sensible memory default and
+a bad one for us, because `boundary_slice_time_series` below copies `fts[t]` EAGERLY for every
+`t`, so a stale read is baked into the copy permanently and silently.
+
+It has been measured. `tools/face_transports.jl` asked for 12 monthly records and got **9
+distinct ones, in three bit-identical consecutive pairs**. NestingValidation's recipe lists the
+same trap: "Set `time_indices_in_memory` to the full length ... The default of 2 reloads cached
+slices and undoes the repair."
+
+The 20-day runs used 3 records and never showed it. A 2-year run uses ~26 and is well inside the
+regime where it bites, which would mean months of boundary and sponge forcing silently repeating
+other months.
+
+Cost is memory: one regridded 360x150x53 Float64 field is ~23 MB, so ~26 records of one variable
+is ~0.6 GB. Four variables is a few GB on a 32 GB node -- affordable, and the alternative is a
+run whose forcing is quietly wrong.
+"""
+resident_fts(metadata, grid; kw...) =
+    FieldTimeSeries(metadata, grid; time_indices_in_memory = max(1, length(metadata)), kw...)
+
+"""
     boundary_slice_time_series(fts::FieldTimeSeries, side::Symbol)
 
 Extract a 2D boundary `FieldTimeSeries` along `side` (:west, :east, :south, :north)
@@ -1339,8 +1365,8 @@ function bsose_surface_wind_stress(grid;
     region = bsose_region(grid)
     taux_meta = Metadata(:zonal_wind_stress; dataset, dates, region)
     tauy_meta = Metadata(:meridional_wind_stress; dataset, dates, region)
-    taux_fts = FieldTimeSeries(taux_meta, grid)
-    tauy_fts = FieldTimeSeries(tauy_meta, grid)
+    taux_fts = resident_fts(taux_meta, grid)
+    tauy_fts = resident_fts(tauy_meta, grid)
 
     time_offset = model_clock_offset(taux_meta, reference_date)
     top_u_slice = boundary_slice_time_series(taux_fts, :top; time_offset)
@@ -1398,8 +1424,8 @@ function bsose_surface_tracer_fluxes(grid;
     region = bsose_region(grid)
     heat_metadata = Metadata(:surface_heat_flux; dataset, dates, region)
     salt_metadata = Metadata(:surface_salt_flux; dataset, dates, region)
-    heat_fts = FieldTimeSeries(heat_metadata, grid)
-    salt_fts = FieldTimeSeries(salt_metadata, grid)
+    heat_fts = resident_fts(heat_metadata, grid)
+    salt_fts = resident_fts(salt_metadata, grid)
 
     time_offset = model_clock_offset(heat_metadata, reference_date)
     top_T_slice = boundary_slice_time_series(heat_fts, :top; time_offset)
@@ -1413,7 +1439,7 @@ function bsose_surface_tracer_fluxes(grid;
     # below and on the sliced series for the reason given there.
     if subtract_shortwave
         shortwave_metadata = Metadata(:surface_shortwave; dataset, dates, region)
-        shortwave_fts = FieldTimeSeries(shortwave_metadata, grid)
+        shortwave_fts = resident_fts(shortwave_metadata, grid)
         top_Q_slice = boundary_slice_time_series(shortwave_fts, :top; time_offset)
 
         for t in 1:length(top_T_slice.times)
@@ -1800,7 +1826,7 @@ function bsose_penetrating_shortwave(grid;
     @info "Loading penetrating shortwave radiation (oceQsw, $(summary(dataset)))..."
     region = bsose_region(grid)
     shortwave_metadata = Metadata(:surface_shortwave; dataset, dates, region)
-    shortwave_fts = FieldTimeSeries(shortwave_metadata, grid)
+    shortwave_fts = resident_fts(shortwave_metadata, grid)
 
     time_offset = model_clock_offset(shortwave_metadata, reference_date)
     Qsw = boundary_slice_time_series(shortwave_fts, :top; time_offset)
@@ -2079,13 +2105,13 @@ function bsose_open_boundary_conditions(grid;
         @info " -> Loading BSOSE u_velocity..."
         u_meta = Metadata(:u_velocity; dataset, dates, region)
         time_offset = model_clock_offset(u_meta, reference_date)
-        u_fts = FieldTimeSeries(u_meta, grid)
+        u_fts = resident_fts(u_meta, grid)
         @info " -> Loading BSOSE v_velocity..."
-        v_fts = FieldTimeSeries(Metadata(:v_velocity; dataset, dates, region), grid)
+        v_fts = resident_fts(Metadata(:v_velocity; dataset, dates, region), grid)
         @info " -> Loading BSOSE temperature..."
-        T_fts = FieldTimeSeries(Metadata(:temperature; dataset, dates, region), grid)
+        T_fts = resident_fts(Metadata(:temperature; dataset, dates, region), grid)
         @info " -> Loading BSOSE salinity..."
-        S_fts = FieldTimeSeries(Metadata(:salinity; dataset, dates, region), grid)
+        S_fts = resident_fts(Metadata(:salinity; dataset, dates, region), grid)
 
         # 2. Extract 2D boundary slices
         @info " -> Extracting boundary slices (West, East, South, North)..."
@@ -2568,15 +2594,19 @@ function bsose_sponge_layer_forcing(grid;
     T_meta = Metadata(:temperature; dataset, start_date, end_date, region)
     S_meta = Metadata(:salinity; dataset, start_date, end_date, region)
 
-    FT = restore_on_model_clock!(DatasetRestoring(T_meta, grid; rate=rate, mask=sponge_mask), reference_date)
-    FS = restore_on_model_clock!(DatasetRestoring(S_meta, grid; rate=rate, mask=sponge_mask), reference_date)
+    FT = restore_on_model_clock!(DatasetRestoring(T_meta, grid; rate=rate, mask=sponge_mask,
+                                            time_indices_in_memory=max(1, length(T_meta))), reference_date)
+    FS = restore_on_model_clock!(DatasetRestoring(S_meta, grid; rate=rate, mask=sponge_mask,
+                                            time_indices_in_memory=max(1, length(S_meta))), reference_date)
 
     if restore_velocities
         @info " -> Restoring u and v velocities in boundary sponge layers to damp accelerations."
         u_meta = Metadata(:u_velocity; dataset, start_date, end_date, region)
         v_meta = Metadata(:v_velocity; dataset, start_date, end_date, region)
-        Fu = restore_on_model_clock!(DatasetRestoring(u_meta, grid; rate=rate, mask=sponge_mask), reference_date)
-        Fv = restore_on_model_clock!(DatasetRestoring(v_meta, grid; rate=rate, mask=sponge_mask), reference_date)
+        Fu = restore_on_model_clock!(DatasetRestoring(u_meta, grid; rate=rate, mask=sponge_mask,
+                                            time_indices_in_memory=max(1, length(u_meta))), reference_date)
+        Fv = restore_on_model_clock!(DatasetRestoring(v_meta, grid; rate=rate, mask=sponge_mask,
+                                            time_indices_in_memory=max(1, length(v_meta))), reference_date)
         return (u=Fu, v=Fv, T=FT, S=FS)
     else
         return (T=FT, S=FS)
@@ -2788,10 +2818,10 @@ function bsose_sponge_forcing(grid;
     @info "Setting up BSOSE sponge layer nudging (timescale = $(prettytime(1/rate)), width = $(sponge_distance)°)..."
 
     region = bsose_region(grid)
-    u_target = FieldTimeSeries(Metadata(:u_velocity; dataset, dates, region), grid)
-    v_target = FieldTimeSeries(Metadata(:v_velocity; dataset, dates, region), grid)
-    T_target = FieldTimeSeries(Metadata(:temperature; dataset, dates, region), grid)
-    S_target = FieldTimeSeries(Metadata(:salinity; dataset, dates, region), grid)
+    u_target = resident_fts(Metadata(:u_velocity; dataset, dates, region), grid)
+    v_target = resident_fts(Metadata(:v_velocity; dataset, dates, region), grid)
+    T_target = resident_fts(Metadata(:temperature; dataset, dates, region), grid)
+    S_target = resident_fts(Metadata(:salinity; dataset, dates, region), grid)
 
     g = grid isa ImmersedBoundaryGrid ? grid.underlying_grid : grid
     λ₁, λ₂ = extrema(λnodes(g, Face(), Center(), Center()))
