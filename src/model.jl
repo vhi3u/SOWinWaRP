@@ -356,6 +356,46 @@ const CHECKPOINTS    = true    # write restart checkpoints every 30 days
 # code first. Worth closing before relying on it.
 const BOUNDARY_DIAGNOSTICS = true  # free-surface file, per-face transport log, 30-min eta watch
 
+# ---- eddy kinetic energy ----------------------------------------------------------------------
+const EKE_DIAGNOSTICS   = true     # time-averaged state and second moments -> RUN_NAME_eke.nc
+const EKE_WINDOW        = 30days   # averaging window, and how often a record is written
+const EKE_STRIDE        = 1        # accumulate every Nth time step (1 = every step)
+const EKE_FULL_DEPTH    = true     # false writes the surface level only
+const EKE_TRACER_FLUXES = false    # also <uT>, <vT>, <uS>, <vS>, for eddy heat and salt transport
+
+# EKE CANNOT BE WRITTEN DIRECTLY, because it is defined against a mean that does not exist until
+# the averaging window closes. What a running model can write is the PAIR of first and second
+# moments, and the decomposition off them is exact:
+#
+#     EKE = 0.5 * ((<uu> - <u>^2) + (<vv> - <v>^2))    eddy part
+#     MKE = 0.5 * (<u>^2 + <v>^2)                      mean part
+#     KE  = EKE + MKE = 0.5 * (<uu> + <vv>)
+#
+# so `uu` and `vv` in the file are <u^2> and <v^2>, NOT the square of anything else in it.
+#
+# WHY NOT COMPUTE THIS FROM THE DAILY FILES WE ALREADY WRITE. Two reasons, the second decisive.
+# (1) Daily snapshots alias every motion faster than two days into the variance -- the inertial
+# period at 60S is 13.8 hours, so it folds straight onto the eddy band. The average below
+# accumulates every time step instead. (2) u and v appear ONLY in the surface file and the
+# mid-longitude section, so there is no depth-resolved answer to be had from them, and Winter
+# Water is a subsurface layer.
+#
+# u AND v ARE INTERPOLATED TO CELL CENTRES BEFORE THEY ARE SQUARED. On the C-grid u sits on the
+# east-west face and v on the north-south face, so their squares are not at the same point and
+# cannot be added. Interpolation does not commute with x^2, so interpolating after squaring is a
+# different and wrong operation -- it has to happen online, here. <u> is written at centres for
+# the same reason: both terms of the decomposition above have to be taken at the same place.
+#
+# THE NEAR-BOTTOM LEVEL IS LOW-BIASED. That interpolation reads zero out of immersed cells, so
+# the cell against topography averages a real velocity with a solid one. True of any C-grid EKE;
+# just do not read the bottom level as physics.
+#
+# THE WINDOW IS NOT A CALENDAR MONTH. Blocks run in fixed EKE_WINDOW steps from model time zero,
+# so a 30-day window matches June exactly and then drifts off every month boundary after it.
+# Irrelevant to EKE. It matters the moment you difference <T> against a B-SOSE monthly record,
+# which is centred on the middle of its calendar month -- see `bsose_window_center` in
+# setup_bsose.jl, and note that a 30-day block starting on the 1st is centred on the 16th.
+
 # ==============================================================================
 # End of configuration. Nothing below needs editing for a routine run.
 # ==============================================================================
@@ -1056,6 +1096,61 @@ simulation.output_writers[:mid_lon] = NetCDFWriter(
 )
 
 # ==============================================================================
+# Eddy kinetic energy
+#
+# One file, RUN_NAME_eke.nc, holding EKE_WINDOW-long time averages of the state and of the second
+# moments the eddy decomposition needs. The recipe, and why the squaring happens here rather than
+# offline, are in the EKE_DIAGNOSTICS block of the configuration above.
+# ==============================================================================
+
+if EKE_DIAGNOSTICS
+    if EKE_WINDOW > simulation_seconds
+        @warn "EKE_WINDOW ($(EKE_WINDOW / 1days) days) is longer than the run ($(round(Int, simulation_days)) days): the window never closes, so $(RUN_NAME)_eke.nc will be created and left empty."
+    end
+
+    # Co-located velocities. `@at` on a Field is a lazy interpolation, so `u_cc^2` squares the
+    # interpolated value instead of interpolating a square -- see the note above.
+    u_cc = @at (Center, Center, Center) u
+    v_cc = @at (Center, Center, Center) v
+
+    # T and S ride along for two reasons: any eddy flux needs the mean state to subtract, and
+    # this is the only FULL-DEPTH output the run writes -- the other two writers are one surface
+    # level and one meridional section.
+    eke_outputs = (; u=u_cc, v=v_cc, T, S, uu=u_cc^2, vv=v_cc^2)
+
+    if EKE_TRACER_FLUXES
+        eke_outputs = merge(eke_outputs, (; uT=u_cc * T, vT=v_cc * T, uS=u_cc * S, vS=v_cc * S))
+    end
+
+    # Carried on the file so an analysis script never has to guess the window, the stride or the
+    # staggering the moments were taken at.
+    eke_metadata = merge(output_metadata, Dict(
+        "averaging_window_seconds" => Float64(EKE_WINDOW),
+        "averaging_stride" => EKE_STRIDE,
+        "moment_location" => "Center, Center, Center",
+        "eke_recipe" => "EKE = 0.5*((uu - u^2) + (vv - v^2)); MKE = 0.5*(u^2 + v^2)"))
+
+    simulation.output_writers[:eke] = NetCDFWriter(
+        ocean.model,
+        eke_outputs,
+        filename="$(RUN_NAME)_eke.nc",
+        schedule=AveragedTimeInterval(EKE_WINDOW, window=EKE_WINDOW, stride=EKE_STRIDE),
+        indices=EKE_FULL_DEPTH ? (:, :, :) : (:, :, grid.Nz),
+        global_attributes=eke_metadata,
+        overwrite_files=true
+    )
+
+    # Float32 on disk, which is NetCDFWriter's default `array_type`, and one record per window.
+    eke_levels = EKE_FULL_DEPTH ? grid.Nz : 1
+    eke_record_mb = length(eke_outputs) * grid.Nx * grid.Ny * eke_levels * 4 / 1e6
+    eke_records = floor(Int, simulation_seconds / EKE_WINDOW)
+    @info @sprintf("EKE output: %d fields (%s), %.0f-day mean, stride %d, %d record(s) at %.0f MB = %.2f GB",
+        length(eke_outputs), EKE_FULL_DEPTH ? "full depth" : "surface only",
+        EKE_WINDOW / 1days, EKE_STRIDE, eke_records, eke_record_mb,
+        eke_records * eke_record_mb / 1000)
+end
+
+# ==============================================================================
 # Open boundary diagnostics
 #
 # Three things are needed to tell an open boundary from a bounded box, and none of
@@ -1138,6 +1233,11 @@ end
       "shortwave $(update_shortwave! !== nothing) | " *
       "freshwater $(BSOSE_FLUXES && BSOSE_FRESHWATER) | " *
       "sponge $SPONGE_LAYERS | atmosphere $ATMOSPHERE"
+@info "Diagnostics: boundary $BOUNDARY_DIAGNOSTICS | " *
+      "EKE $(EKE_DIAGNOSTICS ? "$(round(Int, EKE_WINDOW / 1days))-day mean, " *
+                               (EKE_FULL_DEPTH ? "full depth" : "surface") *
+                               (EKE_TRACER_FLUXES ? ", with tracer fluxes" : "") : "off") | " *
+      "checkpoints $CHECKPOINTS"
 
 # red button 
 

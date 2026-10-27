@@ -52,6 +52,7 @@
 #     DAYS    output indices for the section diagnostics (default: the selected months)
 #     OUTDIR  where figures go                        (tools/bsose_comparison)
 #     MLD_DT  density threshold, kg/m3                (default 0.03, de Boyer Montegut)
+#     Z_TOP   depth for the vertical-structure section (default 200 m)
 # ==============================================================================
 
 using Oceananigans, Oceananigans.Units, Oceananigans.Grids
@@ -128,6 +129,7 @@ end
 mkpath(OUTDIR)
 
 const SPONGE_CELLS = 18      # 3 degrees at 1/6 deg; keep in step with SPONGE_WIDTH in model.jl
+const SPONGE_DEG = SPONGE_CELLS / SCALING   # the same band in degrees, for axes drawn in degrees
 const EOS = TEOS10EquationOfState()
 
 surf_file = joinpath(DIR, "$(RUN)_surface.nc")
@@ -451,23 +453,38 @@ for (n, dd) in enumerate(bc_dates)
     fig = Figure(size = (1350, 760))
     Label(fig[0, 1:4], "$(RUN) — $(label): monthly mean model − monthly B-SOSE (surface)",
           fontsize = 19, font = :bold)
+    # Real coordinates, not indices. EACH FIELD CARRIES ITS OWN STAGGERING, so each gets its own
+    # node vector: u is Face in x and is therefore (Nx+1, Ny), v is Face in y and is (Nx, Ny+1),
+    # T and S are Centre in both and are (Nx, Ny). Drawing all four against the tracer nodes
+    # would shift the velocities half a cell and throw a length error on the staggered axis --
+    # the same shape mismatch that `field_metrics` exists to avoid.
     λc = Array(λnodes(grid, Center()))
+    λf = Array(λnodes(grid, Face()))
+    φf = Array(φnodes(grid, Face()))
     for (k, (f, un, cmap)) in enumerate(FIELDS)
         D = copy(diffs[f])
         _, wet = field_metrics(size(D))
         D[.!wet] .= NaN
         fin = filter(isfinite, D)
         lim = isempty(fin) ? 1.0 : max(quantile(abs.(fin), 0.99), 1e-6)
+        xs = size(D, 1) == Nx ? λc : λf
+        ys = size(D, 2) == Ny ? φc : φf
+        length(xs) == size(D, 1) && length(ys) == size(D, 2) ||
+            error("Δ$f is $(size(D)) but the nodes are $(length(xs))x$(length(ys))")
         ax = Axis(fig[1 + div(k - 1, 2), 1 + 2 * ((k - 1) % 2)],
-                  title = "Δ$f  ($un)", xlabel = "longitude", ylabel = "latitude")
-        hm = heatmap!(ax, 1:size(D, 1), 1:size(D, 2), D, colormap = :balance,
+                  title = "Δ$f  ($un)", xlabel = "longitude (°E)", ylabel = "latitude (°N)")
+        hm = heatmap!(ax, xs, ys, D, colormap = :balance,
                       colorrange = (-lim, lim), nan_color = :gray85)
-        # the sponge band edge
-        vlines!(ax, [SPONGE_CELLS, Nx - SPONGE_CELLS], color = :black, linestyle = :dot)
-        hlines!(ax, [SPONGE_CELLS, Ny - SPONGE_CELLS], color = :black, linestyle = :dot)
+        # Pin all four panels to the domain, so the Centre-located and Face-located fields
+        # get identical ticks instead of Makie choosing a different set for each.
+        xlims!(ax, λ₁, λ₂)
+        ylims!(ax, φ₁, φ₂)
+        # the sponge band edge, in degrees now rather than cell counts
+        vlines!(ax, [λ₁ + SPONGE_DEG, λ₂ - SPONGE_DEG], color = :black, linestyle = :dot)
+        hlines!(ax, [φ₁ + SPONGE_DEG, φ₂ - SPONGE_DEG], color = :black, linestyle = :dot)
         Colorbar(fig[1 + div(k - 1, 2), 2 + 2 * ((k - 1) % 2)], hm)
     end
-    Label(fig[3, 1:4], "dotted lines: edge of the $(SPONGE_CELLS)-cell sponge band. " *
+    Label(fig[3, 1:4], "dotted lines: edge of the $(SPONGE_CELLS)-cell ($(SPONGE_DEG)°) sponge band. " *
           "Inside it a small difference means the sponge works; outside, the difference is the model.",
           fontsize = 12)
     fo = joinpath(OUTDIR, "$(RUN)_diff_$(label).png")
@@ -595,6 +612,153 @@ if isfile(sect_file)
         f = joinpath(OUTDIR, "$(RUN)_section_day$(lpad(last(days)-1, 3, '0')).png")
         save(f, fig); @info "wrote $f"
     end
+
+    # ====================================================== 3b. vertical structure, upper Z_TOP m
+    #
+    # Sections 1 and 4 compare the SURFACE. This one asks where in the water column the bias
+    # lives, which is a different question with a different answer: a surface-trapped difference
+    # points at the surface forcing, one at the base of the mixed layer points at mixing, and one
+    # that is uniform over the upper 200 m points at the water mass arriving through the
+    # boundaries. The upper 200 m is the band that matters here because Winter Water sits in it.
+    #
+    # TWO MASKS AGAIN, and this time per CELL rather than per column. Our bathymetry and B-SOSE's
+    # disagree, so at a given depth a column can be water in one and rock in the other. Averaging
+    # each side over its own mask and then differencing the averages compares two different
+    # populations of cells and charges the difference to the model. Everything below is averaged
+    # over cells wet in BOTH grids, and the count of those cells is printed so a band that has
+    # almost none cannot be read as a measurement.
+    #
+    # Weighted by cos(latitude): at 1/6 deg a cell at 70S is 0.48 of the width of one at 45S, and
+    # an unweighted mean over this section would overcount the Antarctic margin by a factor of 2.
+    Z_TOP = parse(Float64, get(ENV, "Z_TOP", "200"))
+
+    let
+        depth_bins = [(0.0, 25.0), (25.0, 50.0), (50.0, 100.0), (100.0, 150.0), (150.0, Z_TOP)]
+        lat_bands  = [(-70.0, -65.0), (-65.0, -60.0), (-60.0, -55.0), (-55.0, -50.0), (-50.0, -45.0)]
+
+        # wet in BOTH grids at this cell
+        wetboth(j, k) = kbot_model[j] !== nothing && kbot_parent[j] !== nothing &&
+                        k >= kbot_model[j] && k >= kbot_parent[j]
+
+        jsof(lo, hi) = [j for j in 1:Ny if lo <= φc[j] < hi]
+        ksof(lo, hi) = [k for k in 1:Nz if lo < -zc[k] <= hi]
+        kupper = ksof(0.0, Z_TOP)
+
+        """One table cell, formatted. `@sprintf` needs a literal, hence the branch."""
+        cell(v, prec) = isnan(v) ? lpad("---", 9) :
+                        prec == 3 ? @sprintf("%9.3f", v) : @sprintf("%9.4f", v)
+
+        """cos(lat)-weighted mean of `D` over cells wet in both grids; also the cell count."""
+        function binmean(D, js, ks)
+            num = den = 0.0
+            cells = 0
+            for j in js, k in ks
+                (wetboth(j, k) && isfinite(D[j, k])) || continue
+                w = cosd(φc[j])
+                num += w * D[j, k]
+                den += w
+                cells += 1
+            end
+            return (den == 0 ? NaN : num / den), cells
+        end
+
+        # ---- gather every selected day once, so the figure can share one colour range ----
+        panels = NamedTuple[]
+        for t in days
+            Ts = Float64.(coalesce.(dsec["T"][1, :, :, t], NaN))
+            Ss = Float64.(coalesce.(dsec["S"][1, :, :, t], NaN))
+            kk = something(findfirst(n -> t in groups[n], sel), 1)
+            Tps = Array(interior(Tb[pos[sel[kk]]]))[MID, :, :]
+            Sps = Array(interior(Sb[pos[sel[kk]]]))[MID, :, :]
+            label = Dates.format(bsose_window_center(bc_dates[sel[kk]]), "yyyy-mm")
+            push!(panels, (t = t, label = label, dT = Ts .- Tps, dS = Ss .- Sps,
+                           Ts = Ts, Ss = Ss, Tps = Tps, Sps = Sps))
+        end
+
+        println()
+        println("="^100)
+        @printf("3b. VERTICAL STRUCTURE, upper %.0f m, along the %.1fE section\n", Z_TOP, SECT_LON)
+        println("    Model minus B-SOSE, cos(lat)-weighted over cells wet in BOTH bathymetries.")
+        println("    A surface-trapped signal is forcing; one at the mixed-layer base is mixing;")
+        println("    one that is uniform with depth is the water mass coming through the boundaries.")
+        println("="^100)
+
+        for pan in panels
+            for (D, name, unit, prec) in ((pan.dT, "ΔT", "°C", 3), (pan.dS, "ΔS", "g/kg", 4))
+                @printf("\n%s  %s (%s)   [day %d]\n", pan.label, name, unit, pan.t - 1)
+                @printf("%-12s |", "depth (m)")
+                for (lo, hi) in lat_bands; @printf("%9s", @sprintf("%.0f-%.0fS", -lo, -hi)); end
+                @printf("%11s\n", "all")
+                println("-"^(14 + 9 * length(lat_bands) + 11))
+                for (dlo, dhi) in depth_bins
+                    ks = ksof(dlo, dhi)
+                    @printf("%4.0f - %-5.0f |", dlo, dhi)
+                    for (llo, lhi) in lat_bands
+                        v, nc = binmean(D, jsof(llo, lhi), ks)
+                        print(nc == 0 ? lpad("---", 9) : cell(v, prec))
+                    end
+                    v, _ = binmean(D, 1:Ny, ks)
+                    @printf("%11s\n", strip(cell(v, prec)))
+                end
+                println("-"^(14 + 9 * length(lat_bands) + 11))
+                @printf("%-12s |", "cells")
+                for (llo, lhi) in lat_bands
+                    _, nc = binmean(D, jsof(llo, lhi), kupper)
+                    @printf("%9d", nc)
+                end
+                _, nc = binmean(D, 1:Ny, kupper)
+                @printf("%11d\n", nc)
+            end
+        end
+
+        # ---- figure: ΔT and ΔS over the upper Z_TOP m, one column per selected day ----
+        #
+        # One colour range across all days per row, so the panels are comparable to each other --
+        # a per-panel range would hide exactly the seasonal change in amplitude this is for.
+        ncol = length(panels)
+        fig = Figure(size = (430 * ncol + 120, 760))
+        Label(fig[0, 1:(ncol + 1)],
+              "$(RUN) — model − B-SOSE, upper $(round(Int, Z_TOP)) m at $(round(SECT_LON, digits=1))°E",
+              fontsize = 19, font = :bold)
+
+        masked(D) = (M = fill(NaN, size(D));
+                     for j in 1:Ny, k in kupper
+                         wetboth(j, k) && (M[j, k] = D[j, k])
+                     end; M)
+
+        for (row, (fld, name, unit)) in enumerate(((:dT, "ΔT", "°C"), (:dS, "ΔS", "g/kg")))
+            Ms = [masked(getfield(pan, fld)) for pan in panels]
+            fin = filter(isfinite, vcat(vec.(Ms)...))
+            lim = isempty(fin) ? 1.0 : max(quantile(abs.(fin), 0.99), 1e-9)
+
+            local hm
+            for (c, pan) in enumerate(panels)
+                ax = Axis(fig[row, c], title = "$(pan.label)  $name ($unit)",
+                          xlabel = "latitude", ylabel = c == 1 ? "z (m)" : "")
+                hm = heatmap!(ax, φc, zc, Ms[c], colormap = :balance,
+                              colorrange = (-lim, lim), nan_color = :gray85)
+                ylims!(ax, -Z_TOP, 0)
+
+                # Both mixed layers on top of the difference: it matters whether the bias sits
+                # inside the mixed layer or below it.
+                jm2 = [j for j in 1:Ny if kbot_model[j]  !== nothing]
+                jp2 = [j for j in 1:Ny if kbot_parent[j] !== nothing]
+                lines!(ax, φc[jm2], [-mld(pan.Ts[j, :],  pan.Ss[j, :],  zc, kbot_model[j])  for j in jm2],
+                       color = :black, linewidth = 1.5)
+                lines!(ax, φc[jp2], [-mld(pan.Tps[j, :], pan.Sps[j, :], zc, kbot_parent[j]) for j in jp2],
+                       color = :black, linewidth = 1.5, linestyle = :dash)
+            end
+            Colorbar(fig[row, ncol + 1], hm, label = unit)
+        end
+
+        Label(fig[3, 1:(ncol + 1)],
+              "Solid black: model mixed layer. Dashed: B-SOSE's. Grey is where the two bathymetries " *
+              "disagree or the floor is above $(round(Int, Z_TOP)) m. One colour range per row, shared across months.",
+              fontsize = 11)
+        fv = joinpath(OUTDIR, "$(RUN)_vertical_upper$(round(Int, Z_TOP)).png")
+        save(fv, fig); @info "wrote $fv"
+    end
+
     close(dsec)
 else
     @warn "no $sect_file -- skipping MLD and Winter Water. They need the midlon section."
@@ -644,6 +808,11 @@ Reading this:
   * Section 3: a WW column count far below the parent's means the model is not forming or is not
     preserving the temperature minimum. Check the Tmin DEPTH as well as its value -- too deep is
     as wrong as too warm, and it is the vertical grid's job to resolve it.
+  * Section 3b separates WHERE the bias is from HOW BIG it is. Surface-trapped and seasonally
+    reversing is the signature of missing sea ice, not of the boundaries; uniform over the upper
+    200 m means the water mass itself is wrong, which is a boundary or initialisation question.
+    Read it against the mixed-layer lines: a bias below the mixed layer cannot be this season's
+    surface forcing.
   * Section 4: a steady drift in the domain mean with no boundary imbalance points at surface
     forcing, not at the boundaries.
 
