@@ -183,6 +183,43 @@ slab(d, var, t) = (v = d[var]; A = ndims(v) == 4 ? v[:, :, 1, t] : v[:, :, t];
                    Float64.(coalesce.(A, NaN)))
 wet3(i, j, k) = !immersed_cell(i, j, k, grid)
 
+# ── Each grid's own sea floor along the section ───────────────────────────────────────────────
+#
+# Two masks, not one. Our ETOPO bathymetry and B-SOSE's are not the same field, and drawing
+# B-SOSE through OUR mask is what made the 2Y section figure show a filled, dark "B-SOSE T"
+# panel for three degrees of latitude where B-SOSE is land: at 119.92E its southernmost wet
+# column is 66.97S in 100 m of water, and everything south of 67.0S is continent. What was on
+# the screen there was the inpainting pipeline, not the state estimate, and no NaN survived for
+# `nan_color` to catch.
+#
+# `kb*[j]` is the DEEPEST WET index of column j, or `nothing` for a dry column. Everything below
+# it is bathymetry and must be excluded from the density search, the Winter Water search and the
+# heatmap alike.
+kbot_model = [findfirst(k -> wet3(MID, j, k), 1:Nz) for j in 1:Ny]
+
+"""B-SOSE's own sea-floor depth (m, positive) at each of `lats`, on the meridian `lon`."""
+function bsose_section_depth(dataset, lon, lats)
+    file = joinpath(dataset.dir,
+                    resolve_bsose_filename(dataset.dir, :surface_salt_flux, dataset.iteration))
+    d = Dataset(file)
+    try
+        xc = Float64.(coalesce.(d["XC"][:], NaN))
+        yc = Float64.(coalesce.(d["YC"][:], NaN))
+        i = argmin(abs.(xc .- lon))
+        D = Float64.(coalesce.(d["Depth"][i, :], NaN))
+        return [(j = argmin(abs.(yc .- φ)); isfinite(D[j]) ? max(D[j], 0.0) : 0.0) for φ in lats]
+    finally
+        close(d)
+    end
+end
+
+const SECT_LON = λ₁ + (MID - 0.5) / SCALING
+parent_depth = bsose_section_depth(dataset, SECT_LON, φc)
+kbot_parent = [d <= 0 ? nothing : findfirst(k -> -zc[k] <= d, 1:Nz) for d in parent_depth]
+
+@info @sprintf("section %.2fE: %d of %d columns wet in the model, %d in B-SOSE",
+               SECT_LON, count(!isnothing, kbot_model), Ny, count(!isnothing, kbot_parent))
+
 """Potential density anomaly at 0 dbar, same equation of state for model and parent."""
 ρθ(T, S) = (isfinite(T) && isfinite(S)) ?
            SeawaterPolynomials.ρ′(T, S, 0.0, EOS) : NaN
@@ -191,21 +228,40 @@ wet3(i, j, k) = !immersed_cell(i, j, k, grid)
 Mixed layer depth by the de Boyer Montegut density threshold: the shallowest depth at which
 potential density exceeds its 10 m value by `MLD_DT` kg/m3. `T`, `S` are columns ordered
 bottom-to-top as Oceananigans stores them; `zs` is the matching cell-centre depth (negative).
+`kbot` is the DEEPEST WET index of this column — the search stops there.
+
+Returns `NaN` when no crossing exists between 10 m and the sea floor. That is a real result
+("this column is unstratified"), not a failure, and the callers count it.
+
+> `kbot` is not optional bookkeeping, it is the whole correctness of this function.
+>
+> This used to search to `k = 1` and, finding nothing, return `-zs[1]` — the deepest cell centre
+> of the GRID, about 5.6 km, with no relation to the water depth. It relied on hitting a NaN
+> below the sea floor to stop, and there is none: `fill_bathymetry_gaps!` in `setup_bsose.jl`
+> deliberately propagates the deepest valid water mass DOWNWARD into every immersed cell, so T
+> and S below the floor are finite and constant. The detector walked straight through the
+> bathymetry and fell out the bottom.
+>
+> The result was a ~5 km spike on the Antarctic margin of the 2Y_bsose_dirichlet section plot
+> that read as a 5 km mixed layer and was nothing of the kind — and, worse, `mean_or(mm)` below
+> averaged it in. One such column out of ~145 adds ~38 m to the reported mean, which is why the
+> "189 m model vs 186 m B-SOSE" figure quoted from this table was not trustworthy.
 """
-function mld(T, S, zs; Δρ = MLD_DT)
+function mld(T, S, zs, kbot = 1; Δρ = MLD_DT)
     k10 = findlast(z -> z <= -10, zs)          # deepest cell at or above 10 m
     k10 === nothing && (k10 = length(zs))
+    k10 <= kbot && return NaN                   # column too shallow to have a 10 m reference
     ref = ρθ(T[k10], S[k10])
     isfinite(ref) || return NaN
-    for k in (k10 - 1):-1:1                     # Oceananigans orders z bottom-to-top, so a
+    for k in (k10 - 1):-1:kbot                  # Oceananigans orders z bottom-to-top, so a
                                                 # SMALLER index is DEEPER
         ρ = ρθ(T[k], S[k])
-        isfinite(ρ) || return -zs[k + 1]
+        isfinite(ρ) || return NaN
         if ρ - ref >= Δρ
             return -zs[k]
         end
     end
-    return -zs[1]                               # unstratified to the floor
+    return NaN                                  # unstratified through the whole water column
 end
 
 """
@@ -219,9 +275,13 @@ The depth band is not cosmetic. Without it this returns the coldest local minimu
 the mixed layer, and in the Southern Ocean the deep water wins in most columns -- the first run
 of this script reported Tmin depths of 1894-5126 m, i.e. Antarctic Bottom Water.
 """
-function winter_water(T, zs, mld_m)
+function winter_water(T, zs, mld_m, kbot = 1)
+    # `kbot` for the same reason as in `mld`: below the sea floor T is a downward copy of the
+    # deepest wet value, so a shallow column would otherwise be searched through metres of
+    # fill. Constant fill cannot produce a strict local minimum, but the junction between real
+    # water and fill can, and that minimum would be an artifact of the bathymetry.
     kk = [k for k in eachindex(zs)
-          if isfinite(T[k]) && -zs[k] > max(mld_m, WW_MIN) && -zs[k] <= WW_MAX]
+          if k >= kbot && isfinite(T[k]) && -zs[k] > max(mld_m, WW_MIN) && -zs[k] <= WW_MAX]
     length(kk) < 3 && return nothing
     best = nothing
     for n in 2:(length(kk) - 1)
@@ -422,9 +482,12 @@ if isfile(sect_file)
     println("   MLD: de Boyer Montegut, Δρ = $MLD_DT kg/m3 from 10 m, SAME equation of state both sides.")
     println("   The recorded failure to beat: model 3.1 m where B-SOSE had 21.8 m (section 3.3).")
     println("="^96)
+    println("   MLD is averaged over columns that HAVE a crossing. `unstratified` counts the columns")
+    println("   with none between 10 m and their own sea floor -- those are excluded from the mean,")
+    println("   not folded in at the grid depth as they were before 2026-10-26.")
     @printf("\n%6s | %-26s | %-26s | %s\n", "day", "MLD  model / B-SOSE (m)",
             "Tmin  model / B-SOSE (C)", "Tmin depth  model / B-SOSE (m)")
-    println("-"^104)
+    println("-"^128)
 
     for t in days
         Ts = Float64.(coalesce.(dsec["T"][1, :, :, t], NaN))   # (Ny, Nz)
@@ -437,19 +500,29 @@ if isfile(sect_file)
 
         mm, mp, wm, wp = Float64[], Float64[], Float64[], Float64[]
         dm, dp = Float64[], Float64[]
+        nxm, nxp, ncm, ncp = 0, 0, 0, 0     # unstratified columns, and wet columns, per grid
         for j in 1:Ny
-            wet3(MID, j, Nz) || continue
-            a = mld(Ts[j, :], Ss[j, :], zc); b = mld(Tps[j, :], Sps[j, :], zc)
-            isfinite(a) && push!(mm, a); isfinite(b) && push!(mp, b)
-            wa = winter_water(Ts[j, :], zc, isfinite(a) ? a : 0.0)
-            wb = winter_water(Tps[j, :], zc, isfinite(b) ? b : 0.0)
-            wa === nothing || (push!(wm, wa[1]); push!(dm, wa[2]))
-            wb === nothing || (push!(wp, wb[1]); push!(dp, wb[2]))
+            # Each side is walked on ITS OWN mask. Sharing one mask is what put B-SOSE's
+            # inpainting into this table alongside its model counterpart.
+            if (kb = kbot_model[j]) !== nothing
+                ncm += 1
+                a = mld(Ts[j, :], Ss[j, :], zc, kb)
+                isfinite(a) ? push!(mm, a) : (nxm += 1)
+                wa = winter_water(Ts[j, :], zc, isfinite(a) ? a : 0.0, kb)
+                wa === nothing || (push!(wm, wa[1]); push!(dm, wa[2]))
+            end
+            if (kb = kbot_parent[j]) !== nothing
+                ncp += 1
+                b = mld(Tps[j, :], Sps[j, :], zc, kb)
+                isfinite(b) ? push!(mp, b) : (nxp += 1)
+                wb = winter_water(Tps[j, :], zc, isfinite(b) ? b : 0.0, kb)
+                wb === nothing || (push!(wp, wb[1]); push!(dp, wb[2]))
+            end
         end
         mean_or(v) = isempty(v) ? NaN : mean(v)
-        @printf("%6d | %11.1f / %-12.1f | %11.3f / %-12.3f | %9.0f / %-9.0f  (WW in %d/%d cols model, %d parent)\n",
+        @printf("%6d | %11.1f / %-12.1f | %11.3f / %-12.3f | %9.0f / %-9.0f  (WW in %d/%d model, %d/%d parent; unstratified %d / %d)\n",
                 t - 1, mean_or(mm), mean_or(mp), mean_or(wm), mean_or(wp),
-                mean_or(dm), mean_or(dp), length(wm), count(j -> wet3(MID, j, Nz), 1:Ny), length(wp))
+                mean_or(dm), mean_or(dp), length(wm), ncm, length(wp), ncp, nxm, nxp)
     end
 
     # ---- figures: MLD and the WW core along the section ----
@@ -466,31 +539,59 @@ if isfile(sect_file)
 
         ax1 = Axis(fig[1, 1:2], title = "mixed layer depth", xlabel = "latitude",
                    ylabel = "MLD (m)", yreversed = true)
-        jm = [j for j in 1:Ny if wet3(MID, j, Nz)]
-        lines!(ax1, φc[jm], [mld(Ts[j, :], Ss[j, :], zc) for j in jm],
-               color = :firebrick, linewidth = 2, label = "model")
-        lines!(ax1, φc[jm], [mld(Tps[j, :], Sps[j, :], zc) for j in jm],
-               color = :black, linestyle = :dash, linewidth = 2, label = "B-SOSE")
-        axislegend(ax1, position = :lb)
+        jm = [j for j in 1:Ny if kbot_model[j]  !== nothing]   # wet in OUR bathymetry
+        jp = [j for j in 1:Ny if kbot_parent[j] !== nothing]   # wet in B-SOSE's
 
-        for (col, (A, ttl)) in enumerate(((Ts, "model T"), (Tps, "B-SOSE T")))
+        mlds_m = [mld(Ts[j, :],  Ss[j, :],  zc, kbot_model[j])  for j in jm]
+        mlds_p = [mld(Tps[j, :], Sps[j, :], zc, kbot_parent[j]) for j in jp]
+
+        # NaN breaks the line rather than drawing a spike, which is the honest rendering of
+        # "no crossing here". The columns that produced one are then marked AT THEIR OWN SEA
+        # FLOOR, so an unstratified 300 m shelf column reads as 300 m of unstratified water
+        # instead of as a 5 km mixed layer.
+        lines!(ax1, φc[jm], mlds_m, color = :firebrick, linewidth = 2, label = "model")
+        lines!(ax1, φc[jp], mlds_p, color = :black, linestyle = :dash, linewidth = 2,
+               label = "B-SOSE")
+
+        for (js, vals, kb, c, mk, lab) in ((jm, mlds_m, kbot_model,  :firebrick, :xcross, "model"),
+                                           (jp, mlds_p, kbot_parent, :black,     :cross,  "B-SOSE"))
+            bad = [j for (n, j) in enumerate(js) if !isfinite(vals[n])]
+            isempty(bad) && continue
+            scatter!(ax1, φc[bad], [-zc[kb[j]] for j in bad], color = c, marker = mk,
+                     markersize = 11, label = "$lab: unstratified to the floor")
+        end
+        axislegend(ax1, position = :lb, labelsize = 10)
+
+        for (col, (A, Sall, js, kb, ttl)) in enumerate(((Ts,  Ss,  jm, kbot_model,  "model T"),
+                                                        (Tps, Sps, jp, kbot_parent, "B-SOSE T")))
+            # Mask each panel with ITS OWN bathymetry before drawing. Neither array arrives with
+            # NaNs below the sea floor -- the model's immersed cells are filled downward by
+            # `fill_bathymetry_gaps!`, and B-SOSE's have been inpainted -- so without this the
+            # heatmap renders bathymetry as ocean and `nan_color` never fires.
+            M = fill(NaN, size(A))
+            for j in js, k in kb[j]:Nz
+                M[j, k] = A[j, k]
+            end
             ax = Axis(fig[2, col], title = ttl, xlabel = "latitude", ylabel = "z (m)")
-            hm = heatmap!(ax, φc, zc, A, colormap = :thermal,
+            hm = heatmap!(ax, φc, zc, M, colormap = :thermal,
                           colorrange = (-2, 8), nan_color = :gray85)
             ylims!(ax, -700, 0)
             col == 2 && Colorbar(fig[2, 3], hm, label = "°C")
             # the WW core, where one exists
-            for j in jm
+            for j in js
                 # A[j, :], NOT A. Passing the whole (Ny, Nz) matrix made Julia index it linearly,
                 # comparing temperatures at different LATITUDES at one depth, which drew a flat
                 # line of meaningless dots across the first version of this figure.
-                Scol = (col == 1 ? Ss : Sps)[j, :]
-                w = winter_water(A[j, :], zc, mld(A[j, :], Scol, zc))
+                Scol = Sall[j, :]
+                w = winter_water(A[j, :], zc, mld(A[j, :], Scol, zc, kb[j]), kb[j])
                 w === nothing || scatter!(ax, [φc[j]], [-w[2]], color = :cyan, markersize = 4)
             end
         end
-        Label(fig[3, 1:2], "cyan dots: subsurface temperature minimum (Winter Water core) where one exists",
-              fontsize = 12)
+        Label(fig[3, 1:2],
+              "cyan dots: subsurface temperature minimum (Winter Water core) where one exists.  " *
+              "Grey is each grid's OWN bathymetry.  " *
+              "x/+ mark columns with no $(MLD_DT) kg/m³ crossing, plotted at that column's sea floor.",
+              fontsize = 11)
         f = joinpath(OUTDIR, "$(RUN)_section_day$(lpad(last(days)-1, 3, '0')).png")
         save(f, fig); @info "wrote $f"
     end
