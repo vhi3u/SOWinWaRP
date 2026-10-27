@@ -129,12 +129,24 @@ const BSOSE_VARIABLE_NAMES = Dict(
     # same MITgcm convention ("net Short-Wave radiation (+=down), >0 increases theta"), so
     # TFLUX - oceQsw is the non-solar remainder; see `bsose_penetrating_shortwave`.
     :surface_shortwave => "oceQsw",
+    # `oceFWflx` is NOT a second salt flux alongside SFLUX, it is a WATER flux, and the two are
+    # disjoint rather than overlapping. MITgcm ran B-SOSE with a nonlinear free surface and a
+    # real freshwater flux, so precipitation / evaporation / runoff / ice melt move water and
+    # leave salt content untouched: SFLUX ("match salt-CONTENT variations") therefore carries
+    # sea-ice brine and essentially nothing else, and all of the dilution is in here. MEASURED
+    # over 90-150E, Jun 2014 - May 2016 (`tools/check_freshwater_flux.jl`): in the ice-free band
+    # 45-55S the median per-record ratio SFLUX / (-S*oceFWflx) is 0.0003, and per 5-degree band
+    # the implied dS over 2 years from SFLUX alone is within 0.01 g/kg of zero everywhere north
+    # of 65S, reaching -0.14 only in 70-65S where ice forms. See
+    # `bsose_surface_tracer_fluxes`, which turns this into a virtual salt flux.
+    :surface_freshwater_flux => "oceFWflx",
     # The variable inside SSH_bsoseI156_*.nc is ETAN, not SSH; see BSOSE_FILE_TOKENS below.
     # Unlike every other field here it marks land with 0.0 rather than NaN -- see
     # `bsose_exterior_free_surface`, which masks from Depth before using it.
     :sea_surface_height => "ETAN",
     # Aliases
     :oceQsw => "oceQsw",
+    :oceFWflx => "oceFWflx",
     :Theta => "THETA",
     :Salt => "SALT",
     :Uvel => "UVEL",
@@ -170,8 +182,10 @@ const BSOSE_LOCATIONS = Dict(
     :surface_heat_flux => (Center, Center, Nothing),
     :surface_salt_flux => (Center, Center, Nothing),
     :surface_shortwave => (Center, Center, Nothing),
+    :surface_freshwater_flux => (Center, Center, Nothing),
     :sea_surface_height => (Center, Center, Nothing),
     :oceQsw => (Center, Center, Nothing),
+    :oceFWflx => (Center, Center, Nothing),
     :Theta => (Center, Center, Center),
     :Salt => (Center, Center, Center),
     :Uvel => (Face, Center, Center),
@@ -222,6 +236,9 @@ const BSOSE_FILES = Dict(
         :surface_heat_flux      => ("surfTflx", "2013to2024_monthly"),
         :surface_salt_flux      => ("surfSflx", "2013to2024_monthly"),
         :surface_shortwave      => ("oceQsw",   "2013to2024_monthly"),
+        # Downloaded 2026-10-26. No iteration 105 entry on purpose: that distribution has no
+        # oceFWflx file here, and `resolve_bsose_filename` is meant to stop rather than guess.
+        :surface_freshwater_flux => ("oceFWflx", "2013to2024_monthly"),
         :sea_surface_height     => ("SSH",      "2013to2024_monthly"),
         # The cluster carries BOTH `oceTAUX_bsoseI156_2013to2024_monthly.nc` and
         # `oceTAUX_bsoseI156_2014_5day.nc`. Monthly is the one this project uses: the 5-day
@@ -1396,14 +1413,27 @@ end
                                 dates = nothing,
                                 ρ₀ = 1026.0,
                                 cₚ = 3991.86795711963,
+                                subtract_shortwave = false,
+                                add_freshwater_flux = false,
+                                reference_salinity = 34.0,
                                 reference_date = nothing)
 
 Load the BSOSE surface heat and salt fluxes (`TFLUX` and `SFLUX`), convert them to the
 kinematic fluxes Oceananigans takes at a top boundary, and return a `NamedTuple` of top
 `FluxBoundaryCondition`s: `(; T = FluxBoundaryCondition(Jᵀ), S = FluxBoundaryCondition(Jˢ))`.
 
-Without these the ocean exchanges no heat or freshwater with the atmosphere at all: it cannot
-cool in winter or warm in summer, and its surface temperature is left to advection and mixing.
+Without these the ocean exchanges no heat at all with the atmosphere: it cannot cool in winter
+or warm in summer, and its surface temperature is left to advection and mixing.
+
+With `add_freshwater_flux`, the salt flux is `SFLUX - reference_salinity * oceFWflx` rather
+than `SFLUX` alone. **This is not an optional refinement either.** `SFLUX` matches salt-CONTENT
+variations, which under MITgcm's real-freshwater-flux formulation means sea-ice brine and
+nothing else; the dilution by precipitation, evaporation, runoff and ice melt is carried
+entirely by `oceFWflx`. Measured over this domain, `SFLUX` alone implies a domain-mean ΔS of
+-0.006 g/kg over two years — no surface salinity forcing worth the name — while the freshwater
+term is worth 0.47 m/yr of net freshwater in. See the note on `:surface_freshwater_flux` in
+[`BSOSE_VARIABLE_NAMES`](@ref) for the measurement, and `tools/check_freshwater_flux.jl` to
+reproduce it.
 
 `reference_date` is the calendar date of model time zero; see [`model_clock_offset`](@ref).
 """
@@ -1413,6 +1443,8 @@ function bsose_surface_tracer_fluxes(grid;
     ρ₀=1026.0,
     cₚ=3991.86795711963,   # TEOS-10 reference heat capacity, J kg⁻¹ °C⁻¹
     subtract_shortwave=false,
+    add_freshwater_flux=false,
+    reference_salinity=34.0,
     reference_date=nothing)
 
     if isnothing(dates)
@@ -1449,6 +1481,52 @@ function bsose_surface_tracer_fluxes(grid;
         Nlo, Nbar, Nhi = series_statistics(top_T_slice)
         @info @sprintf(" -> Non-solar surface heat flux (TFLUX - oceQsw): mean %+.1f W m⁻², range %+.1f to %+.1f",
             Nbar, Nlo, Nhi)
+    end
+
+    # THE FRESHWATER TERM. `SFLUX` is not the surface salinity forcing on its own -- see the
+    # note on `:surface_freshwater_flux` in `BSOSE_VARIABLE_NAMES` for the measurement that
+    # settles it. Oceananigans has no real freshwater flux here: S is an ordinary tracer with a
+    # flux boundary condition and the cell never changes thickness, so there is no path by
+    # which added water can dilute anything. B-SOSE's dilution therefore has to be converted
+    # into the equivalent VIRTUAL salt flux,
+    #
+    #     F_virtual = -S * oceFWflx       [g/kg] * [kg/m² s] = [g/m² s]
+    #
+    # which is already in SFLUX's units and so rides through the same conversion below.
+    # SUBTRACTING is what applies it: oceFWflx is positive downward and the file states "> 0
+    # decreases salinity", so the term has to make the total less salinifying.
+    #
+    # `reference_salinity` is a constant, not a field, deliberately. Surface S spans about
+    # 33.3 to 34.6 over this domain, so a constant is a ~2% error on the term -- about
+    # 0.003 g/kg/yr -- against the 100% error of leaving the term out. A field would cost a
+    # 3-D salinity load AND a fix to `boundary_slice_time_series`, whose `:top` branch takes
+    # k = 1: correct for the 2-D flux fields it is called with, but the BOTTOM level for
+    # anything three-dimensional. If this ever needs to beat 2%, use the model's own surface S
+    # through a discrete-form boundary condition rather than another prescribed field.
+    if add_freshwater_flux
+        freshwater_metadata = Metadata(:surface_freshwater_flux; dataset, dates, region)
+        freshwater_fts = resident_fts(freshwater_metadata, grid)
+        top_F_slice = boundary_slice_time_series(freshwater_fts, :top; time_offset)
+
+        Flo, Fbar, Fhi = series_statistics(top_F_slice)
+        @info @sprintf(" -> Net surface freshwater flux (oceFWflx): mean %+.3e kg m⁻² s⁻¹ = %+.2f m/yr, range %+.3e to %+.3e",
+            Fbar, Fbar * 365.25days / 1000, Flo, Fhi)
+
+        # Same reason as the shortwave difference above: on the SLICED series, because the
+        # dataset-backed one holds two snapshots and reloads them from disk.
+        for t in 1:length(top_S_slice.times)
+            parent(top_S_slice[t]) .-= reference_salinity .* parent(top_F_slice[t])
+        end
+
+        Slo, Sbar, Shi = series_statistics(top_S_slice)
+        @info @sprintf(" -> Total surface salt flux (SFLUX - %.1f*oceFWflx): mean %+.3e g m⁻² s⁻¹, range %+.3e to %+.3e",
+            reference_salinity, Sbar, Slo, Shi)
+    else
+        @warn """Surface salinity is being forced with SFLUX alone, which is sea-ice brine and \
+                 almost nothing else -- a domain-mean ΔS of -0.006 g/kg over two years, against \
+                 0.47 m/yr of net freshwater that is going unapplied. Pass \
+                 `add_freshwater_flux = true` unless you are deliberately reproducing an \
+                 earlier run."""
     end
 
     # BSOSE follows the MITgcm convention, stated in the files themselves: TFLUX "> 0
@@ -2008,6 +2086,13 @@ open boundary conditions from BSOSE — plus `(; U, V)` when `barotropic = true`
                 `TFLUX`, so the sunlight is not counted twice. Setting this without also
                 constructing the radiation, or the reverse, silently drops or doubles the
                 shortwave — they are two halves of one change.
+- `freshwater_flux`: With `surface_fluxes = true`, whether B-SOSE's net surface freshwater flux
+                `oceFWflx` is converted into a virtual salt flux and added to `SFLUX`. Leave it
+                off only to reproduce a run from before 2026-10-26: `SFLUX` by itself is sea-ice
+                brine and leaves the surface effectively unforced in salinity. See
+                [`bsose_surface_tracer_fluxes`](@ref).
+- `reference_salinity`: The salinity used in that conversion, `-S * oceFWflx`, in g/kg.
+                Default `34.0`.
 - `ρ₀`: Seawater density for wind stress conversion (kg/m³). Default: 1026.0.
 - `reference_date`: Calendar date of model time zero, so that the boundary and wind series are
                     stepped on the model clock; see [`model_clock_offset`](@ref). `nothing`
@@ -2036,6 +2121,8 @@ function bsose_open_boundary_conditions(grid;
     winds=nothing,
     surface_fluxes=false,
     penetrating_shortwave=false,
+    freshwater_flux=false,
+    reference_salinity=34.0,
     tangential_bc_kind=:gradient,
     tracer_scheme=:same,
     radiation_inflow_timescale=1days,
@@ -2420,7 +2507,8 @@ function bsose_open_boundary_conditions(grid;
 
     if surface_fluxes === true
         tracer_flux_bcs = bsose_surface_tracer_fluxes(grid; dataset, dates, ρ₀, reference_date,
-            subtract_shortwave=penetrating_shortwave)
+            subtract_shortwave=penetrating_shortwave,
+            add_freshwater_flux=freshwater_flux, reference_salinity)
         top_T_bc = tracer_flux_bcs.T
         top_S_bc = tracer_flux_bcs.S
     elseif surface_fluxes isa NamedTuple

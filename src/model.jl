@@ -50,11 +50,11 @@ end
 # ---- run identity -------------------------------------------------------------------------
 # Prefixes every output file: RUN_NAME_surface.nc, _midlon.nc, _free_surface.nc.
 # Change it per experiment or runs overwrite each other. Animate: ./run_animate_simulation NAME
-const RUN_NAME = "2Y_bsose_dirichlet"
+const RUN_NAME = "8M_bsose_fwf"
 
 # ---- period and domain --------------------------------------------------------------------
 const START_DATE = DateTime("2014-06-01")
-const END_DATE   = DateTime("2016-06-01")   # 2 years = 731 days. Two full seasonal cycles, so
+const END_DATE   = DateTime("2015-02-01")   # 2 years = 731 days. Two full seasonal cycles, so
                                             # Winter Water forms, is capped, and forms AGAIN --
                                             # and the SECOND cycle is the one not contaminated by
                                             # the initial condition.
@@ -248,6 +248,39 @@ const EXTERIOR_SSH      = true      # eta_ext and the initial eta from B-SOSE ET
 const WINDS                = true   # BSOSE oceTAUX / oceTAUY
 const SURFACE_FLUXES       = true   # BSOSE TFLUX / SFLUX
 const PENETRATING_SHORTWAVE = true  # split oceQsw out of TFLUX into TwoColorRadiation
+const FRESHWATER_FLUX      = true   # add -S*oceFWflx to SFLUX as a virtual salt flux
+const REFERENCE_SALINITY   = 34.0   # the S in that conversion, g/kg
+
+# FRESHWATER_FLUX IS NOT OPTIONAL WHEN SURFACE_FLUXES IS ON, for the same kind of reason as
+# PENETRATING_SHORTWAVE below. B-SOSE's SFLUX matches salt-CONTENT variations, and MITgcm ran it
+# with a nonlinear free surface and a real freshwater flux -- so precipitation, evaporation,
+# runoff and ice melt move WATER there, leave salt content untouched, and do not appear in SFLUX
+# at all. What is left in SFLUX is sea-ice brine.
+#
+# MEASURED 2026-10-26 over this domain, Jun 2014 - May 2016 (`tools/check_freshwater_flux.jl`),
+# implied ΔS over 2 years in a 100 m layer:
+#
+#     band        SFLUX     -S*oceFWflx
+#     70-65S     -0.1401        +0.1266      <- the only band where SFLUX does anything
+#     65-60S     -0.0039        -0.4189
+#     60-55S     +0.0087        -0.4674
+#     55-50S     -0.0003        -0.3602
+#     50-45S     +0.0000        -0.1261
+#
+# A salt flux that is nonzero only where sea ice forms is brine, by construction. In the
+# ice-free band 45-55S the median per-record ratio SFLUX / (-S*oceFWflx) is 0.0003. So every run
+# before this one had NO surface salinity forcing north of 65S: SFLUX alone integrates to
+# -0.006 g/kg domain-mean over two years, a no-op, which is why 2Y_bsose_dirichlet drifted
+# +0.09 g/kg SALTY against B-SOSE.
+#
+# oceFWflx is worth 0.47 m/yr of net freshwater into this domain. Do NOT read the -0.30 g/kg
+# that integrates to in 100 m as a prediction: a surface-flux integral is an upper bound on the
+# local change, and B-SOSE is forced with this exact flux without freshening by anything like
+# that, because the circulation exports it.
+#
+# WATCH THE COAST. In 70-65S the two terms nearly cancel (-0.140 -> -0.014), so this makes the
+# coastal band ~0.13 g/kg SALTIER over two years -- the opposite direction from everywhere else,
+# and exactly where running without a prognostic sea-ice model is least defensible.
 
 # PENETRATING_SHORTWAVE IS NOT OPTIONAL WHEN SURFACE_FLUXES IS ON. B-SOSE's TFLUX is the TOTAL
 # surface heat flux, sunlight included, and sunlight is not absorbed at the surface. Depositing
@@ -311,6 +344,7 @@ const ERA5_THREADS         = 1      # CDS rejects concurrent queued requests
 const BSOSE_WINDS     = WINDS && ATMOSPHERE === :none
 const BSOSE_FLUXES    = SURFACE_FLUXES && ATMOSPHERE === :none
 const BSOSE_SHORTWAVE = PENETRATING_SHORTWAVE && ATMOSPHERE === :none
+const BSOSE_FRESHWATER = FRESHWATER_FLUX && ATMOSPHERE === :none
 
 # ---- physics and run control ---------------------------------------------------------------
 const CLOSURE_CONFIG = "ito"   # ito | bsose | henyey_gm | biharmonic | none (built below)
@@ -525,7 +559,9 @@ if OBCS
     boundary_conditions = bsose_open_boundary_conditions(grid; dataset=dataset, dates=bc_dates,
         exterior_free_surface=exterior_η,
         winds=WINDS, surface_fluxes=SURFACE_FLUXES,
-        penetrating_shortwave=SURFACE_FLUXES && PENETRATING_SHORTWAVE, scheme=obc_scheme,
+        penetrating_shortwave=SURFACE_FLUXES && PENETRATING_SHORTWAVE,
+        freshwater_flux=SURFACE_FLUXES && FRESHWATER_FLUX,
+        reference_salinity=REFERENCE_SALINITY, scheme=obc_scheme,
         tangential_bc_kind=TANGENTIAL_BC, tracer_scheme=TRACER_SCHEME,
         radiation_inflow_timescale=RADIATION_TAU_IN,
         oblique_inflow_timescale=OBLIQUE_TAU_IN,
@@ -657,6 +693,17 @@ elseif PENETRATING_SHORTWAVE
     end
 end
 
+# The same pairing check for the freshwater term. Unlike the shortwave it needs no companion
+# construction -- it is folded into the salt flux inside `bsose_surface_tracer_fluxes` -- so the
+# only way to get it wrong from here is to ask for it without the flux it modifies.
+if FRESHWATER_FLUX && !SURFACE_FLUXES
+    @warn """FRESHWATER_FLUX has no effect while SURFACE_FLUXES is false: oceFWflx is added to \
+             SFLUX, and with surface fluxes off there is no SFLUX to add it to."""
+elseif FRESHWATER_FLUX && ATMOSPHERE !== :none
+    @warn """FRESHWATER_FLUX is ignored under the $(ATMOSPHERE) coupling, which computes its own \
+             surface freshwater flux from the atmosphere's precipitation and evaporation."""
+end
+
 @info "Constructing ocean simulation model..."
 ocean = ocean_simulation(grid;
     boundary_conditions=boundary_conditions,
@@ -743,9 +790,10 @@ if ATMOSPHERE === :era5
 elseif ATMOSPHERE !== :none
     error("Unknown ATMOSPHERE: $ATMOSPHERE. Choose :era5 or :none.")
 else
-    @info @sprintf("No atmosphere. Surface forcing: winds %s, heat/salt fluxes %s, penetrating shortwave %s.",
+    @info @sprintf("No atmosphere. Surface forcing: winds %s, heat/salt fluxes %s, penetrating shortwave %s, freshwater flux %s.",
                    BSOSE_WINDS ? "BSOSE" : "OFF", BSOSE_FLUXES ? "BSOSE" : "OFF",
-                   BSOSE_SHORTWAVE ? "ON" : "OFF")
+                   BSOSE_SHORTWAVE ? "ON" : "OFF",
+                   BSOSE_FLUXES && BSOSE_FRESHWATER ? "oceFWflx" : "OFF")
 end
 
 # some housekeeping to set up the simulation (progress checks and adaptive timestep)
@@ -1087,7 +1135,9 @@ end
 @info "Boundaries: normal/tracers $(OBC_SCHEME), tangential $(TANGENTIAL_BC), " *
       "barotropic $(BAROTROPIC_OBC ? String(BAROTROPIC_SCHEME) : "none") on $BAROTROPIC_FACES faces"
 @info "Surface forcing: winds $BSOSE_WINDS | fluxes $BSOSE_FLUXES | " *
-      "shortwave $(update_shortwave! !== nothing) | sponge $SPONGE_LAYERS | atmosphere $ATMOSPHERE"
+      "shortwave $(update_shortwave! !== nothing) | " *
+      "freshwater $(BSOSE_FLUXES && BSOSE_FRESHWATER) | " *
+      "sponge $SPONGE_LAYERS | atmosphere $ATMOSPHERE"
 
 # red button 
 
