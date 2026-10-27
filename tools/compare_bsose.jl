@@ -1,8 +1,13 @@
 # ==============================================================================
 # compare_bsose.jl -- model against the B-SOSE parent it is nudged toward.
 #
-#     julia --project=. tools/compare_bsose.jl 8M_bsose_v2
-#     DAYS=first,mid,last julia --project=. tools/compare_bsose.jl 8M_bsose_v2
+#     julia --project=. tools/compare_bsose.jl 8M_bsose_fwf
+#     julia --project=. tools/compare_bsose.jl 8M_bsose_fwf 8M S6
+#     DAYS=first,mid,last julia --project=. tools/compare_bsose.jl 8M_bsose_fwf
+#
+# The positional arguments are RUN, then the season preset, then the resolution: `8M S6` reads as
+# "an 8-month window at 1/6 deg". Both are optional -- the season preset is inferred from the run
+# length and the resolution from the output file itself.
 #
 # FOUR QUESTIONS, in order of how cheaply they can be wrong:
 #
@@ -48,6 +53,8 @@
 #     DIR     where the model .nc files live          (default: working directory)
 #     SEASONS preset for which months to map: 2Y | 8M | 1Y | ALL  (default: auto from run length)
 #             also accepted as the 2nd positional argument: `... 2Y_bsose_dirichlet 2Y`
+#     SCALING horizontal resolution, 1/SCALING deg, as S6 or 6   (default: read off the file)
+#             also accepted as the 3rd positional argument: `... 8M_bsose_fwf 8M S6`
 #     MONTHS  explicit month numbers, overrides SEASONS, e.g. MONTHS=6,9,12
 #     DAYS    output indices for the section diagnostics (default: the selected months)
 #     OUTDIR  where figures go                        (tools/bsose_comparison)
@@ -128,9 +135,13 @@ function resolve_months(run_days)
 end
 mkpath(OUTDIR)
 
-const SPONGE_CELLS = 18      # 3 degrees at 1/6 deg; keep in step with SPONGE_WIDTH in model.jl
-const SPONGE_DEG = SPONGE_CELLS / SCALING   # the same band in degrees, for axes drawn in degrees
 const EOS = TEOS10EquationOfState()
+
+# The sponge is 3 DEGREES wide in model.jl (SPONGE_WIDTH); the 18 cells it works out to are a
+# consequence of the resolution, not a property of the model. Deriving the cells from the degrees
+# is what lets this script follow SCALING instead of silently annotating a 1/12 deg run with a
+# 1/6 deg band.
+const SPONGE_DEG = 3.0
 
 surf_file = joinpath(DIR, "$(RUN)_surface.nc")
 sect_file = joinpath(DIR, "$(RUN)_midlon.nc")
@@ -140,8 +151,43 @@ isfile(surf_file) || error("no $surf_file")
 # Rebuilt rather than read, because the distance-to-boundary and z metrics have to match what the
 # run used. Same hard-coded production grid as inspect_bathymetry.jl, and the same reasoning.
 const λ₁, λ₂, φ₁, φ₂ = 90.0, 150.0, -70.0, -45.0
-const SCALING = 6
 const Z_EXTENT, DZ_SURFACE, DZ_BOTTOM, Z_CONST = 5800, 8, 400, 250
+
+# ── Horizontal resolution ─────────────────────────────────────────────────────────────────────
+#
+# 1/SCALING degrees, so SCALING = 6 is the 1/6 deg production grid. Same resolution order as
+# `resolve_months`, and for the same reason -- the usual case should need no argument:
+#
+#   1. the 3rd positional argument or SCALING, written "S6" or "6"
+#   2. auto -- read off the output file's own x extent, which cannot disagree with the run
+#
+# The automatic path is the one to trust. A wrong SCALING does not produce a wrong answer, it
+# produces a grid of the wrong shape, and every array in this script is then the wrong size
+# against the file -- so the check after the grid is built is a real guard, not a formality.
+ds = Dataset(surf_file)
+
+"""Horizontal scaling for the rebuilt grid, and where it came from."""
+function resolve_scaling(nx_file)
+    raw = strip(length(ARGS) > 2 ? ARGS[3] : get(ENV, "SCALING", ""))
+    if !isempty(raw)
+        txt = uppercase(raw)
+        startswith(txt, "S") && (txt = txt[2:end])     # accept "S6" as well as "6"
+        v = tryparse(Int, txt)
+        (v === nothing || v <= 0) &&
+            error("bad resolution \"$raw\": write it as S6 (1/6 deg) or just 6")
+        return v, "set as \"$raw\""
+    end
+    sc = nx_file / (λ₂ - λ₁)
+    isinteger(sc) ||
+        error("the surface file is $(nx_file) cells wide over $(λ₂ - λ₁) degrees, which is " *
+              "1/$(round(sc, digits = 3)) deg and not a whole scaling -- pass it explicitly, e.g. S6")
+    return Int(sc), @sprintf("auto: %d cells over %.0f deg of longitude", nx_file, λ₂ - λ₁)
+end
+
+const SCALING, scaling_src = resolve_scaling(size(ds["T"], 1))
+const SPONGE_CELLS = round(Int, SPONGE_DEG * SCALING)
+@info @sprintf("horizontal resolution 1/%d deg [%s]; sponge %.1f deg = %d cells",
+               SCALING, scaling_src, SPONGE_DEG, SPONGE_CELLS)
 
 z = ReferenceToStretchedDiscretization(; extent = Z_EXTENT, constant_spacing = DZ_SURFACE,
                                        maximum_spacing = DZ_BOTTOM,
@@ -161,8 +207,18 @@ zc  = Array(znodes(grid, Center()))
 φc  = Array(φnodes(grid, Center()))
 MID = div(Nx, 2)
 
+# The rebuilt grid has to match the file it is about to be compared against. If it does not, every
+# mask, every distance-to-boundary and every heatmap below is shaped wrong, and some of that goes
+# wrong QUIETLY -- a (360,150) mask against a (720,300) field errors, but a transposed or
+# off-by-a-few one may not.
+let (nxf, nyf) = size(ds["T"])[1:2]
+    (nxf == Nx && nyf == Ny) || error(
+        "grid mismatch: $(RUN)_surface.nc holds $(nxf)x$(nyf) but a 1/$(SCALING) deg grid over " *
+        "$(λ₁)-$(λ₂)E, $(φ₁)-$(φ₂)N is $(Nx)x$(Ny). Pass the right resolution (e.g. S$(round(Int, nxf / (λ₂ - λ₁)))) " *
+        "or fix the domain constants above.")
+end
+
 # ------------------------------------------------------------------ the B-SOSE parent
-ds = Dataset(surf_file)
 model_times = Float64.(ds["time"][:])
 nt = length(model_times)
 run_days = maximum(model_times) / 86400
