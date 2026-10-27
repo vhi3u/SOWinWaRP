@@ -718,30 +718,52 @@ if isfile(sect_file)
             return (den == 0 ? NaN : num / den), cells
         end
 
-        # ---- gather every selected day once, so the figure can share one colour range ----
+        # ---- one panel per MONTH, built the same way section 1 builds the surface maps ----
+        #
+        # MONTHLY MEAN OF THE MODEL against the B-SOSE monthly record, not a snapshot against a
+        # month. The first version of this block took the single mid-month output and differenced
+        # it against a 30-day average, which charges a month of eddy and synoptic variability to
+        # the model -- the same mistake section 1 documents having made and removed. The section
+        # is written daily, so the monthly mean is just the mean over `groups[n]`, exactly as the
+        # surface maps do it.
         panels = NamedTuple[]
-        for t in days
-            Ts = Float64.(coalesce.(dsec["T"][1, :, :, t], NaN))
-            Ss = Float64.(coalesce.(dsec["S"][1, :, :, t], NaN))
-            kk = something(findfirst(n -> t in groups[n], sel), 1)
-            Tps = Array(interior(Tb[pos[sel[kk]]]))[MID, :, :]
-            Sps = Array(interior(Sb[pos[sel[kk]]]))[MID, :, :]
-            label = Dates.format(bsose_window_center(bc_dates[sel[kk]]), "yyyy-mm")
-            push!(panels, (t = t, label = label, dT = Ts .- Tps, dS = Ss .- Sps,
+        for (n, dd) in enumerate(bc_dates)
+            (isempty(groups[n]) || !(month(bsose_window_center(dd)) in MONTHS)) && continue
+            label = Dates.format(bsose_window_center(dd), "yyyy-mm")
+            nd = length(groups[n])
+            nd < 15 && @warn "$label has only $nd section output(s): the upper-$(round(Int, Z_TOP))m panel for it is a SNAPSHOT, not a monthly mean."
+
+            accT = accS = nothing
+            for t in groups[n]
+                A = Float64.(coalesce.(dsec["T"][1, :, :, t], NaN))
+                B = Float64.(coalesce.(dsec["S"][1, :, :, t], NaN))
+                accT = accT === nothing ? copy(A) : (accT .+= A)
+                accS = accS === nothing ? copy(B) : (accS .+= B)
+            end
+            Ts, Ss = accT ./ nd, accS ./ nd
+
+            Tps = Array(interior(Tb[pos[n]]))[MID, :, :]
+            Sps = Array(interior(Sb[pos[n]]))[MID, :, :]
+            push!(panels, (label = label, nd = nd, dT = Ts .- Tps, dS = Ss .- Sps,
                            Ts = Ts, Ss = Ss, Tps = Tps, Sps = Sps))
         end
+        isempty(panels) && @warn "no month has section output: skipping the upper-$(round(Int, Z_TOP))m comparison"
 
         println()
         println("="^100)
         @printf("3b. VERTICAL STRUCTURE, upper %.0f m, along the %.1fE section\n", Z_TOP, SECT_LON)
-        println("    Model minus B-SOSE, cos(lat)-weighted over cells wet in BOTH bathymetries.")
+        println("    MONTHLY MEAN model minus the monthly B-SOSE record, the same comparison as")
+        println("    section 1 but through the water column instead of at the surface.")
+        println("    cos(lat)-weighted over cells wet in BOTH bathymetries.")
         println("    A surface-trapped signal is forcing; one at the mixed-layer base is mixing;")
         println("    one that is uniform with depth is the water mass coming through the boundaries.")
         println("="^100)
 
         for pan in panels
             for (D, name, unit, prec) in ((pan.dT, "ΔT", "°C", 3), (pan.dS, "ΔS", "g/kg", 4))
-                @printf("\n%s  %s (%s)   [day %d]\n", pan.label, name, unit, pan.t - 1)
+                @printf("\n%s  %s (%s)   [%d model output%s, %s]\n", pan.label, name, unit,
+                        pan.nd, pan.nd == 1 ? "" : "s",
+                        pan.nd < 15 ? "PARTIAL MONTH - snapshot" : "monthly mean")
                 @printf("%-12s |", "depth (m)")
                 for (lo, hi) in lat_bands; @printf("%9s", @sprintf("%.0f-%.0fS", -lo, -hi)); end
                 @printf("%11s\n", "all")
@@ -774,7 +796,7 @@ if isfile(sect_file)
         ncol = length(panels)
         fig = Figure(size = (430 * ncol + 120, 760))
         Label(fig[0, 1:(ncol + 1)],
-              "$(RUN) — model − B-SOSE, upper $(round(Int, Z_TOP)) m at $(round(SECT_LON, digits=1))°E",
+              "$(RUN) — monthly mean model − monthly B-SOSE, upper $(round(Int, Z_TOP)) m at $(round(SECT_LON, digits=1))°E",
               fontsize = 19, font = :bold)
 
         masked(D) = (M = fill(NaN, size(D));
@@ -808,7 +830,7 @@ if isfile(sect_file)
         end
 
         Label(fig[3, 1:(ncol + 1)],
-              "Solid black: model mixed layer. Dashed: B-SOSE's. Grey is where the two bathymetries " *
+              "Solid black: model mixed layer, from the monthly mean. Dashed: B-SOSE's. Grey is where the two bathymetries " *
               "disagree or the floor is above $(round(Int, Z_TOP)) m. One colour range per row, shared across months.",
               fontsize = 11)
         fv = joinpath(OUTDIR, "$(RUN)_vertical_upper$(round(Int, Z_TOP)).png")
