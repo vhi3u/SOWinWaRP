@@ -189,6 +189,55 @@ const WINDS                = true   # BSOSE oceTAUX / oceTAUY
 const SURFACE_FLUXES       = true   # BSOSE TFLUX / SFLUX
 const PENETRATING_SHORTWAVE = true  # split oceQsw out of TFLUX into TwoColorRadiation
 const FRESHWATER_FLUX      = true   # add -S*oceFWflx to SFLUX as a virtual salt flux
+const TOTAL_HEAT_FLUX      = true   # false: TFLUX is NOT applied at all
+const BRINE_FLUX           = true   # false: SFLUX is NOT applied at all
+const SHORTWAVE_AS_HEAT_FLUX = false # true: oceQsw IS the top-cell heat flux, in TFLUX's slot
+
+# ---- the freezing buffer: the minimal sea-ice representation --------------------------------
+const FREEZING_DIAGNOSTIC = true    # always report how far below the liquidus the ocean goes
+const FREEZING_RELAXATION = false   # and optionally relax it back up
+const FREEZING_TIMESCALE  = 3days   # Losch et al. (2010) sec 2.2 relax over 3 days, not a clip
+
+# WHAT IS ACTUALLY MISSING, measured 2026-10-28 (tools/surface_flux_budget.jl section 6):
+# B-SOSE's ice-ocean heat exchange is ALREADY inside what we apply. `oceFreez` is identically
+# zero over this window -- i156 ran allowFreezing = false, so the exchange comes from its real
+# sea-ice model and lands in oceQnet -- and TFLUX - (oceQnet + oceFreez) is 0.2% of mean|TFLUX|.
+# SFLUX - oceSflux is exactly zero. So there is no missing heat and no relaxation term hiding in
+# the forcing.
+#
+# What IS missing is the STATE DEPENDENCE. B-SOSE's flux was computed against B-SOSE's surface
+# temperature; once ours drifts below the freezing point, nothing pulls it back, and the ocean
+# makes water that cannot exist. FREEZING_RELAXATION puts that one feedback back.
+#
+# ONE-SIDED on purpose: it only warms water already below the liquidus. The melting side is
+# carried by TFLUX and adding it here would double-count.
+#
+# NON-CONSERVATIVE, and worth saying plainly: heat is added with no matching brine, because the
+# brine is already supplied by SFLUX/oceFWflx. The defensible reading is that this returns our
+# ocean to the trajectory B-SOSE's fluxes assumed, not that it closes a budget.
+#
+# This is NOT a prognostic sea-ice model. It has no ice, no albedo, no drift, no freshwater
+# capacitor. NumericalEarth calls the same idea "the minimal possible sea ice representation".
+# A real one needs ClimaSeaIce plus an atmosphere, because B-SOSE's fluxes are POST-ice and our
+# own ice on top would double-count every one of them.
+
+# TOTAL_HEAT_FLUX and BRINE_FLUX select the BASE term; PENETRATING_SHORTWAVE and FRESHWATER_FLUX
+# select the modifier. The four together span every combination of B-SOSE's surface files:
+#
+#   TOTAL_HEAT  PEN_SW  surface heat forcing          BRINE  FRESHWATER  surface salt forcing
+#   true        false   TFLUX, all in the top cell    true   false       SFLUX
+#   true        true    TFLUX - oceQsw at the top,    true   true        SFLUX - S*oceFWflx
+#                       oceQsw through the column     false  true        -S*oceFWflx
+#   false       true    oceQsw through the column,    false  false       nothing (warned)
+#                       nothing at the top
+#   false       false   nothing (warned)
+#
+# With TOTAL_HEAT_FLUX = false the shortwave subtraction is SKIPPED inside
+# `bsose_surface_tracer_fluxes` -- subtracting oceQsw from a zeroed base would turn the one heat
+# source into a sink of the same size. Note that oceQsw alone is a ONE-SIDED heat source: it
+# averages about +120 W/m2 over Jun-Feb at 55-60S against TFLUX's near-zero annual mean, which
+# is roughly +6 degC in the upper 100 m over an 8-month run, concentrated near the surface.
+# That is a deliberate diagnostic, not a physical configuration.
 const REFERENCE_SALINITY   = 34.0   # the S in that conversion, g/kg
 
 # FRESHWATER_FLUX IS NOT OPTIONAL WHEN SURFACE_FLUXES IS ON. B-SOSE's SFLUX matches salt-CONTENT
@@ -526,6 +575,8 @@ if OBCS
         winds=WINDS, surface_fluxes=SURFACE_FLUXES,
         penetrating_shortwave=SURFACE_FLUXES && PENETRATING_SHORTWAVE,
         freshwater_flux=SURFACE_FLUXES && FRESHWATER_FLUX,
+        total_heat_flux=TOTAL_HEAT_FLUX, brine_flux=BRINE_FLUX,
+        shortwave_as_heat_flux=SURFACE_FLUXES && SHORTWAVE_AS_HEAT_FLUX,
         reference_salinity=REFERENCE_SALINITY, scheme=obc_scheme,
         tangential_bc_kind=TANGENTIAL_BC, tracer_scheme=TRACER_SCHEME,
         radiation_inflow_timescale=RADIATION_TAU_IN,
@@ -661,6 +712,26 @@ end
 # The same pairing check for the freshwater term. Unlike the shortwave it needs no companion
 # construction -- it is folded into the salt flux inside `bsose_surface_tracer_fluxes` -- so the
 # only way to get it wrong from here is to ask for it without the flux it modifies.
+if SHORTWAVE_AS_HEAT_FLUX && TOTAL_HEAT_FLUX
+    error("""SHORTWAVE_AS_HEAT_FLUX puts oceQsw in the top cell, but TFLUX already contains \
+             oceQsw -- together they count the sunlight twice. Set TOTAL_HEAT_FLUX = false to \
+             use oceQsw INSTEAD of TFLUX, or PENETRATING_SHORTWAVE = true to split it out.""")
+end
+if SHORTWAVE_AS_HEAT_FLUX && PENETRATING_SHORTWAVE
+    error("""SHORTWAVE_AS_HEAT_FLUX and PENETRATING_SHORTWAVE are two different ways to deliver \
+             the same field. Pick one: the first puts oceQsw in the top cell, the second \
+             distributes it through the column.""")
+end
+
+if SURFACE_FLUXES && !TOTAL_HEAT_FLUX && !PENETRATING_SHORTWAVE && !SHORTWAVE_AS_HEAT_FLUX
+    @warn """TOTAL_HEAT_FLUX and PENETRATING_SHORTWAVE are both false while SURFACE_FLUXES is \
+             true: there is NO surface heat forcing at all. The top heat flux is zero."""
+end
+if SURFACE_FLUXES && !BRINE_FLUX && !FRESHWATER_FLUX
+    @warn """BRINE_FLUX and FRESHWATER_FLUX are both false while SURFACE_FLUXES is true: there \
+             is NO surface salinity forcing at all. The top salt flux is zero."""
+end
+
 if FRESHWATER_FLUX && !SURFACE_FLUXES
     @warn """FRESHWATER_FLUX has no effect while SURFACE_FLUXES is false: oceFWflx is added to \
              SFLUX, and with surface fluxes off there is no SFLUX to add it to."""
@@ -800,6 +871,41 @@ else
     @info "Penetrating shortwave is OFF: the whole surface heat flux lands in the top cell."
 end
 
+# ---- the freezing buffer ---------------------------------------------------------------------
+# Linear liquidus, the same form as ClimaSeaIce's `LinearLiquidus`:
+#     Tf = -0.054 * S    [degC, S in g/kg]   ->   -1.86 degC at S = 34.4
+# Written out rather than imported because ClimaSeaIce is a dependency of NumericalEarth, not of
+# this project, and adding it to Project.toml to get one scalar function is not worth it. It
+# differs from TEOS-10's freezing point by a few hundredths of a degree -- far below the ~0.5
+# degC bias this exists to diagnose.
+@inline freezing_point(S) = -0.054f0 * S
+
+# Counts cells below the liquidus and reports the worst excursion. Immersed cells are included:
+# `fill_bathymetry_gaps!` leaves plausible T and S there, so they are not NaN and cannot be
+# excluded cheaply. Read the count as an upper bound; the WORST value is the number that matters.
+function report_freezing(sim)
+    Ti = interior(ocean.model.tracers.T)
+    Si = interior(ocean.model.tracers.S)
+    d  = Ti .- freezing_point.(Si)
+    worst = minimum(d)
+    nbelow = count(<(0), d)
+    if nbelow > 0
+        @info @sprintf("  [freezing] %d cells below the liquidus, worst %.3f degC below",
+                       nbelow, -worst)
+    end
+    return nothing
+end
+
+# max(T, T + a(Tf - T)) is a one-sided relaxation in one branch-free expression: when Tf > T the
+# relaxed value wins, when Tf < T the original does. Broadcast, so it runs on the GPU as is.
+function relax_to_freezing!(sim)
+    Ti = interior(ocean.model.tracers.T)
+    Si = interior(ocean.model.tracers.S)
+    a  = convert(eltype(Ti), min(1.0, sim.Δt / FREEZING_TIMESCALE))
+    @. Ti = max(Ti, Ti + a * (freezing_point(Si) - Ti))
+    return nothing
+end
+
 # Safety callback: clamp salinity/temperature to physically valid ranges before each time step.
 # Operates on parent() to cover all cells including halos and immersed cells.
 # Prevents DomainError in TEOS10's sqrt(S) from any numerical noise that accumulates
@@ -813,6 +919,19 @@ end
 
 # output and progress interval (daily)
 output_interval = 1days
+
+# Registered here, not beside their definitions: the diagnostic schedules on
+# `output_interval`, which is defined on the line above.
+if FREEZING_RELAXATION
+    simulation.callbacks[:freezing] = Callback(relax_to_freezing!, IterationInterval(1))
+    @info @sprintf("Freezing relaxation is ON: T relaxed up to the liquidus over %s (Losch et al. 2010).",
+                   prettytime(FREEZING_TIMESCALE))
+end
+if FREEZING_DIAGNOSTIC
+    simulation.callbacks[:freezing_report] = Callback(report_freezing, TimeInterval(output_interval))
+    @info "Freezing diagnostic is ON: sub-liquidus cells reported at the progress interval."
+end
+
 
 # Wall-clock reference for the coupled progress messenger below (hoisted out of the branch:
 # a `const` inside a conditional is asking for trouble).

@@ -1444,6 +1444,9 @@ function bsose_surface_tracer_fluxes(grid;
     cₚ=3991.86795711963,   # TEOS-10 reference heat capacity, J kg⁻¹ °C⁻¹
     subtract_shortwave=false,
     add_freshwater_flux=false,
+    include_total_heat=true,
+    include_brine=true,
+    add_shortwave_flux=false,
     reference_salinity=34.0,
     reference_date=nothing)
 
@@ -1463,13 +1466,56 @@ function bsose_surface_tracer_fluxes(grid;
     top_T_slice = boundary_slice_time_series(heat_fts, :top; time_offset)
     top_S_slice = boundary_slice_time_series(salt_fts, :top; time_offset)
 
+    # SELECTING WHICH BASE TERM IS USED AT ALL. `include_total_heat = false` means TFLUX is not
+    # applied and oceQsw -- through `bsose_penetrating_shortwave` -- is the only heat input;
+    # `include_brine = false` means SFLUX is not applied and oceFWflx is the only salt forcing.
+    # Both are zeroed HERE, before the modifiers below, and the shortwave subtraction is skipped
+    # when the base is gone: subtracting oceQsw from zero would turn the one heat source we want
+    # into a heat SINK of the same size. Zeroing happens on the SLICED series for the same reason
+    # every other write here does -- the dataset-backed one holds two snapshots and reloads them.
+    if !include_total_heat
+        for t in 1:length(top_T_slice.times)
+            parent(top_T_slice[t]) .= 0
+        end
+        @info " -> Surface heat flux: TFLUX EXCLUDED, the top heat flux is zero"
+    end
+    if !include_brine
+        for t in 1:length(top_S_slice.times)
+            parent(top_S_slice[t]) .= 0
+        end
+        @info " -> Surface salt flux: SFLUX (sea-ice brine) EXCLUDED"
+    end
+
+    # `add_shortwave_flux` puts oceQsw into the TOP CELL, in the slot TFLUX would have used.
+    # Pair it with `include_total_heat = false` for a literal "oceQsw instead of TFLUX": same
+    # delivery, same code path, different field, so the only thing that changes against a
+    # TFLUX run is the field itself. That is a cleaner A/B than routing oceQsw through
+    # `bsose_penetrating_shortwave`, which changes the field AND the delivery at once.
+    # With `include_total_heat = true` this would count the sunlight twice, so it is refused.
+    if add_shortwave_flux
+        include_total_heat && error("add_shortwave_flux with include_total_heat = true would " *
+                                    "count oceQsw twice: TFLUX already contains it. Set " *
+                                    "include_total_heat = false, or use subtract_shortwave.")
+        subtract_shortwave && error("add_shortwave_flux and subtract_shortwave are opposites; " *
+                                    "pick one.")
+        sw_meta = Metadata(:surface_shortwave; dataset, dates, region)
+        sw_fts  = resident_fts(sw_meta, grid)
+        sw_top  = boundary_slice_time_series(sw_fts, :top; time_offset)
+        for t in 1:length(top_T_slice.times)
+            parent(top_T_slice[t]) .+= parent(sw_top[t])
+        end
+        Qlo, Qbar, Qhi = series_statistics(top_T_slice)
+        @info @sprintf(" -> Surface heat flux is oceQsw ALONE, in the top cell: mean %+.1f W m⁻², range %+.1f to %+.1f",
+            Qbar, Qlo, Qhi)
+    end
+
     # With `subtract_shortwave`, what stays at the surface is the NON-SOLAR part of the heat
     # flux. TFLUX is the total and already contains the solar part, so handing the whole of it
     # to the top boundary while `bsose_penetrating_shortwave` also distributes oceQsw through
     # the column would count the sunlight twice. The two fields share the MITgcm ">0 increases
     # theta" convention, so the remainder is a plain difference, taken before the sign flip
     # below and on the sliced series for the reason given there.
-    if subtract_shortwave
+    if subtract_shortwave && include_total_heat
         shortwave_metadata = Metadata(:surface_shortwave; dataset, dates, region)
         shortwave_fts = resident_fts(shortwave_metadata, grid)
         top_Q_slice = boundary_slice_time_series(shortwave_fts, :top; time_offset)
@@ -1519,14 +1565,18 @@ function bsose_surface_tracer_fluxes(grid;
         end
 
         Slo, Sbar, Shi = series_statistics(top_S_slice)
-        @info @sprintf(" -> Total surface salt flux (SFLUX - %.1f*oceFWflx): mean %+.3e g m⁻² s⁻¹, range %+.3e to %+.3e",
-            reference_salinity, Sbar, Slo, Shi)
-    else
+        @info @sprintf(" -> Total surface salt flux (%s%.1f*oceFWflx): mean %+.3e g m⁻² s⁻¹, range %+.3e to %+.3e",
+            include_brine ? "SFLUX - " : "-", reference_salinity, Sbar, Slo, Shi)
+    elseif include_brine
         @warn """Surface salinity is being forced with SFLUX alone, which is sea-ice brine and \
                  almost nothing else -- a domain-mean ΔS of -0.006 g/kg over two years, against \
                  0.47 m/yr of net freshwater that is going unapplied. Pass \
                  `add_freshwater_flux = true` unless you are deliberately reproducing an \
                  earlier run."""
+    else
+        @warn """Surface salinity has NO forcing at all: SFLUX is excluded by \
+                 `include_brine = false` and oceFWflx is not being added. The top salt flux is \
+                 identically zero."""
     end
 
     # BSOSE follows the MITgcm convention, stated in the files themselves: TFLUX "> 0
@@ -2122,6 +2172,9 @@ function bsose_open_boundary_conditions(grid;
     surface_fluxes=false,
     penetrating_shortwave=false,
     freshwater_flux=false,
+    total_heat_flux=true,
+    brine_flux=true,
+    shortwave_as_heat_flux=false,
     reference_salinity=34.0,
     tangential_bc_kind=:gradient,
     tracer_scheme=:same,
@@ -2508,7 +2561,10 @@ function bsose_open_boundary_conditions(grid;
     if surface_fluxes === true
         tracer_flux_bcs = bsose_surface_tracer_fluxes(grid; dataset, dates, ρ₀, reference_date,
             subtract_shortwave=penetrating_shortwave,
-            add_freshwater_flux=freshwater_flux, reference_salinity)
+            add_freshwater_flux=freshwater_flux,
+            include_total_heat=total_heat_flux, include_brine=brine_flux,
+            add_shortwave_flux=shortwave_as_heat_flux,
+            reference_salinity)
         top_T_bc = tracer_flux_bcs.T
         top_S_bc = tracer_flux_bcs.S
     elseif surface_fluxes isa NamedTuple

@@ -8,10 +8,10 @@
 # them side by side so the question "what does THIS term do" is answered by reading across a row
 # instead of flipping between files.
 #
-#   surface_tests_dT.png     rows = arms, cols = months. Monthly mean model T minus the monthly
-#   surface_tests_dS.png     B-SOSE record, at the surface. One colour range for the whole grid.
-#   surface_tests_midlon_T.png   rows = arms PLUS B-SOSE, cols = months. The 119.9E section
-#   surface_tests_midlon_S.png   itself, not a difference, so the parent is directly comparable.
+#   surface_tests_T.png          Top row: B-SOSE's own monthly mean. Every row below: that arm
+#   surface_tests_S.png          minus B-SOSE. Columns are months, one shared diverging scale
+#   surface_tests_midlon_T.png   across all the difference rows so arms are comparable to each
+#   surface_tests_midlon_S.png   other. Surface and the 119.9E section, for T and for S.
 #
 # Plus a table of domain-mean and RMS bias per arm per month. Read the table first: the mean says
 # whether an arm is biased, the RMS says whether it is merely in the wrong place. An arm whose
@@ -37,7 +37,7 @@ include(joinpath(@__DIR__, "..", "src", "setup_bsose.jl"))
 const λ₁, λ₂, φ₁, φ₂ = 90.0, 150.0, -70.0, -45.0
 const Z_EXTENT, DZ_SURFACE, DZ_BOTTOM, Z_CONST = 5800, 8, 400, 250
 
-const RUNS = split(get(ENV, "RUNS", "none,wind,wind_tsflux,wind_fw,wind_fw_sw"), ",")
+const RUNS = split(get(ENV, "RUNS", "none,wind,wind_tsflux,wind_fw,wind_fw_sw,wind_qsw_fw,wind_fw_sw_freeze"), ",")
 const DIR    = get(ENV, "DIR", "surface_tests")
 const OUTDIR = get(ENV, "OUTDIR", joinpath(@__DIR__, "bsose_comparison"))
 const MONTHS = parse.(Int, split(get(ENV, "MONTHS", "6,7,8,9,10,11,12,1"), ","))
@@ -185,58 +185,82 @@ for (fld, name, unit, surf, par) in (("T", "ΔT", "°C", surfT, parT),
 end
 
 # ── figures ───────────────────────────────────────────────────────────────────────────────────
-"""Grid of difference maps: one row per arm, one column per month, one shared colour range."""
-function diff_figure(surf, par, name, unit, fname)
-    Ds = Dict(r => [let D = surf[r][k] .- par[k]; D[.!wetmask[k]] .= NaN; D end for k in 1:nm]
-              for r in present)
-    fin = filter(isfinite, vcat([vcat(vec.(Ds[r])...) for r in present]...))
-    lim = isempty(fin) ? 1.0 : quantile(abs.(fin), 0.99)
+#
+# ONE REFERENCE ROW, THEN ONE DIFFERENCE ROW PER ARM. Showing every arm's absolute field as well
+# would double the panel count for nothing: at any sensible colour scale the arms are visually
+# identical to each other and to B-SOSE -- the whole signal is in the differences. So B-SOSE's
+# own field goes on top, once, to say what the water actually looks like, and everything below
+# it is model minus B-SOSE on a single shared diverging scale so the rows are comparable.
+#
+# Same function for the surface and the section; only the axes and the masks differ.
 
-    fig = Figure(size = (230 * nm + 140, 210 * length(present) + 90))
-    Label(fig[0, 1:(nm + 1)], "$name ($unit): monthly mean model − monthly B-SOSE, surface",
+"""
+    ladder_figure(ref, perarm, arms, mask, name, unit, refcmap, xs, ys, xlab, ylab, fname; ylim)
+
+`ref` is B-SOSE's own monthly field, `perarm[arm]` the model's. Both are vectors of one matrix
+per month. Row 1 is `ref` on its own colour range; rows 2+ are `perarm[arm] - ref`, all sharing
+one symmetric range taken from the 99th percentile so a single outlier cannot flatten the rest.
+"""
+function ladder_figure(ref, perarm, arms, mask, name, unit, refcmap, xs, ys, xlab, ylab, fname;
+                       ylim = nothing)
+    isempty(arms) && (@warn "no arm has data for $fname -- skipping"; return)
+
+    masked(A, k) = (B = copy(A); B[.!mask[k]] .= NaN; B)
+    R = [masked(ref[k], k) for k in 1:nm]
+    D = Dict(r => [masked(perarm[r][k] .- ref[k], k) for k in 1:nm] for r in arms)
+
+    rfin = filter(isfinite, vcat(vec.(R)...))
+    rrange = isempty(rfin) ? (0.0, 1.0) : (quantile(rfin, 0.01), quantile(rfin, 0.99))
+    dfin = filter(isfinite, vcat([vcat(vec.(D[r])...) for r in arms]...))
+    lim = isempty(dfin) ? 1.0 : max(quantile(abs.(dfin), 0.99), 1e-12)
+
+    nrow = length(arms) + 1
+    fig = Figure(size = (230 * nm + 190, 195 * nrow + 150))
+    Label(fig[0, 1:(nm + 1)],
+          "$name — top row is B-SOSE's own monthly mean; below, each arm minus B-SOSE",
           fontsize = 18, font = :bold)
-    local hm
-    for (i, r) in enumerate(present), k in 1:nm
-        ax = Axis(fig[i, k], title = i == 1 ? mlabels[k] : "",
-                  ylabel = k == 1 ? r : "", xticksvisible = false, yticksvisible = false,
-                  xticklabelsvisible = false, yticklabelsvisible = false)
-        hm = heatmap!(ax, λc, φc, Ds[r][k], colormap = :balance,
-                      colorrange = (-lim, lim), nan_color = :gray85)
+
+    local hmr, hmd
+    for k in 1:nm
+        ax = Axis(fig[1, k], title = mlabels[k], ylabel = k == 1 ? "B-SOSE" : "",
+                  xticksvisible = false, xticklabelsvisible = false,
+                  yticklabelsvisible = k == 1)
+        hmr = heatmap!(ax, xs, ys, R[k], colormap = refcmap, colorrange = rrange,
+                       nan_color = :gray85)
+        ylim === nothing || ylims!(ax, ylim...)
     end
-    Colorbar(fig[1:length(present), nm + 1], hm, label = unit)
+    Colorbar(fig[1, nm + 1], hmr, label = unit)
+
+    for (i, r) in enumerate(arms), k in 1:nm
+        last_row = i == length(arms)
+        ax = Axis(fig[i + 1, k], ylabel = k == 1 ? r : "",
+                  xlabel = last_row ? xlab : "",
+                  xticksvisible = last_row, xticklabelsvisible = last_row,
+                  yticklabelsvisible = k == 1)
+        hmd = heatmap!(ax, xs, ys, D[r][k], colormap = :balance, colorrange = (-lim, lim),
+                       nan_color = :gray85)
+        ylim === nothing || ylims!(ax, ylim...)
+    end
+    Colorbar(fig[2:nrow, nm + 1], hmd, label = "Δ $unit")
+
     f = joinpath(OUTDIR, fname); save(f, fig); @info "wrote $f"
 end
 
-diff_figure(surfT, parT, "ΔT", "°C",   "surface_tests_dT.png")
-diff_figure(surfS, parS, "ΔS", "g/kg", "surface_tests_dS.png")
+# the section needs its own per-cell wet mask: different shape, different bathymetry overlap
+sect_arms = [r for r in present if !isempty(sectT[r])]
+sectmask = isempty(sect_arms) ? Vector{BitMatrix}() :
+           [isfinite.(parTsec[k]) .& isfinite.(sectT[first(sect_arms)][k]) for k in 1:nm]
 
-"""Section grid: one row per arm PLUS a B-SOSE row, one column per month. Values, not differences."""
-function section_figure(sect, parsec, name, unit, cmap, fname)
-    rows = [r for r in present if !isempty(sect[r])]
-    isempty(rows) && (@warn "no _midlon.nc for any arm -- skipping $fname"; return)
-    all_ = vcat([vcat(vec.(sect[r])...) for r in rows]..., vcat(vec.(parsec)...))
-    fin = filter(isfinite, all_)
-    cr = isempty(fin) ? (0.0, 1.0) : (quantile(fin, 0.01), quantile(fin, 0.99))
-
-    nr = length(rows) + 1
-    fig = Figure(size = (230 * nm + 140, 200 * nr + 90))
-    Label(fig[0, 1:(nm + 1)], "$name ($unit) at $(round(λ₁ + (MID - 0.5) / SCALING, digits = 1))°E, " *
-          "monthly mean; bottom row is B-SOSE", fontsize = 18, font = :bold)
-    local hm
-    for (i, r) in enumerate(vcat(rows, "B-SOSE")), k in 1:nm
-        A = r == "B-SOSE" ? parsec[k] : sect[r][k]
-        ax = Axis(fig[i, k], title = i == 1 ? mlabels[k] : "",
-                  ylabel = k == 1 ? r : "", xticksvisible = false,
-                  xticklabelsvisible = false, yticklabelsvisible = k == 1)
-        hm = heatmap!(ax, φc, zc, A, colormap = cmap, colorrange = cr, nan_color = :gray85)
-        ylims!(ax, -700, 0)
-    end
-    Colorbar(fig[1:nr, nm + 1], hm, label = unit)
-    f = joinpath(OUTDIR, fname); save(f, fig); @info "wrote $f"
-end
-
-section_figure(sectT, parTsec, "T", "°C",   :thermal, "surface_tests_midlon_T.png")
-section_figure(sectS, parSsec, "S", "g/kg", :haline,  "surface_tests_midlon_S.png")
+ladder_figure(parT, surfT, present, wetmask, "T (°C), surface", "°C", :thermal,
+              λc, φc, "longitude (°E)", "latitude (°N)", "surface_tests_T.png")
+ladder_figure(parS, surfS, present, wetmask, "S (g/kg), surface", "g/kg", :haline,
+              λc, φc, "longitude (°E)", "latitude (°N)", "surface_tests_S.png")
+ladder_figure(parTsec, sectT, sect_arms, sectmask,
+              "T (°C) at $(round(λ₁ + (MID - 0.5) / SCALING, digits = 1))°E", "°C", :thermal,
+              φc, zc, "latitude (°N)", "z (m)", "surface_tests_midlon_T.png"; ylim = (-700, 0))
+ladder_figure(parSsec, sectS, sect_arms, sectmask,
+              "S (g/kg) at $(round(λ₁ + (MID - 0.5) / SCALING, digits = 1))°E", "g/kg", :haline,
+              φc, zc, "latitude (°N)", "z (m)", "surface_tests_midlon_S.png"; ylim = (-700, 0))
 
 println("\nReading this:")
 println("  * `none` is the control. Any drift it shows is the boundaries and the sponge, not the")
