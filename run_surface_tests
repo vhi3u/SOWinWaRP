@@ -9,6 +9,9 @@
 #     ./run_surface_tests --no-analysis   # model only, skip the per-run diagnostics
 #     ./run_surface_tests --no-summary    # skip the cross-arm job that runs after them all
 #
+# Each arm tees its full output to surface_tests/out/<arm>.log as well as the SLURM .out file,
+# so a running arm can be watched with `tail -f` and a failed one read without hunting job ids.
+#
 # AFTER EACH ARM COMPLETES it runs `tools/compare_bsose.jl` on its own output, so each job leaves
 # behind that arm's monthly surface differences against B-SOSE, its mixed-layer and Winter Water
 # tables, the upper-200 m vertical structure and the drift table -- without waiting for the other
@@ -120,7 +123,7 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-mkdir -p surface_tests logs
+mkdir -p surface_tests surface_tests/out logs
 
 # GATE. A global used before it is defined parses fine, lints fine, and dies with UndefVarError
 # at job start -- after the queue wait, the module load and the bathymetry build. Two submitted
@@ -190,6 +193,15 @@ for entry in "${CONFIGS[@]}"; do
 
     printf '%-14s %-8s %s\n' "$name" "$walltime" "$overrides"
 
+    # The job pipes julia through `tee` so the run is readable live in
+    # surface_tests/out/<arm>.log as well as in the SLURM .out file. `set -o pipefail` inside
+    # the job is what keeps that honest: without it the pipeline would report tee's exit status,
+    # every arm would look like it succeeded, and the RESULT line would lie.
+    #
+    # This note lives OUT here because the heredoc below is unquoted: backticks in it are
+    # command substitution and run at submit time. Putting this same text inside it made bash
+    # try to execute `| tee` and mangled the generated script -- which is what the header of
+    # this file already warned about, twice.
     job="surface_tests/job_${name}.sh"
     cat > "$job" <<EOF
 #!/bin/bash
@@ -217,7 +229,8 @@ unset LD_LIBRARY_PATH
 export JULIA_CPU_TARGET=\${JULIA_CPU_TARGET:-generic}
 export JULIA_PKGIMAGES=\${JULIA_PKGIMAGES:-no}
 
-if stdbuf -o0 -e0 julia --project=. ${variant}; then
+mkdir -p surface_tests/out
+if stdbuf -o0 -e0 julia --project=. ${variant} 2>&1 | tee surface_tests/out/${name}.log; then
     echo "RESULT ${name}: completed ${START} to ${STOP}"
 
     if [ "${ANALYSE}" = "1" ]; then
@@ -227,7 +240,7 @@ if stdbuf -o0 -e0 julia --project=. ${variant}; then
         export DIR=surface_tests
         export OUTDIR=surface_tests/figs
         export MONTHS=${MONTHS}
-        julia --project=. tools/compare_bsose.jl "${name}" 8M S6 || echo "NOTE ${name}: diagnostics failed; the RUN itself completed (see RESULT above)"
+        julia --project=. tools/compare_bsose.jl "${name}" 8M S6 2>&1 | tee -a surface_tests/out/${name}.log || echo "NOTE ${name}: diagnostics failed; the RUN itself completed (see RESULT above)"
     fi
 else
     echo "RESULT ${name}: FAILED exit \$? -- see above for where it diverged"
@@ -278,7 +291,8 @@ export DIR=surface_tests
 export OUTDIR=surface_tests/figs
 export RUNS=${runs}
 export MONTHS=${MONTHS}
-julia --project=. tools/compare_surface_tests.jl
+mkdir -p surface_tests/out
+julia --project=. tools/compare_surface_tests.jl 2>&1 | tee surface_tests/out/summary.log
 
 echo " Finished  : \$(date)"
 EOF
@@ -290,6 +304,7 @@ fi
 if [ $LIST_ONLY -eq 0 ]; then
     echo
     echo "Submitted. Watch with:  squeue -u \$USER"
+    echo "Watch a run live:       tail -f surface_tests/out/<arm>.log"
     echo "Collect failures:       grep -h '^RESULT' logs/sfc_*.out"
     echo "Figures land in:        surface_tests/figs"
 fi

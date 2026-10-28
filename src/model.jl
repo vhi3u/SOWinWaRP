@@ -59,7 +59,10 @@ const END_DATE   = DateTime("2015-02-01")   # 8 months. The goal is 2 years: two
 # BEFORE EXTENDING, three things an 8-month run does not expose:
 #   1. `target_transport` is materialised once, so the pin becomes a 2-year mean -- and north
 #      swings -31 to +16 Sv over a year. `tools/face_transports.jl` measures it, no GPU.
-#   2. No restart path: CHECKPOINTS writes state, nothing passes `pickup=`.
+#   2. No restart path at all. Checkpointing was removed 2026-10-28 -- it had no `pickup=` to
+#      pair with, so it only ever proved the state existed, and a bare "checkpoint" prefix made
+#      every concurrent arm of a sweep race for one JLD2 file (three died that way). A 2-year
+#      run that dies at month 20 loses everything; write a real restart before relying on one.
 #   3. `time_indices_in_memory` unset (defaults to 2). With ~26 records that is the regime where
 #      stale duplicated snapshots were measured: 12 requested, 9 distinct.
 
@@ -330,11 +333,6 @@ const BSOSE_FRESHWATER = FRESHWATER_FLUX && ATMOSPHERE === :none
 # ---- physics and run control ---------------------------------------------------------------
 const CLOSURE_CONFIG = "ito"   # ito | bsose | henyey_gm | biharmonic | none (built below)
 const STOP_ITERATION = Inf     # cut the run short for a smoke test
-const CHECKPOINTS    = true    # write restart checkpoints every 30 days
-# ON for the 8-month run. NOTE: `model.jl` can WRITE checkpoints but has no pickup path -- there
-# is no `set!(model, "checkpoint...")` or `pickup=` anywhere in this file. So a checkpoint is
-# currently insurance that the state EXISTS, not a restart we can perform without writing that
-# code first. Worth closing before relying on it.
 const BOUNDARY_DIAGNOSTICS = true  # free-surface file, per-face transport log, 30-min eta watch
 
 # ---- eddy kinetic energy ----------------------------------------------------------------------
@@ -1257,17 +1255,6 @@ if BOUNDARY_DIAGNOSTICS
     simulation.callbacks[:open_boundaries] = Callback(log_open_boundaries, TimeInterval(output_interval))
 end
 
-# checkpointing
-
-if CHECKPOINTS
-    simulation.output_writers[:checkpointer] = Checkpointer(
-        ocean.model,
-        schedule=TimeInterval(30days),
-        prefix="checkpoint",
-        overwrite_files=true
-    )
-end
-
 @info "--- Model Setup Complete ---"
 @info "Grid Resolution: Nx=$(grid.Nx), Ny=$(grid.Ny), Nz=$(grid.Nz)"
 @info "Dataset: B-SOSE iteration $BSOSE_ITERATION"
@@ -1280,8 +1267,7 @@ end
 @info "Diagnostics: boundary $BOUNDARY_DIAGNOSTICS | " *
       "EKE $(EKE_DIAGNOSTICS ? "$(round(Int, EKE_WINDOW / 1days))-day mean, " *
                                (EKE_FULL_DEPTH ? "full depth" : "surface") *
-                               (EKE_TRACER_FLUXES ? ", with tracer fluxes" : "") : "off") | " *
-      "checkpoints $CHECKPOINTS"
+                               (EKE_TRACER_FLUXES ? ", with tracer fluxes" : "") : "off")"
 
 # red button 
 
