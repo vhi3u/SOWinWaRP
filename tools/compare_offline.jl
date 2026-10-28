@@ -37,6 +37,11 @@
 #     OUTDIR  figures                     (default: surface_tests/figs)
 #     START   first day of the run        (default: 2014-06-01)
 #     Z_TOP   section depth, m            (default: 200)
+#     EXCLUDE arms to leave out            (default: none. One arm whose difference is an order
+#                                           of magnitude larger than the rest sets the ladder's
+#                                           shared colour range and washes every other row out;
+#                                           dropping it here rescales the rest.)
+#     TAG     suffix for the filenames      (default: none, so a second run overwrites the first)
 #     SCALE   shared | panel               (default: shared -- one colour range across months;
 #                                           `panel` gives each month its own, for when one
 #                                           month is so far off that it whites out the rest)
@@ -63,6 +68,12 @@ const START  = DateTime(get(ENV, "START", "2014-06-01"))
 const Z_TOP  = parse(Float64, get(ENV, "Z_TOP", "200"))
 const SCALE  = get(ENV, "SCALE", "shared")
 SCALE in ("shared", "panel") || error("SCALE must be \"shared\" or \"panel\", got \"$SCALE\"")
+# Arms to leave out, and a suffix for the filenames so a trimmed run does not overwrite the
+# full one. The ladder's colour range is taken from the arms it actually draws, so dropping a
+# runaway arm rescales every remaining row automatically -- that is the point of EXCLUDE.
+const EXCLUDE = filter(!isempty, strip.(split(get(ENV, "EXCLUDE", ""), ",")))
+const TAG     = get(ENV, "TAG", "")
+outname(base) = isempty(TAG) ? base : replace(base, ".png" => "_$(TAG).png")
 mkpath(OUTDIR)
 
 # ── which arms are on disk, and how far each one got ──────────────────────────────────────────
@@ -77,11 +88,17 @@ function record_count(path)
     return n
 end
 
-present = [r for r in RUNS if isfile(surface_path(r))]
+for e in EXCLUDE
+    e in RUNS || @warn "EXCLUDE names `$e`, which is not in RUNS -- check the spelling"
+end
+present = [r for r in RUNS if !(r in EXCLUDE) && isfile(surface_path(r))]
 isempty(present) && error("no $(DIR)/<arm>_surface.nc for any of $(join(RUNS, ", "))")
 for r in RUNS
+    r in EXCLUDE && continue
     r in present || @warn "$r has no $(surface_path(r)) -- it is not in this comparison"
 end
+isempty(EXCLUDE) || @info "excluded by request: $(join(EXCLUDE, ", ")) " *
+                          "(the colour ranges below are set by the remaining arms only)"
 
 n_surface = Dict(r => record_count(surface_path(r)) for r in present)
 n_section = Dict(r => record_count(section_path(r)) for r in present)
@@ -312,7 +329,7 @@ function diff_figure(arm, dT, dS, xs, ys, xlab, ylab, fname; ylim = nothing, whe
           (SCALE == "panel" ? "Colour range is PER PANEL — compare shapes, not amplitudes." :
                               "Colour range is shared across months (SCALE=panel to unshare)."),
           fontsize = 11, justification = :center)
-    f = joinpath(OUTDIR, fname); save(f, fig); @info "wrote $f"
+    f = joinpath(OUTDIR, outname(fname)); save(f, fig); @info "wrote $f"
 end
 
 for r in present
@@ -346,6 +363,10 @@ function ladder_figure(ref, perarm, arms, mask, name, unit, refcmap, xs, ys, xla
     rrange = isempty(rfin) ? (0.0, 1.0) : (quantile(rfin, 0.01), quantile(rfin, 0.99))
     lim = sym_range([D[r][k] for r in arms for k in 1:nm])
 
+    # Each arm's own magnitude, printed on its row. Without it a row that is pale because the
+    # arm is good and a row that is pale because another arm set the scale look identical.
+    own = Dict(r => sym_range(D[r]) for r in arms)
+
     nrow = length(arms) + 1
     fig = Figure(size = (230 * nm + 190, 195 * nrow + 150))
     Label(fig[0, 1:(nm + 1)],
@@ -365,7 +386,8 @@ function ladder_figure(ref, perarm, arms, mask, name, unit, refcmap, xs, ys, xla
 
     for (i, r) in enumerate(arms), k in 1:nm
         last_row = i == length(arms)
-        ax = Axis(fig[i + 1, k], ylabel = k == 1 ? r : "",
+        ax = Axis(fig[i + 1, k],
+                  ylabel = k == 1 ? @sprintf("%s\n±%.3g", r, own[r]) : "",
                   xlabel = last_row ? xlab : "",
                   xticksvisible = last_row, xticklabelsvisible = last_row,
                   yticklabelsvisible = k == 1)
@@ -375,7 +397,13 @@ function ladder_figure(ref, perarm, arms, mask, name, unit, refcmap, xs, ys, xla
     end
     Colorbar(fig[2:nrow, nm + 1], hmd, label = "Δ $unit")
 
-    f = joinpath(OUTDIR, fname); save(f, fig); @info "wrote $f"
+    Label(fig[nrow + 1, 1:(nm + 1)],
+          "Row labels carry each arm's own 99th-percentile |Δ|. All difference rows share one " *
+          "colour range,\nso an arm an order of magnitude off the rest will flatten them — " *
+          "drop it with EXCLUDE=<arm> to rescale.",
+          fontsize = 11, justification = :center)
+
+    f = joinpath(OUTDIR, outname(fname)); save(f, fig); @info "wrote $f"
 end
 
 ladder_figure(parT, surfT, present, wet_surface, "T (°C), surface", "°C", :thermal,
