@@ -322,6 +322,10 @@ if has_TS
     println()
     println("="^100)
     @printf("3. BUDGET over 0-%.0f m: flux implied vs B-SOSE's own change\n", ZTOP)
+    @printf("   !! ZTOP = %.0f m. If that is INSIDE the winter mixed layer (B-SOSE runs 180-215 m\n", ZTOP)
+    println("      here in Jun-Oct) the residual is mostly VERTICAL exchange with the water just")
+    println("      below, not lateral advection. Rerun with ZTOP=300 to enclose the mixed layer")
+    println("      and difference the two to separate them.")
     println("   Both in FLUX UNITS, so they read against each other directly.")
     println("     implied  = mean surface flux over the interval between month centres")
     println("     actual   = d/dt of the layer's heat/salt content over the same interval")
@@ -370,10 +374,19 @@ if has_TS
             println()
         end
         # the headline: what fraction of the forcing is exported
-        ti = wmean(dropdims(mean(imp, dims = 3), dims = 3), deep)
-        tr = wmean(dropdims(mean(res, dims = 3), dims = 3), deep)
-        @printf("  run mean: implied %s, residual %s -> the circulation removes %.0f%% of it\n",
-                strip(cell(ti)), strip(cell(tr)), abs(ti) > 0 ? 100tr / ti : NaN)
+        # Signed run means first. Do NOT ratio them: the surface flux is a seasonal cycle whose
+        # signed mean is near zero, so implied/residual ratios blow up and mean nothing.
+        si = [wmean(imp[:, :, n], deep) for n in 1:nt]
+        sa = [wmean(act[:, :, n], deep) for n in 1:nt]
+        sr = [wmean(res[:, :, n], deep) for n in 1:nt]
+        @printf("  run mean  : implied %s   actual %s   residual %s\n",
+                strip(cell(mean(si))), strip(cell(mean(sa))), strip(cell(mean(sr))))
+        @printf("  typical   : mean|implied| %s   mean|residual| %s -> the circulation moves\n",
+                strip(cell(mean(abs, si))), strip(cell(mean(abs, sr))))
+        @printf("              %.0f%% as much as the surface does, %s\n",
+                100 * mean(abs, sr) / mean(abs, si),
+                mean(sr) * mean(si) < 0 ? "OPPOSING the forcing on average" :
+                                          "reinforcing the forcing on average")
     end
 
     # ── figure: implied / actual / residual, latitude x time ──────────────────────────────────
@@ -408,14 +421,15 @@ if has_TS
     println("="^100)
     VIRT34 = .-34.0 .* FW
     ERR = VIRT34 .- VIRT
-    @printf("\n  %-9s |%11s%11s%11s%11s   %s\n", "month", "S mean", "S min", "err g/m²/s",
-            "as %% of term", "(domain, wet)")
-    println("  " * "-"^72)
+    println("\n  (domain mean over wet cells)")
+    @printf("  %-9s |%11s%11s%13s%14s\n", "month", "S mean", "S min", "err g/m²/s",
+            "as % of term")
+    println("  " * "-"^62)
     for n in 1:nm
         sm = wmean(SURF_S[:, :, n], wet); se = wmean(ERR[:, :, n], wet)
         vt = wmean(VIRT[:, :, n], wet)
-        smin = minimum(filter(isfinite, SURF_S[:, :, n][wet]); init = NaN)
-        @printf("  %-9s |%11.4f%11.4f%11.3e%10.1f%%\n", labels[n], sm, smin, se,
+        smin = minimum(filter(isfinite, SURF_S[:, :, n][wet]); init = Inf)
+        @printf("  %-9s |%11.4f%11.4f%13.3e%13.2f%%\n", labels[n], sm, smin, se,
                 abs(vt) > 0 ? 100se / vt : NaN)
     end
 
