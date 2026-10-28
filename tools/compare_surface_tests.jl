@@ -50,7 +50,25 @@ for r in RUNS
     r in present || @warn "$r has no $(DIR)/$(r)_surface.nc -- skipping (still running, or it failed)"
 end
 
-ds0 = Dataset(joinpath(DIR, "$(first(present))_surface.nc"))
+# The reference arm defines the time axis every arm is grouped against, so it has to be the
+# LONGEST one. `first(present)` would let a single arm that died in month 3 silently truncate the
+# whole figure to three columns and look like a deliberate choice.
+function ntime(r)
+    ds = Dataset(joinpath(DIR, "$(r)_surface.nc"))
+    n = length(ds["time"])
+    close(ds)
+    return n
+end
+nt = Dict(r => ntime(r) for r in present)
+refarm = present[argmax([nt[r] for r in present])]
+@info "output records per arm: " * join(("$r=$(nt[r])" for r in present), ", ") *
+      " (time axis from $refarm)"
+for r in present
+    nt[r] == nt[refarm] ||
+        @warn "$r stopped at output $(nt[r]) of $(nt[refarm]) -- its later months will be blank"
+end
+
+ds0 = Dataset(joinpath(DIR, "$(refarm)_surface.nc"))
 nxf = size(ds0["T"], 1)
 SCALING = Int(nxf / (λ₂ - λ₁))
 z = ReferenceToStretchedDiscretization(; extent = Z_EXTENT, constant_spacing = DZ_SURFACE,
@@ -112,8 +130,14 @@ Tb, Sb = resident(:temperature), resident(:salinity)
 
 # ── per-arm monthly means ─────────────────────────────────────────────────────────────────────
 nm = length(sel)
-slab(ds, v, t) = Float64.(coalesce.(ds[v][:, :, t], NaN))
-sect(ds, v, t) = Float64.(coalesce.(ds[v][1, :, :, t], NaN))
+# The surface writer is `indices=(:, :, grid.Nz)` (src/model.jl:1124), and NetCDFWriter KEEPS
+# that collapsed axis as a singleton: the variable is (x, y, 1, time), not (x, y, time). So
+# `v[:, :, t]` indexes z, not time, and throws a BoundsError on the very first month. Same `ndims`
+# dispatch as compare_bsose.jl:240 -- that script reads these identical files without complaint,
+# and copying this helper without its dispatch is what cost the first summary job.
+slab(ds, v, t) = (va = ds[v]; A = ndims(va) == 4 ? va[:, :, 1, t] : va[:, :, t];
+                  Float64.(coalesce.(A, NaN)))
+sect(ds, v, t) = Float64.(coalesce.(ds[v][1, :, :, t], NaN))   # (1, y, z, time), always 4-D
 
 surfT = Dict{String,Vector{Matrix{Float64}}}()   # arm -> per-month (Nx, Ny)
 surfS = Dict{String,Vector{Matrix{Float64}}}()
@@ -129,15 +153,34 @@ for r in present
     surfT[r] = Matrix{Float64}[]; surfS[r] = Matrix{Float64}[]
     sectT[r] = Matrix{Float64}[]; sectS[r] = Matrix{Float64}[]
 
+    # `groups` was built from the longest arm, so an arm that died early has indices pointing
+    # past its own end -- the same BoundsError in a different costume. Trim to this arm's axis;
+    # a month with nothing left becomes an all-NaN panel, drawn gray, which reads as "this arm
+    # never got here" instead of as a bias of zero.
+    ntu = length(dsu["time"])
+    nts = dss === nothing ? 0 : length(dss["time"])
+    blank(dims) = fill(NaN, dims)
+
     for n in sel
-        ts = groups[n]
-        length(ts) < 15 && @warn "$r $(Dates.format(bsose_window_center(bc_dates[n]), "yyyy-mm")) " *
-                                 "has only $(length(ts)) output(s): that panel is a snapshot, not a mean"
-        push!(surfT[r], mean(slab(dsu, "T", t) for t in ts))
-        push!(surfS[r], mean(slab(dsu, "S", t) for t in ts))
+        mlab = Dates.format(bsose_window_center(bc_dates[n]), "yyyy-mm")
+        ts = [t for t in groups[n] if t <= ntu]
+        if isempty(ts)
+            @warn "$r $mlab: no output at all -- that panel is blank"
+            push!(surfT[r], blank((Nx, Ny))); push!(surfS[r], blank((Nx, Ny)))
+        else
+            length(ts) < 15 && @warn "$r $mlab has only $(length(ts)) output(s): " *
+                                     "that panel is a snapshot, not a mean"
+            push!(surfT[r], mean(slab(dsu, "T", t) for t in ts))
+            push!(surfS[r], mean(slab(dsu, "S", t) for t in ts))
+        end
         if dss !== nothing
-            push!(sectT[r], mean(sect(dss, "T", t) for t in ts))
-            push!(sectS[r], mean(sect(dss, "S", t) for t in ts))
+            tss = [t for t in groups[n] if t <= nts]
+            if isempty(tss)
+                push!(sectT[r], blank((Ny, Nz))); push!(sectS[r], blank((Ny, Nz)))
+            else
+                push!(sectT[r], mean(sect(dss, "T", t) for t in tss))
+                push!(sectS[r], mean(sect(dss, "S", t) for t in tss))
+            end
         end
     end
     close(dsu); dss === nothing || close(dss)
@@ -149,8 +192,17 @@ parS = [Array(interior(Sb[pos[n]]))[:, :, Nz] for n in sel]
 parTsec = [Array(interior(Tb[pos[n]]))[MID, :, :] for n in sel]
 parSsec = [Array(interior(Sb[pos[n]]))[MID, :, :] for n in sel]
 
-# wet where BOTH have data, per cell -- the two bathymetries disagree
-wetmask = [isfinite.(parT[k]) .& isfinite.(surfT[first(present)][k]) for k in 1:nm]
+# Wet where BOTH have data, per cell -- the two bathymetries disagree. Built PER MONTH from
+# whichever arm actually reached that month: taking it from one fixed arm meant a short arm
+# blanked that month for every arm, including the ones that finished.
+function overlap_mask(par, perarm, arms, k, dims)
+    for r in arms
+        any(isfinite, perarm[r][k]) && return isfinite.(par[k]) .& isfinite.(perarm[r][k])
+    end
+    return falses(dims)
+end
+
+wetmask = [overlap_mask(parT, surfT, present, k, (Nx, Ny)) for k in 1:nm]
 
 # ── table ─────────────────────────────────────────────────────────────────────────────────────
 function stats(D, m)
@@ -249,7 +301,7 @@ end
 # the section needs its own per-cell wet mask: different shape, different bathymetry overlap
 sect_arms = [r for r in present if !isempty(sectT[r])]
 sectmask = isempty(sect_arms) ? Vector{BitMatrix}() :
-           [isfinite.(parTsec[k]) .& isfinite.(sectT[first(sect_arms)][k]) for k in 1:nm]
+           [overlap_mask(parTsec, sectT, sect_arms, k, (Ny, Nz)) for k in 1:nm]
 
 ladder_figure(parT, surfT, present, wetmask, "T (°C), surface", "°C", :thermal,
               λc, φc, "longitude (°E)", "latitude (°N)", "surface_tests_T.png")
