@@ -322,10 +322,15 @@ if has_TS
     println()
     println("="^100)
     @printf("3. BUDGET over 0-%.0f m: flux implied vs B-SOSE's own change\n", ZTOP)
-    @printf("   !! ZTOP = %.0f m. If that is INSIDE the winter mixed layer (B-SOSE runs 180-215 m\n", ZTOP)
-    println("      here in Jun-Oct) the residual is mostly VERTICAL exchange with the water just")
-    println("      below, not lateral advection. Rerun with ZTOP=300 to enclose the mixed layer")
-    println("      and difference the two to separate them.")
+    if ZTOP < 250
+        @printf("   !! ZTOP = %.0f m is INSIDE the winter mixed layer (B-SOSE runs 177-215 m here\n", ZTOP)
+        println("      in Jun-Oct), so the residual is mostly VERTICAL exchange with the water just")
+        println("      below. Rerun with ZTOP=300 to enclose it; the difference is the vertical part.")
+    else
+        @printf("   ZTOP = %.0f m encloses B-SOSE's winter mixed layer (177-215 m Jun-Oct), so the\n", ZTOP)
+        println("   residual here is lateral convergence plus exchange ACROSS this depth, not the")
+        println("   mixed layer trading with the water below it. Compare against a ZTOP=100 run.")
+    end
     println("   Both in FLUX UNITS, so they read against each other directly.")
     println("     implied  = mean surface flux over the interval between month centres")
     println("     actual   = d/dt of the layer's heat/salt content over the same interval")
