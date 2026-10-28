@@ -1,8 +1,7 @@
 # ==============================================================================
 # SUPERSEDED by tools/compare_offline.jl, which does everything this does plus the per-arm
-# figures, and masks the section against BOTH bathymetries instead of against isfinite -- see
-# the note there about B-SOSE being finite below its own sea floor. Kept because it still runs;
-# reach for compare_offline.jl.
+# figures and a coverage table. Both share tools/bsose_masks.jl, so the four figures here are
+# masked against both bathymetries exactly as the ones there are.
 #
 # compare_surface_tests.jl -- the surface-forcing ladder, all arms on one set of axes.
 #
@@ -35,6 +34,7 @@ using NumericalEarth, NumericalEarth.ECCO
 using NCDatasets, CairoMakie, Printf, Statistics, Dates
 
 include(joinpath(@__DIR__, "..", "src", "setup_bsose.jl"))
+include(joinpath(@__DIR__, "bsose_masks.jl"))
 
 # The production grid, same literals as compare_bsose.jl:153-154 and src/model.jl. Repeated
 # rather than imported because neither file exports them; if model.jl's grid changes, these
@@ -197,17 +197,19 @@ parS = [Array(interior(Sb[pos[n]]))[:, :, Nz] for n in sel]
 parTsec = [Array(interior(Tb[pos[n]]))[MID, :, :] for n in sel]
 parSsec = [Array(interior(Sb[pos[n]]))[MID, :, :] for n in sel]
 
-# Wet where BOTH have data, per cell -- the two bathymetries disagree. Built PER MONTH from
-# whichever arm actually reached that month: taking it from one fixed arm meant a short arm
-# blanked that month for every arm, including the ones that finished.
-function overlap_mask(par, perarm, arms, k, dims)
-    for r in arms
-        any(isfinite, perarm[r][k]) && return isfinite.(par[k]) .& isfinite.(perarm[r][k])
-    end
-    return falses(dims)
-end
-
-wetmask = [overlap_mask(parT, surfT, present, k, (Nx, Ny)) for k in 1:nm]
+# BATHYMETRY, NOT `isfinite`. These panels used to be masked on "both sides are finite", which
+# masks nothing: B-SOSE's T and S are finite below its own sea floor (fill_bathymetry_gaps!
+# propagates the deepest water mass downward) and Oceananigans writes immersed tracer cells as
+# zeros, not NaN. The section panels therefore drew the Antarctic margin and everything under
+# the sea floor as though it were ocean. Both masks now come from the two grids' own
+# bathymetries -- see tools/bsose_masks.jl, which compare_offline.jl shares.
+#
+# The mask is the same every month; it is held per month only because `ladder_figure` indexes
+# it that way. A month an arm never reached is still blank, because its data is NaN and
+# `nan_color` catches it.
+bathy_surface = both_wet_surface(grid, dataset, λc, φc)
+wetmask = [bathy_surface for _ in 1:nm]
+@info @sprintf("surface mask: %d of %d cells wet in both grids", count(bathy_surface), Nx * Ny)
 
 # ── table ─────────────────────────────────────────────────────────────────────────────────────
 function stats(D, m)
@@ -303,10 +305,13 @@ function ladder_figure(ref, perarm, arms, mask, name, unit, refcmap, xs, ys, xla
     f = joinpath(OUTDIR, fname); save(f, fig); @info "wrote $f"
 end
 
-# the section needs its own per-cell wet mask: different shape, different bathymetry overlap
+# The section needs its own mask: different shape, and the two bathymetries disagree with depth
+# as well as in plan. SECT_DEPTH matches the `ylim` the section panels are drawn with, so the
+# mask covers exactly what is on screen and no more.
+const SECT_DEPTH = 700.0
 sect_arms = [r for r in present if !isempty(sectT[r])]
-sectmask = isempty(sect_arms) ? Vector{BitMatrix}() :
-           [overlap_mask(parTsec, sectT, sect_arms, k, (Ny, Nz)) for k in 1:nm]
+bathy_section, _ = both_wet_section(grid, dataset, MID, φc, zc, SECT_DEPTH)
+sectmask = isempty(sect_arms) ? Vector{BitMatrix}() : [bathy_section for _ in 1:nm]
 
 ladder_figure(parT, surfT, present, wetmask, "T (°C), surface", "°C", :thermal,
               λc, φc, "longitude (°E)", "latitude (°N)", "surface_tests_T.png")
@@ -314,10 +319,12 @@ ladder_figure(parS, surfS, present, wetmask, "S (g/kg), surface", "g/kg", :halin
               λc, φc, "longitude (°E)", "latitude (°N)", "surface_tests_S.png")
 ladder_figure(parTsec, sectT, sect_arms, sectmask,
               "T (°C) at $(round(λ₁ + (MID - 0.5) / SCALING, digits = 1))°E", "°C", :thermal,
-              φc, zc, "latitude (°N)", "z (m)", "surface_tests_midlon_T.png"; ylim = (-700, 0))
+              φc, zc, "latitude (°N)", "z (m)", "surface_tests_midlon_T.png";
+              ylim = (-SECT_DEPTH, 0))
 ladder_figure(parSsec, sectS, sect_arms, sectmask,
               "S (g/kg) at $(round(λ₁ + (MID - 0.5) / SCALING, digits = 1))°E", "g/kg", :haline,
-              φc, zc, "latitude (°N)", "z (m)", "surface_tests_midlon_S.png"; ylim = (-700, 0))
+              φc, zc, "latitude (°N)", "z (m)", "surface_tests_midlon_S.png";
+              ylim = (-SECT_DEPTH, 0))
 
 println("\nReading this:")
 println("  * `none` is the control. Any drift it shows is the boundaries and the sponge, not the")

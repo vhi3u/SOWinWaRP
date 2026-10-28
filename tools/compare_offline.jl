@@ -43,11 +43,11 @@
 # ==============================================================================
 
 using Oceananigans, Oceananigans.Units, Oceananigans.Grids
-using Oceananigans.ImmersedBoundaries: immersed_cell
 using NumericalEarth, NumericalEarth.ECCO
 using NCDatasets, CairoMakie, Printf, Statistics, Dates
 
 include(joinpath(@__DIR__, "..", "src", "setup_bsose.jl"))
+include(joinpath(@__DIR__, "bsose_masks.jl"))
 
 # The production grid, same literals as src/model.jl. Repeated rather than imported because
 # model.jl does not export them; the Nx/Ny guard below is what catches them going stale.
@@ -182,47 +182,11 @@ println("  * = partial month")
 flush(stdout)
 
 # ── the two sea floors ────────────────────────────────────────────────────────────────────────
-#
-# `kb*[j]` is the DEEPEST WET index of column j on the section meridian, or `nothing` for a dry
-# column; everything below it is rock in that grid and is excluded from every mask and mean.
-wet3(i, j, k) = !immersed_cell(i, j, k, grid)
-kbot_model = [findfirst(k -> wet3(MID, j, k), 1:Nz) for j in 1:Ny]
-
-"""B-SOSE's own sea-floor depth (m, positive, 0 over land) nearest each (lon, lat)."""
-function bsose_depth(dataset, lons, lats)
-    file = joinpath(dataset.dir,
-                    resolve_bsose_filename(dataset.dir, :surface_salt_flux, dataset.iteration))
-    d = Dataset(file)
-    try
-        xc = Float64.(coalesce.(d["XC"][:], NaN))
-        yc = Float64.(coalesce.(d["YC"][:], NaN))
-        is = [argmin(abs.(xc .- λ)) for λ in lons]
-        js = [argmin(abs.(yc .- φ)) for φ in lats]
-        D  = Float64.(coalesce.(d["Depth"][minimum(is):maximum(is), minimum(js):maximum(js)], NaN))
-        i0, j0 = minimum(is) - 1, minimum(js) - 1
-        return [(v = D[is[a] - i0, js[b] - j0]; isfinite(v) ? max(v, 0.0) : 0.0)
-                for a in eachindex(lons), b in eachindex(lats)]
-    finally
-        close(d)
-    end
-end
-
-parent_depth2d = bsose_depth(dataset, λc, φc)
-parent_depth   = parent_depth2d[MID, :]
-kbot_parent    = [d <= 0 ? nothing : findfirst(k -> -zc[k] <= d, 1:Nz) for d in parent_depth]
-
-@info @sprintf("section %.2fE: %d of %d columns wet in the model, %d in B-SOSE",
-               SECT_LON, count(!isnothing, kbot_model), Ny, count(!isnothing, kbot_parent))
-
-# wet in BOTH grids: surface (i, j) and section (j, k)
-wet_surface = [wet3(i, j, Nz) && parent_depth2d[i, j] > 0 for i in 1:Nx, j in 1:Ny]
-wetboth(j, k) = kbot_model[j] !== nothing && kbot_parent[j] !== nothing &&
-                k >= kbot_model[j] && k >= kbot_parent[j]
-kupper = [k for k in 1:Nz if -zc[k] <= Z_TOP]
-wet_section = [wetboth(j, k) && k in kupper for j in 1:Ny, k in 1:Nz]
-
-@info @sprintf("masks: %d of %d surface cells wet in both grids; %d of %d section cells",
-               count(wet_surface), Nx * Ny, count(wet_section), Ny * length(kupper))
+# Both masks come from tools/bsose_masks.jl, which is also what the ladder script uses -- the
+# "B-SOSE is finite below its own floor" trap is subtle enough to be worth having in one place.
+wet_surface = both_wet_surface(grid, dataset, λc, φc)
+wet_section, _ = both_wet_section(grid, dataset, MID, φc, zc, Z_TOP)
+@info @sprintf("surface mask: %d of %d cells wet in both grids", count(wet_surface), Nx * Ny)
 
 # ── B-SOSE ────────────────────────────────────────────────────────────────────────────────────
 region = bsose_region(grid)
