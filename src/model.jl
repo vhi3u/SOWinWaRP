@@ -50,21 +50,33 @@ end
 # ---- run identity -------------------------------------------------------------------------
 # Prefixes every output file: RUN_NAME_surface.nc, _midlon.nc, _free_surface.nc.
 # Change it per experiment or runs overwrite each other. Animate: ./run_animate_simulation NAME
-const RUN_NAME = "8M_bsose_fwf"
+const RUN_NAME = "2Y_wind_fw_sw"
 
 # ---- period and domain --------------------------------------------------------------------
 const START_DATE = DateTime("2014-06-01")
-const END_DATE   = DateTime("2015-02-01")   # 8 months. The goal is 2 years: two seasonal
-                                            # cycles, the second uncontaminated by the IC.
-# BEFORE EXTENDING, three things an 8-month run does not expose:
-#   1. `target_transport` is materialised once, so the pin becomes a 2-year mean -- and north
-#      swings -31 to +16 Sv over a year. `tools/face_transports.jl` measures it, no GPU.
+const END_DATE   = DateTime("2016-06-01")   # 2 years: two seasonal cycles, the second one
+                                            # uncontaminated by the initial condition.
+# This is the `wind_fw_sw` arm of the surface_tests sweep, extended. That arm was the best of
+# the seven on both tracers (Jan surface bias +0.23 degC / -0.063 g/kg, against +1.80 / -0.087
+# without the shortwave split), and `wind_fw_sw_freeze` added nothing, so FREEZING_RELAXATION
+# stays off. SPONGE_TIMESCALE is 12 h to match the arm, not the 6 h that was here before.
+#
+# TWO THINGS A 2-YEAR RUN EXPOSES THAT 8 MONTHS DID NOT. Both are live; neither is fixed here.
+#   1. `target_transport` is materialised once, so the pin becomes a 2-YEAR mean -- and the
+#      north face swings -31 to +16 Sv over a year. The longer the run, the worse the pin fits
+#      any particular month. `tools/face_transports.jl` measures it, no GPU needed. This is
+#      also the live suspect for the depth-uniform 0.07-0.15 m/s Dv anomaly.
 #   2. No restart path at all. Checkpointing was removed 2026-10-28 -- it had no `pickup=` to
-#      pair with, so it only ever proved the state existed, and a bare "checkpoint" prefix made
-#      every concurrent arm of a sweep race for one JLD2 file (three died that way). A 2-year
-#      run that dies at month 20 loses everything; write a real restart before relying on one.
-#   3. `time_indices_in_memory` unset (defaults to 2). With ~26 records that is the regime where
-#      stale duplicated snapshots were measured: 12 requested, 9 distinct.
+#      pair with, and a bare "checkpoint" prefix made every concurrent arm of a sweep race for
+#      one JLD2 file (three died that way). At ~6 h of wall time, a job that dies at month 20
+#      loses all of it. Write a real restart before relying on one.
+#
+# A third warning used to live here -- `time_indices_in_memory` defaulting to 2, giving stale
+# duplicated snapshots at ~26 records. It does NOT apply on this path: with OBCS = true the
+# forcing goes through `bsose_sponge_layer_forcing`, which sets it to the full record count
+# (setup_bsose.jl:2741-2753), as does every `resident_fts` call. It IS still live for the
+# `elseif !OBCS` whole-region `DatasetRestoring` branch at the bottom of this section, which
+# passes no `time_indices_in_memory` at all.
 
 const SCALING    = 6        # horizontal resolution = 1/SCALING degrees (1/6 ~ 15 km)
 const Z_EXTENT   = 5800     # m, depth of the vertical grid
@@ -282,7 +294,7 @@ const REFERENCE_SALINITY   = 34.0   # the S in that conversion, g/kg
 # with the split on, section-mean MLD is 177.1 m against B-SOSE's 186.2 at day 137.
 const SPONGE_LAYERS        = true   # interior restoring near the open edges
 const SPONGE_WIDTH         = 3.0    # degrees; 18 cells at 1/6 deg
-const SPONGE_TIMESCALE     = 6hours # 6 hours, matching the MAB production config -- see below
+const SPONGE_TIMESCALE     = 12hours # matches the surface_tests sweep (Canary config); see below
 
 # MEASURED 2026-10-25 (boundary-spike metrics: growth of max|v| at the west wall, and the
 # boundary eta offset). 30 days is within 10% of no sponge at all:
