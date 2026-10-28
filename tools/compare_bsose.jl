@@ -700,6 +700,14 @@ if isfile(sect_file)
         ksof(lo, hi) = [k for k in 1:Nz if lo < -zc[k] <= hi]
         kupper = ksof(0.0, Z_TOP)
 
+        # v LIVES ON φ_afa FACES, so a single-longitude slice of it is (Ny+1, Nz) while every
+        # other field here is (Ny, Nz) -- it has one more row than there are latitude bands to
+        # put them in. Centre it onto φ_aca with the same two-point average
+        # `tools/animate_simulation.jl` uses for exactly this slice, and it drops into the
+        # banding like the rest. Both sides get the same treatment, so no half-cell offset is
+        # introduced between model and parent.
+        centre_v(A) = 0.5 .* (A[1:(end - 1), :] .+ A[2:end, :])
+
         """One table cell, formatted. `@sprintf` needs a literal, hence the branch."""
         cell(v, prec) = isnan(v) ? lpad("---", 9) :
                         prec == 3 ? @sprintf("%9.3f", v) : @sprintf("%9.4f", v)
@@ -733,18 +741,26 @@ if isfile(sect_file)
             nd = length(groups[n])
             nd < 15 && @warn "$label has only $nd section output(s): the upper-$(round(Int, Z_TOP))m panel for it is a SNAPSHOT, not a monthly mean."
 
-            accT = accS = nothing
+            acc = Dict(f => nothing for f in ("T", "S", "u", "v"))
             for t in groups[n]
-                A = Float64.(coalesce.(dsec["T"][1, :, :, t], NaN))
-                B = Float64.(coalesce.(dsec["S"][1, :, :, t], NaN))
-                accT = accT === nothing ? copy(A) : (accT .+= A)
-                accS = accS === nothing ? copy(B) : (accS .+= B)
+                for f in ("T", "S", "u", "v")
+                    A = Float64.(coalesce.(dsec[f][1, :, :, t], NaN))
+                    f == "v" && (A = centre_v(A))
+                    acc[f] = acc[f] === nothing ? A : (acc[f] .+= A)
+                end
             end
-            Ts, Ss = accT ./ nd, accS ./ nd
+            Ts, Ss, us, vs = (acc[f] ./ nd for f in ("T", "S", "u", "v"))
 
+            # The parent is sliced at the SAME index, so u is compared face-to-face at the same
+            # meridian -- there is only one face in a single-longitude slice, so there is nothing
+            # to centre in x and nothing that needs centring.
             Tps = Array(interior(Tb[pos[n]]))[MID, :, :]
             Sps = Array(interior(Sb[pos[n]]))[MID, :, :]
-            push!(panels, (label = label, nd = nd, dT = Ts .- Tps, dS = Ss .- Sps,
+            ups = Array(interior(ub[pos[n]]))[MID, :, :]
+            vps = centre_v(Array(interior(vb[pos[n]]))[MID, :, :])
+
+            push!(panels, (label = label, nd = nd,
+                           dT = Ts .- Tps, dS = Ss .- Sps, du = us .- ups, dv = vs .- vps,
                            Ts = Ts, Ss = Ss, Tps = Tps, Sps = Sps))
         end
         isempty(panels) && @warn "no month has section output: skipping the upper-$(round(Int, Z_TOP))m comparison"
@@ -760,7 +776,8 @@ if isfile(sect_file)
         println("="^100)
 
         for pan in panels
-            for (D, name, unit, prec) in ((pan.dT, "ΔT", "°C", 3), (pan.dS, "ΔS", "g/kg", 4))
+            for (D, name, unit, prec) in ((pan.dT, "ΔT", "°C", 3), (pan.dS, "ΔS", "g/kg", 4),
+                                          (pan.du, "Δu", "m/s", 4), (pan.dv, "Δv", "m/s", 4))
                 @printf("\n%s  %s (%s)   [%d model output%s, %s]\n", pan.label, name, unit,
                         pan.nd, pan.nd == 1 ? "" : "s",
                         pan.nd < 15 ? "PARTIAL MONTH - snapshot" : "monthly mean")
@@ -789,12 +806,12 @@ if isfile(sect_file)
             end
         end
 
-        # ---- figure: ΔT and ΔS over the upper Z_TOP m, one column per selected day ----
+        # ---- figure: ΔT, ΔS, Δu, Δv over the upper Z_TOP m, one column per month ----
         #
         # One colour range across all days per row, so the panels are comparable to each other --
         # a per-panel range would hide exactly the seasonal change in amplitude this is for.
         ncol = length(panels)
-        fig = Figure(size = (430 * ncol + 120, 760))
+        fig = Figure(size = (430 * ncol + 120, 1430))
         Label(fig[0, 1:(ncol + 1)],
               "$(RUN) — monthly mean model − monthly B-SOSE, upper $(round(Int, Z_TOP)) m at $(round(SECT_LON, digits=1))°E",
               fontsize = 19, font = :bold)
@@ -804,7 +821,8 @@ if isfile(sect_file)
                          wetboth(j, k) && (M[j, k] = D[j, k])
                      end; M)
 
-        for (row, (fld, name, unit)) in enumerate(((:dT, "ΔT", "°C"), (:dS, "ΔS", "g/kg")))
+        for (row, (fld, name, unit)) in enumerate(((:dT, "ΔT", "°C"), (:dS, "ΔS", "g/kg"),
+                                                   (:du, "Δu", "m/s"), (:dv, "Δv", "m/s")))
             Ms = [masked(getfield(pan, fld)) for pan in panels]
             fin = filter(isfinite, vcat(vec.(Ms)...))
             lim = isempty(fin) ? 1.0 : max(quantile(abs.(fin), 0.99), 1e-9)
@@ -829,7 +847,7 @@ if isfile(sect_file)
             Colorbar(fig[row, ncol + 1], hm, label = unit)
         end
 
-        Label(fig[3, 1:(ncol + 1)],
+        Label(fig[5, 1:(ncol + 1)],
               "Solid black: model mixed layer, from the monthly mean. Dashed: B-SOSE's. Grey is where the two bathymetries " *
               "disagree or the floor is above $(round(Int, Z_TOP)) m. One colour range per row, shared across months.",
               fontsize = 11)
