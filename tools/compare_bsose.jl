@@ -741,12 +741,12 @@ if isfile(sect_file)
             nd = length(groups[n])
             nd < 15 && @warn "$label has only $nd section output(s): the upper-$(round(Int, Z_TOP))m panel for it is a SNAPSHOT, not a monthly mean."
 
-            acc = Dict(f => nothing for f in ("T", "S", "u", "v"))
+            acc = Dict{String,Union{Nothing,Matrix{Float64}}}(f => nothing for f in ("T", "S", "u", "v"))
             for t in groups[n]
                 for f in ("T", "S", "u", "v")
                     A = Float64.(coalesce.(dsec[f][1, :, :, t], NaN))
                     f == "v" && (A = centre_v(A))
-                    acc[f] = acc[f] === nothing ? A : (acc[f] .+= A)
+                    acc[f] = acc[f] === nothing ? A : (acc[f] .+ A)
                 end
             end
             Ts, Ss, us, vs = (acc[f] ./ nd for f in ("T", "S", "u", "v"))
