@@ -54,27 +54,14 @@ const RUN_NAME = "8M_bsose_fwf"
 
 # ---- period and domain --------------------------------------------------------------------
 const START_DATE = DateTime("2014-06-01")
-const END_DATE   = DateTime("2015-02-01")   # 2 years = 731 days. Two full seasonal cycles, so
-                                            # Winter Water forms, is capped, and forms AGAIN --
-                                            # and the SECOND cycle is the one not contaminated by
-                                            # the initial condition.
-#
-# THREE THINGS GET WORSE AT THIS LENGTH, and none of them showed up in the 8-month run:
-#
-# 1. THE TRANSPORT PIN BECOMES A 2-YEAR MEAN. `target_transport` is materialised once at
-#    free-surface construction, so it is one number per face for the whole run, and the note at
-#    BAROTROPIC_SCHEME records north swinging -31 to +16 Sv over a year. Over 8 months the pin
-#    was a ~10-month mean and merely blunt; over 2 years it holds a face against its own flow for
-#    a large part of the run. `tools/face_transports.jl` with this window measures it, no GPU.
-#
-# 2. NO RESTART PATH. CHECKPOINTS writes state but `model.jl` has no `pickup=` anywhere, so a
-#    job that dies at month 20 loses everything. At 8 months that was a tolerable risk; at 2
-#    years it is the most likely way this run fails.
-#
-# 3. `time_indices_in_memory` IS STILL UNSET, so it defaults to 2. With ~26 monthly records the
-#    boundary and sponge series reload constantly, and that is the regime where stale, duplicated
-#    snapshots were measured (12 records requested, 9 distinct returned). See the Upstream OBC
-#    Research note.
+const END_DATE   = DateTime("2015-02-01")   # 8 months. The goal is 2 years: two seasonal
+                                            # cycles, the second uncontaminated by the IC.
+# BEFORE EXTENDING, three things an 8-month run does not expose:
+#   1. `target_transport` is materialised once, so the pin becomes a 2-year mean -- and north
+#      swings -31 to +16 Sv over a year. `tools/face_transports.jl` measures it, no GPU.
+#   2. No restart path: CHECKPOINTS writes state, nothing passes `pickup=`.
+#   3. `time_indices_in_memory` unset (defaults to 2). With ~26 records that is the regime where
+#      stale duplicated snapshots were measured: 12 requested, 9 distinct.
 
 const SCALING    = 6        # horizontal resolution = 1/SCALING degrees (1/6 ~ 15 km)
 const Z_EXTENT   = 5800     # m, depth of the vertical grid
@@ -82,7 +69,8 @@ const DZ_SURFACE = 8        # m, upper-ocean spacing
 const DZ_BOTTOM  = 400      # m, deep spacing
 const Z_CONSTANT_EXTENT = 250  # m, depth over which DZ_SURFACE is held before stretching
 
-# Nz = 53, from 135, chosen 2026-10-26. Computed, not guessed:
+# Nz = 53 (B-SOSE has 52), chosen 2026-10-26. Winter Water is a Tmin at 50-200 m, so the column
+# that decides the grid is cells<200m -- this keeps 8 m spacing through all of it:
 #
 #   DZ_SURFACE / DZ_BOTTOM / const-extent   Nz   cells<200m   dz at 150 m
 #   5  / 200 / 500  (the old default)      135       40          5.0 m
@@ -90,49 +78,30 @@ const Z_CONSTANT_EXTENT = 250  # m, depth over which DZ_SURFACE is held before s
 #   10 / 400 / 300                          50       20         10.0 m
 #   8  / 400 / 250  (this)                  53       25          8.0 m
 #
-# 53 levels is B-SOSE's own count (52) and about 2.5x fewer cells than 135, but the point is the
-# middle column: WINTER WATER IS A SUBSURFACE TEMPERATURE MINIMUM at roughly 50-200 m, so the
-# cells in that band are the ones that decide whether the Tmin is resolved or smeared. This keeps
-# 8 m spacing through all of it with 25 cells above 200 m.
-#
-# DO NOT coarsen to 20/400/500 to save more. It gives 20 m through the Tmin, and it is also the
-# `coarse_z` arm -- the one run of the 2026-10-25 matrix that FAILED, for a reason never
-# diagnosed. See `tail -40 logs/obc_coarse_z_20d-*.err` before trusting any coarser grid.
-#
-# The floor lands at 5815 m and only moves in 400 m steps down there, so Z_EXTENT anywhere in
-# 5500-5800 gives the same grid. 5400 would give Nz=52 and a 5415 m floor, which is worth doing
-# IF B-SOSE's deepest valid level turns out to be shallower than 5815 -- see the depth-cap item
-# in the Upstream OBC Research note. Unverified.
+# DO NOT coarsen to 20/400/500: 20 m through the Tmin, and it is the `coarse_z` arm, the one run
+# of the 2026-10-25 matrix that FAILED and was never diagnosed. The floor lands at 5815 m in
+# 400 m steps, so any Z_EXTENT in 5500-5800 gives this same grid.
 const CIRCUMPOLAR = false   # true = 0-360 degrees, Periodic in x (west/east BCs then unused)
 
 const BSOSE_ITERATION = 156 # 156 covers 2013-2024, 105 covers 2008-2012. No fallback: a
                             # missing file is an error. Filenames: BSOSE_FILES in setup_bsose.jl
 
-# Condition the sea floor on the open boundaries (see `fix_boundary_topography!`).
-#
-# The model's fastest cell has been the BOTTOM cell of a column on an open boundary in every
-# run: (1,21,39) in a 483 m column, growing ~0.3 m/s/day. Three scheme hypotheses have been
-# tested and eliminated -- missing bottom drag (no, it is active), the radiation stencil at
-# immersed-adjacent cells (no, Dirichlet diverges in 3 days), and the transport pin amplifying
-# ΔU/H (no, identical growth without it). The bathymetry is what is left, and the east face
-# carries a 42 m column at (360,10) against neighbours of ~438 m: a 75x velocity amplifier.
+# Condition the sea floor on the open boundaries (see `fix_boundary_topography!`). The fastest
+# cell has been the BOTTOM cell of an open-boundary column in every run -- (1,21,39), 483 m,
+# ~0.3 m/s/day. Three scheme hypotheses were tested and eliminated: missing bottom drag (it is
+# active), the radiation stencil at immersed-adjacent cells (Dirichlet diverges in 3 days), and
+# the transport pin amplifying DU/H (identical growth without it). Bathymetry is what is left:
+# the east face carries a 42 m column at (360,10) against ~438 m neighbours, a 75x amplifier.
 const FIX_BOUNDARY_TOPOGRAPHY = true
 const MINIMUM_BOUNDARY_DEPTH  = 100   # m; masks (360,10) at 42 m and nothing else
 
-# 0 = real bathymetry. Anything > 0 sets every WET column to that uniform depth, which removes
-# all depth variation -- so no thin columns, no U/H amplification, no OBCSfixtopo steps -- while
-# leaving the COASTLINE exactly where it is.
-#
-# Keeping the coastline is the whole point. Flattening the entire box would turn the Antarctic
-# continent into ocean, and B-SOSE has no data there: its land is inpainted with
-# nearest-neighbour ocean values, so prescribing boundary conditions from it would re-create the
-# bug of 2026-10-25 (Uᵉˣᵗ integrated through land) deliberately and across a far larger area.
-#
-# For a self-consistent simplified case, pair a SHALLOW depth with a matching Z_EXTENT:
-# B-SOSE has valid data in the top ~1000 m of every wet column, so a flat 1000 m ocean is a
-# case where the prescribed transport is real data rather than inpainted filler, and the volume
-# budget should still close. √(gH) drops from 198 to 99 m/s, which also doubles the barotropic
-# substep. Note this is NOT the ACC: a 1000 m channel carries far less transport than 3500 m.
+# 0 = real bathymetry. > 0 flattens every WET column to that depth -- no thin columns, no U/H
+# amplification, no OBCSfixtopo steps -- while KEEPING the coastline, which is the whole point:
+# flattening the box too would make Antarctica ocean, where B-SOSE is nearest-neighbour inpainted
+# filler, re-creating the 2026-10-25 bug (Uext integrated through land) over a far larger area.
+# For a self-consistent toy case pair a shallow depth with a matching Z_EXTENT: B-SOSE has real
+# data in the top ~1000 m everywhere, and sqrt(gH) drops 198 -> 99 m/s, doubling the barotropic
+# substep. Not the ACC, though: a 1000 m channel carries far less than 3500 m.
 const FLAT_BOTTOM_DEPTH = 0   # m
 
 # ---- open boundaries ----------------------------------------------------------------------
@@ -162,50 +131,29 @@ const TRACER_SCHEME = TracerReservoir(inflow_length_scale = 5000, outflow_length
 #     base               +0.137     3.42     +0.163  +0.167   <- NormalRadiation + :gradient
 #     tang_radiation     +0.168     3.65     +0.083  +0.098
 #
-# The eta offset tracks dv/dt across the whole matrix, which is the mechanism: the step in the
-# free surface at the boundary row is geostrophically worth metres per second at this latitude
-# (g/|f| = 8.2e4 at 55S, so 0.16 m over one 9.9 km cell is ~1.3 m/s). The exception is
-# :radiation on the TANGENTIAL component, which grows fast despite a modest offset.
+# The eta offset tracks dv/dt across the matrix, which is the mechanism: a free-surface step at
+# the boundary row is geostrophically worth m/s here (g/|f| = 8.2e4 at 55S, so 0.16 m over one
+# 9.9 km cell is ~1.3 m/s). Exception: :radiation on the TANGENTIAL grows fast at a modest
+# offset. This config takes the best arm on each axis; they were measured one at a time, so
+# additivity is what this run tests.
 #
-# This configuration takes the best arm on each axis. They were measured one at a time, so the
-# combination is not guaranteed additive -- that is what this run tests.
+# TWO WARNINGS THAT ONCE STOOD HERE ARE SUPERSEDED (2026-10-25), do not re-add them: "clamped
+# diverges" (it no longer does -- `normal_clamped` is the best normal arm; the Uext land-masking
+# fix is the likely reason) and ":gradient on the tangential" (:clamped measured +0.047 against
+# :gradient's +0.137). Both were stated confidently for a week on one run each.
 #
-# SUPERSEDED, both of them (2026-10-25):
-#
-# 1. "DO NOT SET OBC_SCHEME = clamped. Tested 2026-10-24 and it DIVERGES: NaN in u at day 3.1."
-#    It no longer does -- `normal_clamped` ran 20 days and is the BEST normal condition in the
-#    matrix (+0.011). That divergence started at (355,11) and (359,87), the thin-column cluster
-#    on the east face, and the Uᵉˣᵗ masking fix of 2026-10-25 is the likely reason it is gone:
-#    Uᵉˣᵗ had been integrating B-SOSE's inpainted LAND values through those columns.
-#
-# 2. ":gradient on the tangential, because a prescribed Value leaves the baroclinic and
-#    barotropic halves of the face inconsistent." The reasoning may be sound but the outcome is
-#    not: :clamped measured +0.047 against :gradient's +0.137, and :radiation was worst at
-#    +0.168. Whatever the halves are doing, a prescribed tangential beats imposing nothing here.
-#
-# Both were stated confidently in this file for a week on the strength of a single run each.
-# ObliqueRadiation is still not advisable -- see the land-adjacency note below.
-
-# Do not set ObliqueRadiation here, for two independent reasons.
-#
-# 1. It buys nothing. NestingValidation's truncation experiment puts oblique and normal within
-#    noise of each other (enstrophy 0.184 vs 0.187); the whole gain, +32%, comes from having a
-#    TANGENTIAL condition at all, which TANGENTIAL_BC provides either way.
-#
-# 2. It diverges next to land, and most of our faces have some. West and east are genuine
-#    open-ocean ACC boundaries -- about 132 of 150 rows wet -- but the domain runs to 70S and
-#    the Wilkes Land coast is at 66-68S, so the southern ~18 rows of every zonal face are
-#    continent, and the south face is land across its whole length. The criterion is not "is
-#    this face mostly ocean" but "does any wet cell on it have a land neighbour along the face":
-#    six land cells out of 575 diverged a NestingValidation run, and oblique is what
-#    destabilised this model once already. North, at 45S, is probably the one clean face.
-#
-# The startup log prints each face's wet fraction, which is the measurement, not an inference.
+# DO NOT set ObliqueRadiation. (1) It buys nothing: NestingValidation puts oblique and normal
+# within noise (enstrophy 0.184 vs 0.187) -- the whole +32% comes from having ANY tangential
+# condition, which TANGENTIAL_BC provides. (2) It diverges next to land, and six land cells out
+# of 575 were enough to diverge a NestingValidation run. Our zonal faces are ~132/150 wet but
+# their southern ~18 rows are the Wilkes Land coast; north at 45S is the one clean face. The
+# criterion is "does any wet cell have a land neighbour along the face", not "is it mostly
+# ocean". The startup log prints each face's wet fraction -- that is the measurement.
 
 # ---- barotropic mode and the free surface -------------------------------------------------
-# Not optional. The split-explicit corrector overwrites the depth mean of u/v at every face
-# with the barotropic solution, so without these the net transport is driven to zero whatever
-# the 3-D conditions say.
+# Not optional: the split-explicit corrector overwrites the depth mean of u/v at every face with
+# the barotropic solution, so without these the net transport is driven to zero whatever the 3-D
+# conditions say. (Corollary, measured 2026-10-27: a sponge CANNOT fix a barotropic error.)
 const BAROTROPIC_OBC    = true
 const BAROTROPIC_SCHEME = :pinned   # :pinned (Flather + target_transport) | :flather
 #
@@ -216,33 +164,25 @@ const BAROTROPIC_SCHEME = :pinned   # :pinned (Flather + target_transport) | :fl
 #     east       +215.4       -60.3   <- sign flipped, ACC enters through BOTH zonal faces
 #     north       -28.6      +295.2   <- and exits north
 #
-# with mean eta drifting -0.44 -> -0.53 m over ten days and still going. The cause is
-# EXTERIOR_SSH = false: Flather's reference is a flat zero sea surface while the model sits near
-# -0.5 m, and at the measured ~5 Sv/cm that is ~250 Sv of spurious forcing. The pin has been
-# absorbing it. NestingValidation removed this same correction with no effect, but their own
-# caveat applies -- they tested a 719 km^2 section carrying 24-45 Sv, not a basin carrying 200.
+# with mean eta drifting -0.44 -> -0.53 m over ten days. Cause: EXTERIOR_SSH = false made
+# Flather radiate toward a flat zero sea surface while the model sits near -0.5 m -- at ~5 Sv/cm
+# that is ~250 Sv of spurious forcing, which the pin had been absorbing. Reconfirmed in the
+# matrix (`bt_flather`: E -59.85, N +331.82, worst west eta offset of all 14 arms at +0.193).
+# Worth noting the pin is NOT the amplifier: |u| at (1,21,39) grew 0.30 m/s/day without it
+# against 0.32 with it.
 #
-# The test was worth running anyway: |u| at (1,21,39) grew at 0.30 m/s/day WITHOUT the pin
-# against 0.32 WITH it. Same cell, same rate. The pin is not the amplifier.
-#
-# Reconfirmed in the 2026-10-25 matrix: `bt_flather` inverted again (E -59.85, N +331.82) and
-# had the worst west eta offset of all fourteen arms, +0.193. But note that arm also ran with
-# EXTERIOR_SSH = false, so :flather WITH a correct eta_ext -- which is what this file now sets
-# -- has still never been tested. It is the obvious next A/B once this configuration is known.
+# NEXT A/B: that arm also ran EXTERIOR_SSH = false, so :flather WITH a correct eta_ext -- what
+# this file now sets -- has still never been tested. Also the live suspect for the depth-uniform
+# Dv of 0.07-0.15 m/s measured 2026-10-27.
 #
 const BAROTROPIC_FACES  = :all      # :all | :zonal -- keep :all, the :zonal theory was
                                     # disproven (north carries -31 Sv, 18% of the zonal flow)
 const EXTERIOR_SSH      = true      # eta_ext and the initial eta from B-SOSE ETAN
-# ON as of 2026-10-25. The note that stood here said `bsose_exterior_free_surface` aborts the
-# process on the GPU with SIGBUS / a corrupted heap at the same point every run. It does not any
-# more: the `ext_ssh` arm completed 20 days. That crash was almost certainly the invented
-# one-cell-z-window FieldTimeSeries construction, fixed by moving to the full-depth form that
-# was already working elsewhere in setup_bsose.jl -- the same cause as the three "JIT crashes".
-#
-# And it earns its place on the physics: `ext_ssh` cut the west/north eta offset from
-# +0.163/+0.167 to +0.026/+0.019 and had the LOWEST max|u| of any arm (0.79 against base's
-# 1.59). eta_ext = 0 was asking Flather to radiate toward a flat zero sea surface while B-SOSE
-# ETAN averages about -0.95 m over this domain.
+# ON as of 2026-10-25, and it earns its place: `ext_ssh` cut the west/north eta offset from
+# +0.163/+0.167 to +0.026/+0.019 and had the LOWEST max|u| of any arm (0.79 vs base 1.59).
+# B-SOSE ETAN averages ~-0.95 m here, so eta_ext = 0 was radiating toward the wrong surface.
+# The old "aborts on GPU with SIGBUS" note is stale -- that was the invented one-cell-z-window
+# FieldTimeSeries, same cause as the three "JIT crashes", fixed by using the full-depth form.
 
 # ---- surface forcing ----------------------------------------------------------------------
 const WINDS                = true   # BSOSE oceTAUX / oceTAUY
@@ -251,11 +191,9 @@ const PENETRATING_SHORTWAVE = true  # split oceQsw out of TFLUX into TwoColorRad
 const FRESHWATER_FLUX      = true   # add -S*oceFWflx to SFLUX as a virtual salt flux
 const REFERENCE_SALINITY   = 34.0   # the S in that conversion, g/kg
 
-# FRESHWATER_FLUX IS NOT OPTIONAL WHEN SURFACE_FLUXES IS ON, for the same kind of reason as
-# PENETRATING_SHORTWAVE below. B-SOSE's SFLUX matches salt-CONTENT variations, and MITgcm ran it
-# with a nonlinear free surface and a real freshwater flux -- so precipitation, evaporation,
-# runoff and ice melt move WATER there, leave salt content untouched, and do not appear in SFLUX
-# at all. What is left in SFLUX is sea-ice brine.
+# FRESHWATER_FLUX IS NOT OPTIONAL WHEN SURFACE_FLUXES IS ON. B-SOSE's SFLUX matches salt-CONTENT
+# variations and MITgcm ran it with a real freshwater flux, so P, E, runoff and ice melt move
+# WATER, leave salt content untouched, and never appear in SFLUX. What is left there is brine.
 #
 # MEASURED 2026-10-26 over this domain, Jun 2014 - May 2016 (`tools/check_freshwater_flux.jl`),
 # implied ΔS over 2 years in a 100 m layer:
@@ -267,20 +205,18 @@ const REFERENCE_SALINITY   = 34.0   # the S in that conversion, g/kg
 #     55-50S     -0.0003        -0.3602
 #     50-45S     +0.0000        -0.1261
 #
-# A salt flux that is nonzero only where sea ice forms is brine, by construction. In the
-# ice-free band 45-55S the median per-record ratio SFLUX / (-S*oceFWflx) is 0.0003. So every run
-# before this one had NO surface salinity forcing north of 65S: SFLUX alone integrates to
-# -0.006 g/kg domain-mean over two years, a no-op, which is why 2Y_bsose_dirichlet drifted
-# +0.09 g/kg SALTY against B-SOSE.
+# A salt flux nonzero only where ice forms is brine by construction: in the ice-free band 45-55S
+# the median ratio SFLUX / (-S*oceFWflx) is 0.0003. So every run before this one had NO surface
+# salinity forcing north of 65S -- SFLUX alone is -0.006 g/kg domain-mean over 2 years, a no-op,
+# which is why 2Y_bsose_dirichlet drifted +0.09 g/kg SALTY. oceFWflx is worth 0.47 m/yr of net
+# freshwater here; do NOT read the -0.30 g/kg that implies in 100 m as a prediction, since a
+# flux integral is an upper bound and B-SOSE is forced with this exact flux without freshening
+# anything like that -- the circulation exports it.
 #
-# oceFWflx is worth 0.47 m/yr of net freshwater into this domain. Do NOT read the -0.30 g/kg
-# that integrates to in 100 m as a prediction: a surface-flux integral is an upper bound on the
-# local change, and B-SOSE is forced with this exact flux without freshening by anything like
-# that, because the circulation exports it.
-#
-# WATCH THE COAST. In 70-65S the two terms nearly cancel (-0.140 -> -0.014), so this makes the
-# coastal band ~0.13 g/kg SALTIER over two years -- the opposite direction from everywhere else,
-# and exactly where running without a prognostic sea-ice model is least defensible.
+# WATCH THE COAST: at 70-65S the two terms nearly cancel (-0.140 -> -0.014), salting that band
+# ~0.13 g/kg over 2 years, opposite to everywhere else. CONFIRMED 2026-10-27 -- a thin salty
+# strip hugging the coast at 65-67S in the Aug/Sep/Oct surface maps, right where predicted.
+# This is exactly where running without a prognostic sea-ice model is least defensible.
 
 # PENETRATING_SHORTWAVE IS NOT OPTIONAL WHEN SURFACE_FLUXES IS ON. B-SOSE's TFLUX is the TOTAL
 # surface heat flux, sunlight included, and sunlight is not absorbed at the surface. Depositing
@@ -290,53 +226,49 @@ const REFERENCE_SALINITY   = 34.0   # the S in that conversion, g/kg
 # and the split gives +97 instead of +344 W/m2 over Nov-Feb, which this run spans.
 #
 # A 3 m mixed layer would make a Winter Water run meaningless, since WW *is* the remnant winter
-# mixed layer. See section 3.3 of Model Architecture.md for the full measurement.
-#
-# Still un-convicted rather than cleared: the split has never run on top of a working boundary
-# condition. It does now.
+# mixed layer. Full measurement in section 3.3 of Model Architecture.md. VINDICATED 2026-10-27:
+# with the split on, section-mean MLD is 177.1 m against B-SOSE's 186.2 at day 137.
 const SPONGE_LAYERS        = true   # interior restoring near the open edges
 const SPONGE_WIDTH         = 3.0    # degrees; 18 cells at 1/6 deg
-const SPONGE_TIMESCALE     = 1days  # 1 day, not 12 hours -- see the note below
+const SPONGE_TIMESCALE     = 6hours # 6 hours, matching the MAB production config -- see below
 
-# MEASURED 2026-10-25: 30 days does nothing, 1 day and 12 hours are indistinguishable.
+# MEASURED 2026-10-25 (boundary-spike metrics: growth of max|v| at the west wall, and the
+# boundary eta offset). 30 days is within 10% of no sponge at all:
 #
 #     sponge_30d   dv/dt +0.118   eta offset W +0.148   <- base is +0.137 / +0.163
 #     sponge_1d    dv/dt +0.005   eta offset W +0.013
 #     sponge_12h   dv/dt +0.004   eta offset W +0.008
 #
-# So 1 day is the setting: 12 hours buys 0.001 m/s/day and constrains the outer 3 degrees harder
-# for nothing. A 30-day sponge is within 10% of no sponge at all, which is the quantitative
-# version of the paragraph below.
+# MEASURED 2026-10-27 -- THE SPONGE WORKS. Section 1 of tools/compare_bsose.jl, 8M_bsose_fwf,
+# Oct 2014, mean |dT| by distance from the wall:
 #
-# CAVEAT WORTH KEEPING IN VIEW. The sponge gives the lowest max|v| of any arm (1.01) and moves
-# the maximum 20 cells off the wall, but a sponge that suppresses the feature is not the same as
-# a boundary condition that does not create it. `flat_upper` still pinned at i=1 on a flat
-# 1000 m ocean, so there is a boundary-condition problem here that a strong sponge would mask.
-# Do not read a clean sponged run as proof the boundaries are right.
+#     cells   0-2    3-5   6-11  12-17 | 18-23  24-35  36-59  60-200
+#     dT     0.116  0.111  0.118 0.309 | 0.509  0.694  0.736  0.457
+#                      in sponge       |            free
 #
-# SPONGE_TIMESCALE was 30days until 2026-10-25, and that is why earlier sponge arms proved
-# nothing. NestingValidation's canary setup -- our closest published analogue -- runs
-# `rate = 1/12hours`, so our sponge was **60x too weak**. Read from their source, not from our
-# earlier note about it, which recorded "a 1/12-day rate" and was wrong.
+# A 6x knee exactly at 18 cells, in dT, dS, du and dv alike. The boundaries and the sponge are
+# NOT the problem with this run; the interior is. Set at 1 day this passed cleanly.
 #
-# The WIDTH was never the mismatch, which the same note also got wrong. Canary's nominal 0.25 deg
-# at 0.02 deg is 12.5 cells, and its Gaussian exp(-(d/w)^2) still carries 0.37 AT the nominal
-# width, so its effective reach is ~20 cells. Our raised cosine 0.5(1+cos(pi d/w)) has compact
-# support, reaching exactly 0 at the width, so 3 deg = 18 cells is the closer match -- and it is
-# the value already in use. Changing the timescale alone keeps this to one variable.
+# TIMESCALE IS 6 HOURS as of 2026-10-27, matching NumericalEarth's MAB production config
+# (PR #676: tau = 6 h, cos^2 over 8 cells at 1/12 deg; Canary runs 12 h). This is a "do not be
+# the outlier" choice, NOT a fix -- the knee above shows 1 day was already working, and no arm
+# has ever measured tau against the interior T/S bias. Revert to 1day freely.
 #
-# Our mask takes `min` over the edge distances and then tapers, which is equivalent to canary's
-# `max(edge(distance))`: the nearest edge gives the strongest restoring, so corners are not
-# double-counted either way. The south edge is entirely land, so its share of the mask lands on
-# immersed cells and does nothing.
+# WIDTH is right and should not change. Canary's Gaussian exp(-(d/w)^2) still carries 0.37 at
+# its nominal width, so its effective reach is ~20 cells; our raised cosine 0.5(1+cos(pi d/w))
+# has compact support and reaches exactly 0, so 3 deg = 18 cells is the closer match. The mask
+# takes `min` over edge distances, equivalent to canary's `max(edge(distance))`, so corners are
+# not double-counted. The south edge is entirely land and its share does nothing.
 #
-# WHY THIS ARM. `TANGENTIAL_BC = :gradient` imposes nothing, so with the sponge off there was no
-# path at all for the parent's tangential velocity -- and the growing signal IS tangential v on
-# the west wall at i=1-3, inside this sponge. Canary supplies boundary-adjacent u and v through
-# exactly this mechanism, not through a boundary condition.
+# WHY THE SPONGE EARNS ITS PLACE: `TANGENTIAL_BC = :gradient` imposes nothing, so without it
+# there is no path at all for the parent's tangential velocity -- and the growing signal IS
+# tangential v on the west wall at i=1-3, inside this band. Canary supplies boundary-adjacent
+# u and v this way too, not through a boundary condition.
 #
-# COST: the outer 3 deg is no longer a free model solution, so it must be excluded from any
-# analysis. That is the same band Ito et al. exclude anyway.
+# TWO CAVEATS. (1) A sponge that suppresses a feature is not a boundary condition that never
+# creates it -- `flat_upper` still pinned at i=1 on a flat 1000 m ocean. (2) The outer 3 deg is
+# no longer a free model solution and must be excluded from analysis; Ito et al. exclude the
+# same band. Note also that a tendency restoring cannot touch the barotropic mode at any tau.
 const ATMOSPHERE           = :none  # :none | :era5 (bulk formulae; needs ~/.cdsapirc)
 const ERA5_THREADS         = 1      # CDS rejects concurrent queued requests
 
@@ -363,38 +295,31 @@ const EKE_STRIDE        = 1        # accumulate every Nth time step (1 = every s
 const EKE_FULL_DEPTH    = true     # false writes the surface level only
 const EKE_TRACER_FLUXES = false    # also <uT>, <vT>, <uS>, <vS>, for eddy heat and salt transport
 
-# EKE CANNOT BE WRITTEN DIRECTLY, because it is defined against a mean that does not exist until
-# the averaging window closes. What a running model can write is the PAIR of first and second
-# moments, and the decomposition off them is exact:
+# EKE CANNOT BE WRITTEN DIRECTLY -- it is defined against a mean that does not exist until the
+# window closes. What a running model can write is the pair of moments; the decomposition is
+# exact:
 #
-#     EKE = 0.5 * ((<uu> - <u>^2) + (<vv> - <v>^2))    eddy part
-#     MKE = 0.5 * (<u>^2 + <v>^2)                      mean part
+#     EKE = 0.5 * ((<uu> - <u>^2) + (<vv> - <v>^2))     MKE = 0.5 * (<u>^2 + <v>^2)
 #     KE  = EKE + MKE = 0.5 * (<uu> + <vv>)
 #
-# so `uu` and `vv` in the file are <u^2> and <v^2>, NOT the square of anything else in it.
+# so `uu`/`vv` in the file are <u^2>/<v^2>, NOT the square of anything else in it.
 #
-# WHY NOT COMPUTE THIS FROM THE DAILY FILES WE ALREADY WRITE. Two reasons, the second decisive.
-# (1) Daily snapshots alias every motion faster than two days into the variance -- the inertial
-# period at 60S is 13.8 hours, so it folds straight onto the eddy band. The average below
-# accumulates every time step instead. (2) u and v appear ONLY in the surface file and the
-# mid-longitude section, so there is no depth-resolved answer to be had from them, and Winter
-# Water is a subsurface layer.
+# WHY NOT POST-PROCESS THE DAILY FILES. (1) Daily snapshots alias everything faster than 2 days
+# into the variance -- the inertial period at 60S is 13.8 h, folding straight onto the eddy
+# band; this accumulates every time step. (2) Decisive: u and v appear only in the surface file
+# and the mid-longitude section, and Winter Water is subsurface.
 #
-# u AND v ARE INTERPOLATED TO CELL CENTRES BEFORE THEY ARE SQUARED. On the C-grid u sits on the
-# east-west face and v on the north-south face, so their squares are not at the same point and
-# cannot be added. Interpolation does not commute with x^2, so interpolating after squaring is a
-# different and wrong operation -- it has to happen online, here. <u> is written at centres for
-# the same reason: both terms of the decomposition above have to be taken at the same place.
+# u AND v ARE CENTRED BEFORE SQUARING. On the C-grid they sit on different faces, so their
+# squares are not co-located. Interpolation does not commute with x^2, so it must happen online,
+# here. <u> is written at centres for the same reason -- both terms at the same point.
 #
-# THE NEAR-BOTTOM LEVEL IS LOW-BIASED. That interpolation reads zero out of immersed cells, so
-# the cell against topography averages a real velocity with a solid one. True of any C-grid EKE;
-# just do not read the bottom level as physics.
+# CAVEATS. The near-bottom level is low-biased (centring reads zero out of immersed cells, true
+# of any C-grid EKE -- do not read it as physics), and immersed cells are written as 0.0, not
+# missing, so mask by bathymetry before any analysis.
 #
-# THE WINDOW IS NOT A CALENDAR MONTH. Blocks run in fixed EKE_WINDOW steps from model time zero,
-# so a 30-day window matches June exactly and then drifts off every month boundary after it.
-# Irrelevant to EKE. It matters the moment you difference <T> against a B-SOSE monthly record,
-# which is centred on the middle of its calendar month -- see `bsose_window_center` in
-# setup_bsose.jl, and note that a 30-day block starting on the 1st is centred on the 16th.
+# THE WINDOW IS NOT A CALENDAR MONTH: blocks run in fixed EKE_WINDOW steps from model time zero,
+# so a 30-day window matches June then drifts. Irrelevant to EKE, but it matters the moment you
+# difference <T> against a B-SOSE monthly record -- see `bsose_window_center` in setup_bsose.jl.
 
 # ==============================================================================
 # End of configuration. Nothing below needs editing for a routine run.
