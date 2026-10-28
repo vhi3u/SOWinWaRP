@@ -84,8 +84,14 @@
 set -euo pipefail
 
 START="2014-06-01"
-ANALYSE=1
-SUMMARY=1
+# PLOTTING IS OFFLINE. These default to 0 because running the comparison inside the simulation
+# job couples two things that fail for unrelated reasons: an arm that completed showed no
+# figures when the plotting died, and an arm that died early produced nothing at all even for
+# the months it did reach. `tools/compare_offline.jl` does the whole comparison on the login
+# node, over whatever is on disk, as many times as you like. `--analysis` and `--summary` put
+# it back in the job if you want it unattended.
+ANALYSE=0
+SUMMARY=0
 MONTHS="6,7,8,9,10,11,12,1"
 STOP="2015-02-01"
 # MEASURED: 8M_bsose_fwf, the same window and grid, took 2.025 hours. 4 h is ~2x headroom.
@@ -115,6 +121,8 @@ while [ $# -gt 0 ]; do
         --start)    START="$2"; shift 2 ;;
         --stop)     STOP="$2"; shift 2 ;;
         --list)     LIST_ONLY=1; shift ;;
+        --analysis)    ANALYSE=1; shift ;;
+        --summary)     SUMMARY=1; shift ;;
         --no-analysis) ANALYSE=0; shift ;;
         --no-summary)  SUMMARY=0; shift ;;
         -h|--help)  sed -n '2,40p' "$0"; exit 0 ;;
@@ -292,13 +300,13 @@ export OUTDIR=surface_tests/figs
 export RUNS=${runs}
 export MONTHS=${MONTHS}
 mkdir -p surface_tests/out
-julia --project=. tools/compare_surface_tests.jl 2>&1 | tee surface_tests/out/summary.log
+julia --project=. tools/compare_offline.jl 2>&1 | tee surface_tests/out/summary.log
 
 echo " Finished  : \$(date)"
 EOF
     sid=$(submit_job "$sjob" --job-name="sfc_summary" --dependency=afterany:${dep})
     echo
-    echo "summary job $sid runs tools/compare_surface_tests.jl after all ${#JIDS[@]} arms terminate"
+    echo "summary job $sid runs tools/compare_offline.jl after all ${#JIDS[@]} arms terminate"
 fi
 
 if [ $LIST_ONLY -eq 0 ]; then
@@ -306,5 +314,8 @@ if [ $LIST_ONLY -eq 0 ]; then
     echo "Submitted. Watch with:  squeue -u \$USER"
     echo "Watch a run live:       tail -f surface_tests/out/<arm>.log"
     echo "Collect failures:       grep -h '^RESULT' logs/sfc_*.out"
-    echo "Figures land in:        surface_tests/figs"
+    echo
+    echo "Then plot, on the login node, over whatever has finished -- it skips the arms that"
+    echo "have not, and says so:"
+    echo "    OUTDIR=surface_tests/figs julia --project=. tools/compare_offline.jl"
 fi

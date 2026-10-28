@@ -1,4 +1,9 @@
 # ==============================================================================
+# SUPERSEDED by tools/compare_offline.jl, which does everything this does plus the per-arm
+# figures, and masks the section against BOTH bathymetries instead of against isfinite -- see
+# the note there about B-SOSE being finite below its own sea floor. Kept because it still runs;
+# reach for compare_offline.jl.
+#
 # compare_surface_tests.jl -- the surface-forcing ladder, all arms on one set of axes.
 #
 #     julia --project=. tools/compare_surface_tests.jl
