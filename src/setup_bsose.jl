@@ -837,6 +837,19 @@ function find_bsose_time_index(ds::Dataset, target_date)
     time_raw = ds["time"][:]
     target_dt = DateTime(target_date)
 
+    # A RECORD STAMP MEANS THAT RECORD. `dates = all_dates(dataset, var)` is the standard way
+    # to build a `Metadata`, so most callers pass stamps rather than simulation dates: every
+    # default argument in this file, `bc_dates` in model.jl, and the analysis scripts. The
+    # window scan below gets those wrong. A stamp sits at the END of the window it averages,
+    # and the i156 stamps drift about ten hours per record, so most land just past their own
+    # month boundary and fall inside the NEXT record's window — 32 of 144 for i156, 27 of 60
+    # for i105. In a 2014-06 to 2016-06 run that silently shifted 15 of 26 records one month
+    # late and dropped two months of the seasonal cycle, replacing them with duplicates of
+    # their successors. Matching the stamp first leaves the scan below seeing only genuine
+    # simulation dates, which is what it was written for.
+    exact = findfirst(t -> DateTime(t) == target_dt, time_raw)
+    isnothing(exact) || return exact
+
     # Pick the record whose averaging window contains `target_date`, using the same
     # convention as `averaging_window`: a BSOSE monthly mean is stamped at the end of the
     # month it averages. Matching the calendar month of the stamp instead would be wrong
