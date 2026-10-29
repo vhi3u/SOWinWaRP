@@ -62,7 +62,7 @@
 #     MLD_DT      density threshold, kg/m^3                  (default: 0.03)
 # ==============================================================================
 
-using NCDatasets, Dates, Printf, Statistics
+using NCDatasets, Dates, Printf, Statistics, CairoMakie
 include(joinpath(@__DIR__, "mld.jl"))      # one implementation of the threshold, shared
 
 const DIR  = get(ENV, "BSOSE_DIR", "data")
@@ -70,6 +70,7 @@ const ITER = parse(Int, get(ENV, "ITER", "156"))
 const YEAR = parse(Int, get(ENV, "YEAR", "2015"))
 const ZMAX = parse(Float64, get(ENV, "ZMAX", "600"))
 const S0   = parse(Float64, get(ENV, "S0", "34.0"))
+const OUTDIR = get(ENV, "OUTDIR", "figs")
 
 # `rho_theta` from tools/mld.jl is SeawaterPolynomials' rho-prime: a density ANOMALY about
 # `reference_density`, which TEOS10 sets to 1020, so it comes back around 7, not 1027. mld.jl
@@ -320,6 +321,7 @@ if HAS3D
     # Season from B-SOSE's own mixed layer: shallowest in Jan-Apr, deepest in Aug-Nov, per band.
     cand_start = [k for k in months if month(monthof(k)) in 1:4]
     cand_end   = [k for k in months if month(monthof(k)) in 8:11]
+    RESULTS = NamedTuple[]
     (isempty(cand_start) || isempty(cand_end)) && error("$YEAR does not cover Jan-Apr and Aug-Nov")
 
     @printf("\n  %-10s %-9s %-9s %10s %10s %12s %12s %8s\n",
@@ -356,6 +358,9 @@ if HAS3D
                 -lo, -hi, Dates.format(monthof(ks), "yyyy-mm"), Dates.format(monthof(ke), "yyyy-mm"),
                 band_mean(mldof[ks], lo, hi), h_end, required, supplied,
                 required == 0 ? NaN : supplied / required)
+        push!(RESULTS, (band = @sprintf("%.0fS-%.0fS", -lo, -hi), h0 = band_mean(mldof[ks], lo, hi),
+                        h1 = h_end, required = required, supplied = supplied,
+                        season = Dates.format(monthof(ks), "u") * "-" * Dates.format(monthof(ke), "u")))
     end
 
     println()
@@ -364,4 +369,72 @@ if HAS3D
     println("  ratio <  1 : the forcing cannot make it, and the shortfall is the size of the")
     println("               forcing problem. Wind stirring adds to the supply and eddy")
     println("               restratification adds to the requirement; neither is counted here.")
+end
+
+# ── figures ───────────────────────────────────────────────────────────────────────────────────
+mkpath(OUTDIR)
+mlabels = [Dates.format(monthof(k), "u") for k in months]
+
+# 1. the seasonal cycle of each buoyancy term, per band. The zero line is the thing to read
+#    against: a month above it is being STABILISED by the surface forcing, whatever the mixed
+#    layer is doing, and cannot be deepening on buoyancy alone.
+fig = Figure(size = (320 * length(BANDS) + 160, 420))
+Label(fig[0, 1:length(BANDS)],
+      "Surface buoyancy flux as the model applies it — $YEAR" *
+      (HAS3D ? "" : "  (no 3-D files: shortwave term omitted)"),
+      fontsize = 17, font = :bold)
+ymax = maximum(abs, [1e8 * band_mean(B0[k][i], lo, hi)
+                     for k in months, i in 1:4, (lo, hi) in BANDS
+                     if isfinite(band_mean(B0[k][i], lo, hi))]; init = 1.0)
+for (c, (lo, hi)) in enumerate(BANDS)
+    ax = Axis(fig[1, c], title = @sprintf("%.0fS to %.0fS", -lo, -hi), titlesize = 12,
+              xlabel = "month", ylabel = c == 1 ? "1e-8 m² s⁻³" : "",
+              xticks = (1:length(months), mlabels), yticklabelsvisible = c == 1)
+    hlines!(ax, [0], color = :gray60, linewidth = 1)
+    for (tag, idx, col, lw) in (("non-solar", 2, :firebrick, 1.5), ("solar above ML", 3, :goldenrod, 1.5),
+                                ("salt", 4, :royalblue, 1.5), ("total", 1, :black, 2.5))
+        ys = [1e8 * band_mean(B0[k][idx], lo, hi) for k in months]
+        lines!(ax, 1:length(months), ys, color = col, linewidth = lw, label = tag)
+    end
+    ylims!(ax, -1.1ymax, 1.1ymax)
+    c == length(BANDS) && axislegend(ax; position = :lt, framevisible = false, labelsize = 9)
+end
+Label(fig[2, 1:length(BANDS)],
+      "Negative drives convection. Where `total` sits above zero through the freezing season, " *
+      "the surface forcing is stabilising that band\nand whatever mixed layer forms there is " *
+      "being made by the wind, which this budget does not count.",
+      fontsize = 11, justification = :center)
+f1 = joinpath(OUTDIR, "buoyancy_flux_$(YEAR).png"); save(f1, fig); @info "wrote $f1"
+
+# 2. required against supplied. A bar chart because the question is a comparison of two
+#    scalars per band, and the ratio is the whole answer.
+if HAS3D && !isempty(RESULTS)
+    fig = Figure(size = (900, 460))
+    Label(fig[0, 1], "Can the applied surface forcing make B-SOSE's own mixed layer? — $YEAR",
+          fontsize = 17, font = :bold)
+    ax = Axis(fig[1, 1], xlabel = "", ylabel = "buoyancy  (m² s⁻²)",
+              xticks = (1:length(RESULTS), [r.band for r in RESULTS]))
+    n = length(RESULTS)
+    barplot!(ax, (1:n) .- 0.19, [r.required for r in RESULTS], width = 0.36,
+             color = :grey35, label = "required (B-SOSE column → B-SOSE MLD)")
+    barplot!(ax, (1:n) .+ 0.19, [isfinite(r.supplied) ? max(r.supplied, 0.0) : 0.0 for r in RESULTS], width = 0.36,
+             color = :seagreen, label = "supplied (surface buoyancy loss)")
+    for (i, r) in enumerate(RESULTS)
+        ratio = r.required == 0 ? NaN : r.supplied / r.required
+        text!(ax, i, max(r.required, isfinite(r.supplied) ? r.supplied : 0.0) * 1.06,
+              text = @sprintf("%.2f", ratio), align = (:center, :bottom),
+              fontsize = 13, font = :bold, color = ratio >= 1 ? :seagreen : :firebrick)
+        text!(ax, i, -0.02 * maximum(x -> x.required, RESULTS),
+              text = @sprintf("%.0f→%.0f m\n%s", r.h0, r.h1, r.season),
+              align = (:center, :top), fontsize = 9, color = :gray40)
+    end
+    # Room under the axis for the two-line annotation, which otherwise clips.
+    ylims!(ax, -0.17 * maximum(x -> x.required, RESULTS), nothing)
+    axislegend(ax; position = :lt, framevisible = false, labelsize = 10)
+    Label(fig[2, 1],
+          "Ratio ≥ 1: the energy to make that mixed layer is present in the forcing, so a model " *
+          "that falls short is not being starved.\nRatio < 1 is only evidence of a forcing " *
+          "deficit where buoyancy dominates — elsewhere the wind does the mixing and is not counted here.",
+          fontsize = 11, justification = :center)
+    f2 = joinpath(OUTDIR, "mixing_energetics_$(YEAR).png"); save(f2, fig); @info "wrote $f2"
 end
