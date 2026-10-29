@@ -2,7 +2,7 @@
 # compare_mld.jl -- model mixed layer depth against B-SOSE's, month by month.
 #
 #     RUN=wind_fw_sw julia --project=. tools/compare_mld.jl
-#     RUN=2Y_wind_fw_sw DIR=. MONTHS=8,9,10 julia --project=. tools/compare_mld.jl
+#     RUN=2Y_wind_fw_sw MONTHS=8,9,10 julia --project=. tools/compare_mld.jl
 #
 # WHY. The summer salinity bias and the pre-shortwave-split warm band both sit in the seasonal
 # ice zone, and both are what you would expect from a mixed layer that is too shallow: the same
@@ -25,7 +25,7 @@
 #
 # ENV
 #     RUN     run name prefix                 (default: wind_fw_sw)
-#     DIR     where the .nc files live        (default: surface_tests)
+#     DIR     where the .nc files live        (default: auto, "." then surface_tests)
 #     OUTDIR  figures                         (default: <DIR>/figs)
 #     MONTHS  calendar months                 (default: 6,7,8,9,10,11,12,1)
 #     START   first day of the run            (default: 2014-06-01)
@@ -45,7 +45,27 @@ const λ₁, λ₂, φ₁, φ₂ = 90.0, 150.0, -70.0, -45.0
 const Z_EXTENT, DZ_SURFACE, DZ_BOTTOM, Z_CONST = 5800, 8, 400, 250
 
 const RUN     = get(ENV, "RUN", "wind_fw_sw")
-const DIR     = get(ENV, "DIR", "surface_tests")
+
+# WHERE THE OUTPUT IS. `src/model.jl` writes bare filenames, so a single run lands in whatever
+# directory the job ran from, which is the repo root. The sweep is the exception:
+# `run_surface_tests` puts its seven arms under `surface_tests/`. Defaulting to either one makes
+# the other fail on a path nobody passed, so probe both and say which was used. An explicit DIR
+# is honoured as given, including one that turns out to be wrong -- the check below then names
+# the full paths it tried.
+const DIR_CANDIDATES = [".", "surface_tests"]
+
+function resolve_dir(run)
+    haskey(ENV, "DIR") && return ENV["DIR"]
+    for d in DIR_CANDIDATES
+        isfile(joinpath(d, "$(run)_eke.nc")) && return d
+        isfile(joinpath(d, "$(run)_midlon.nc")) && return d
+    end
+    error("found no $(run)_eke.nc or $(run)_midlon.nc under " *
+          join(map(d -> "\"$d\"", DIR_CANDIDATES), " or ") *
+          " -- pass DIR=<directory> if the run wrote somewhere else")
+end
+
+const DIR     = resolve_dir(RUN)
 const OUTDIR  = get(ENV, "OUTDIR", joinpath(DIR, "figs"))
 const MONTHS  = parse.(Int, split(get(ENV, "MONTHS", "6,7,8,9,10,11,12,1"), ","))
 const START   = DateTime(get(ENV, "START", "2014-06-01"))
@@ -57,6 +77,8 @@ sect_path = joinpath(DIR, "$(RUN)_midlon.nc")
 has_eke   = isfile(eke_path)
 has_sect  = isfile(sect_path)
 has_eke || has_sect || error("neither $eke_path nor $sect_path exists -- nothing to compare")
+@info "reading $RUN from $(abspath(DIR))" *
+      (haskey(ENV, "DIR") ? "" : " (found by probing $(join(DIR_CANDIDATES, ", ")))")
 has_eke  || @warn "$eke_path is missing: no MLD map. Was EKE_DIAGNOSTICS/EKE_FULL_DEPTH on?"
 has_sect || @warn "$sect_path is missing: no MLD section, and no check on the mean-of-MLD gap"
 
