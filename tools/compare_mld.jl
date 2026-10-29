@@ -160,8 +160,7 @@ if has_eke
         T = Float64.(coalesce.(ds["T"][:, :, :, n], NaN))
         S = Float64.(coalesce.(ds["S"][:, :, :, n], NaN))
         push!(mod_mld, mld_map(T, S, kbot_model))
-        push!(paired, Dates.format(centres[n], "mm-dd") * @sprintf(" (%+.0fd)",
-                      Dates.value(centres[n] - target) / 86400_000))
+        push!(paired, @sprintf("%+.0fd", Dates.value(centres[n] - target) / 86400_000))
     end
     close(ds)
 end
@@ -234,6 +233,15 @@ if has_eke
     println("  B / M / Δ  =  B-SOSE / model / model minus B-SOSE.  Negative Δ = the model's")
     println("  mixed layer is TOO SHALLOW, which is the suspect for the summer surface biases.")
     println("="^104)
+    # How well each model window lines up with the BSOSE month it is being compared against.
+    # The EKE blocks are fixed 30-day steps from model time zero, NOT calendar months
+    # (model.jl:379), so over a 2-year run they drift about ten days against the month centres.
+    # In Sep and Oct, when the mixed layer moves fastest, that offset is worth reading with the
+    # numbers rather than discovering afterwards.
+    @printf("\n  %-8s |", "offset")
+    for k in 1:nm; @printf("%9s", paired[k]); end
+    println()
+
     for (lo, hi) in bands
         @printf("\n  %.0fS to %.0fS\n", -lo, -hi)
         @printf("  %-8s |", "")
