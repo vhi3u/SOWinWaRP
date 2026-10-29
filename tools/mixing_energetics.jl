@@ -70,7 +70,16 @@ const ITER = parse(Int, get(ENV, "ITER", "156"))
 const YEAR = parse(Int, get(ENV, "YEAR", "2015"))
 const ZMAX = parse(Float64, get(ENV, "ZMAX", "600"))
 const S0   = parse(Float64, get(ENV, "S0", "34.0"))
-const OUTDIR = get(ENV, "OUTDIR", "figs")
+# This one never reads run output, only B-SOSE, so there is no sweep case: always `plots/`.
+const OUTDIR = get(ENV, "OUTDIR", "plots")
+
+# Optional second column: OUR model's own stratification instead of B-SOSE's. The B-SOSE
+# column answers 'is the forcing adequate in principle'. This one answers 'is our drifted
+# state still mixable by it', which is the other half and the one that separates a closure
+# problem from a state problem.
+const MODEL_RUN   = get(ENV, "MODEL_RUN", "")
+const MODEL_START = DateTime(get(ENV, "MODEL_START", "2014-06-01"))
+const MODEL_DIRS  = [get(ENV, "MODEL_DIR", ".") , "surface_tests"]
 
 # `rho_theta` from tools/mld.jl is SeawaterPolynomials' rho-prime: a density ANOMALY about
 # `reference_density`, which TEOS10 sets to 1020, so it comes back around 7, not 1027. mld.jl
@@ -207,6 +216,39 @@ kbot_native = [wet[i, j] ? something(findlast(k -> -RC[k] <= depth[i, j], 1:NZ),
                for i in axes(depth, 1), j in axes(depth, 2)]
 
 """
+    deficit_profile(Tc, Sc, zs, h)
+
+Buoyancy the mixed layer must remove to reach depth `h`, in m^2/s^2, for one column given
+SURFACE-FIRST profiles. `NaN` when the column does not reach `h` or carries a gap.
+
+Shared by the B-SOSE path and the model path so the two cannot drift apart; the trapezoid and
+the surface-cell extension are pinned by the scratchpad test against an independent sum and
+against the analytic N^2 h^2 / 2 for a linear profile.
+"""
+function deficit_profile(Tc, Sc, zs, h)
+    kb = length(zs)
+    kb >= 2 || return NaN
+    (isfinite(h) && h > 0) || return NaN
+    -zs[kb] >= h || return NaN                  # column shallower than the target depth
+    kh = findfirst(k -> -zs[k] >= h, 1:kb)
+    kh === nothing && return NaN
+
+    bz(k) = (ρ = rho_full(Tc[k], Sc[k]); isfinite(ρ) ? -g * (ρ - ρ₀) / ρ₀ : NaN)
+    bh = bz(kh)
+    isfinite(bh) || return NaN
+
+    # Trapezoid over the top kh levels, with the surface cell extended to z = 0.
+    total = 0.0
+    for k in 1:(kh - 1)
+        b1, b2 = bz(k), bz(k + 1)
+        (isfinite(b1) && isfinite(b2)) || return NaN
+        total += 0.5 * ((b1 - bh) + (b2 - bh)) * (zs[k] - zs[k + 1])
+    end
+    total += (bz(1) - bh) * (0.0 - zs[1])
+    return total
+end
+
+"""
     column_mld_and_deficit(T, S, i, j, h)
 
 `(mld, deficit)` for one column. `mld` uses the shared threshold from `tools/mld.jl`, which
@@ -222,24 +264,7 @@ function column_mld_and_deficit(T, S, i, j, h)
 
     hmld = mld(reverse(Tc), reverse(Sc), reverse(zc), 1)
 
-    isfinite(h) && h > 0 || return (hmld, NaN)
-    -zc[kb] >= h || return (hmld, NaN)          # column shallower than the target depth
-    kh = findfirst(k -> -zc[k] >= h, 1:kb)
-    kh === nothing && return (hmld, NaN)
-
-    bz(k) = (ρ = rho_full(Tc[k], Sc[k]); isfinite(ρ) ? -g * (ρ - ρ₀) / ρ₀ : NaN)
-    bh = bz(kh)
-    isfinite(bh) || return (hmld, NaN)
-
-    # Trapezoid over the top kh levels, with the surface cell extended to z = 0.
-    total = 0.0
-    for k in 1:(kh - 1)
-        b1, b2 = bz(k), bz(k + 1)
-        (isfinite(b1) && isfinite(b2)) || return (hmld, NaN)
-        total += 0.5 * ((b1 - bh) + (b2 - bh)) * (zc[k] - zc[k + 1])
-    end
-    total += (bz(1) - bh) * (0.0 - zc[1])
-    return (hmld, total)
+    return (hmld, deficit_profile(Tc, Sc, zc, h))
 end
 
 band_mask(lo, hi) = [lo <= LATS[j] < hi for j in axes(depth, 2)]
@@ -311,6 +336,82 @@ for (lo, hi) in BANDS
     end
 end
 
+
+# ── our model's own column ────────────────────────────────────────────────────────────────────
+# No `for` loop with an assignment in it: at top level that makes a NEW LOCAL and leaves the
+# global empty, silently, which is how this returned "--" the first time. `findfirst` keeps the
+# assignment out of the loop body entirely.
+hit = isempty(MODEL_RUN) ? nothing :
+      findfirst(d -> isfile(joinpath(d, "$(MODEL_RUN)_eke.nc")), MODEL_DIRS)
+model_path = hit === nothing ? "" : joinpath(MODEL_DIRS[hit], "$(MODEL_RUN)_eke.nc")
+
+if !isempty(MODEL_RUN)
+    isempty(model_path) ?
+        @warn("no $(MODEL_RUN)_eke.nc under $(join(MODEL_DIRS, " or ")) -- skipping the model column") :
+        @info "model column from $model_path"
+end
+
+# NetCDFWriter names its coordinates after the field's location, so the z of a Center field is
+# `z_aac` rather than anything guessable. Try the spellings in use and say what is there on a miss.
+function coordvar(ds, cands, what)
+    for c in cands
+        haskey(ds, c) && return Float64.(coalesce.(ds[c][:], NaN))
+    end
+    error("no $what coordinate in $(path(ds)); tried $(join(cands, ", ")). Keys: $(collect(keys(ds)))")
+end
+
+"""
+    model_required(file, target_month, lo, hi, h)
+
+`(required, offset_days)` for our own column: the buoyancy the mixed layer must remove to reach
+`h` in band `lo..hi`, from the 30-day mean nearest `target_month`, cos-lat weighted.
+
+Read against the B-SOSE value in the same row. B-SOSE's answers whether the forcing is adequate
+in principle; this one answers whether our drifted column is still mixable by it, and the two
+diverging is the whole signature of a state problem rather than a closure problem.
+"""
+function model_required(file, target_month, lo, hi, h)
+    ds = Dataset(file)
+    try
+        zs_up = coordvar(ds, ["z_aac", "zC", "z_c", "z"], "z")              # bottom-to-top
+        lats  = coordvar(ds, ["y_aca", "φ_aca", "φ_cca", "yC", "latitude", "lat", "y"], "latitude")
+        tt    = Float64.(ds["time"][:])
+        win   = haskey(ds.attrib, "averaging_window_seconds") ?
+                Float64(ds.attrib["averaging_window_seconds"]) : 30 * 86400.0
+        centres = [MODEL_START + Second(round(Int, x - win / 2)) for x in tt]
+        gap, n = findmin(abs(Dates.value(c - target_month)) for c in centres)
+        gapdays = gap / 86400_000
+        if gapdays > 20
+            @warn "nearest model window is $(round(gapdays, digits = 1)) days from " *
+                  "$(Dates.format(target_month, "yyyy-mm")); not pairing it"
+            return (NaN, NaN)
+        end
+        T = Float64.(coalesce.(ds["T"][:, :, :, n], NaN))
+        S = Float64.(coalesce.(ds["S"][:, :, :, n], NaN))
+        zs = reverse(zs_up)                                                 # surface-first
+
+        num = den = 0.0
+        for j in axes(T, 2)
+            (lo <= lats[j] < hi) || continue
+            w = cosd(lats[j])
+            for i in axes(T, 1)
+                Tc, Sc = reverse(T[i, j, :]), reverse(S[i, j, :])
+                # Oceananigans writes immersed cells as EXACT zeros, so `S != 0` is the wet
+                # test. `isfinite` is not, for the same reason it is not on the B-SOSE side.
+                kb = something(findlast(k -> Sc[k] != 0 && isfinite(Sc[k]), eachindex(Sc)), 0)
+                kb >= 2 || continue
+                d = deficit_profile(Tc[1:kb], Sc[1:kb], zs[1:kb], h)
+                isfinite(d) || continue
+                num += w * d; den += w
+            end
+        end
+        return (den == 0 ? NaN : num / den,
+                Dates.value(centres[n] - target_month) / 86400_000)
+    finally
+        close(ds)
+    end
+end
+
 if HAS3D
     println()
     println("="^108)
@@ -324,10 +425,11 @@ if HAS3D
     RESULTS = NamedTuple[]
     (isempty(cand_start) || isempty(cand_end)) && error("$YEAR does not cover Jan-Apr and Aug-Nov")
 
-    @printf("\n  %-10s %-9s %-9s %10s %10s %12s %12s %8s\n",
-            "band", "start", "end", "MLD start", "MLD end", "required", "supplied", "ratio")
-    @printf("  %-10s %-9s %-9s %10s %10s %12s %12s %8s\n",
-            "", "", "", "(m)", "(m)", "(m2/s2)", "(m2/s2)", "")
+    @printf("\n  %-10s %-9s %-9s %9s %9s %11s %11s %11s %8s %8s\n",
+            "band", "start", "end", "MLD start", "MLD end",
+            "req BSOSE", "req model", "supplied", "ratio B", "ratio M")
+    @printf("  %-10s %-9s %-9s %9s %9s %11s %11s %11s %8s %8s\n",
+            "", "", "", "(m)", "(m)", "(m2/s2)", "(m2/s2)", "(m2/s2)", "", "")
 
     for (lo, hi) in BANDS
         ks = cand_start[argmin([band_mean(mldof[k], lo, hi) for k in cand_start])]
@@ -354,12 +456,18 @@ if HAS3D
             supplied -= 0.5 * (b1 + b2) * dt
         end
 
-        @printf("  %4.0fS-%2.0fS  %-9s %-9s %10.1f %10.1f %12.4f %12.4f %8.2f\n",
+        req_model = isempty(model_path) ? NaN :
+                    first(model_required(model_path, monthof(ks), lo, hi, h_end))
+        cellf(v) = isnan(v) ? lpad("--", 11) : @sprintf("%11.4f", v)
+        ratf(v)  = isnan(v) ? lpad("--", 8)  : @sprintf("%8.2f", v)
+        @printf("  %4.0fS-%2.0fS  %-9s %-9s %9.1f %9.1f %s %s %s %s %s\n",
                 -lo, -hi, Dates.format(monthof(ks), "yyyy-mm"), Dates.format(monthof(ke), "yyyy-mm"),
-                band_mean(mldof[ks], lo, hi), h_end, required, supplied,
-                required == 0 ? NaN : supplied / required)
+                band_mean(mldof[ks], lo, hi), h_end,
+                cellf(required), cellf(req_model), cellf(supplied),
+                ratf(required == 0 ? NaN : supplied / required),
+                ratf(isfinite(req_model) && req_model != 0 ? supplied / req_model : NaN))
         push!(RESULTS, (band = @sprintf("%.0fS-%.0fS", -lo, -hi), h0 = band_mean(mldof[ks], lo, hi),
-                        h1 = h_end, required = required, supplied = supplied,
+                        h1 = h_end, required = required, req_model = req_model, supplied = supplied,
                         season = Dates.format(monthof(ks), "u") * "-" * Dates.format(monthof(ke), "u")))
     end
 
@@ -415,26 +523,36 @@ if HAS3D && !isempty(RESULTS)
     ax = Axis(fig[1, 1], xlabel = "", ylabel = "buoyancy  (m² s⁻²)",
               xticks = (1:length(RESULTS), [r.band for r in RESULTS]))
     n = length(RESULTS)
-    barplot!(ax, (1:n) .- 0.19, [r.required for r in RESULTS], width = 0.36,
-             color = :grey35, label = "required (B-SOSE column → B-SOSE MLD)")
-    barplot!(ax, (1:n) .+ 0.19, [isfinite(r.supplied) ? max(r.supplied, 0.0) : 0.0 for r in RESULTS], width = 0.36,
-             color = :seagreen, label = "supplied (surface buoyancy loss)")
+    hasmodel = any(r -> isfinite(r.req_model), RESULTS)
+    off, wid = hasmodel ? (0.26, 0.24) : (0.19, 0.36)
+    barplot!(ax, (1:n) .- off, [r.required for r in RESULTS], width = wid,
+             color = :grey35, label = "required — B-SOSE column")
+    hasmodel && barplot!(ax, 1:n, [isfinite(r.req_model) ? r.req_model : 0.0 for r in RESULTS],
+                         width = wid, color = :darkorange3, label = "required — our column")
+    barplot!(ax, (1:n) .+ off, [isfinite(r.supplied) ? max(r.supplied, 0.0) : 0.0 for r in RESULTS],
+             width = wid, color = :seagreen, label = "supplied — surface buoyancy loss")
     for (i, r) in enumerate(RESULTS)
         ratio = r.required == 0 ? NaN : r.supplied / r.required
-        text!(ax, i, max(r.required, isfinite(r.supplied) ? r.supplied : 0.0) * 1.06,
-              text = @sprintf("%.2f", ratio), align = (:center, :bottom),
-              fontsize = 13, font = :bold, color = ratio >= 1 ? :seagreen : :firebrick)
-        text!(ax, i, -0.02 * maximum(x -> x.required, RESULTS),
+        rm = isfinite(r.req_model) && r.req_model != 0 ? r.supplied / r.req_model : NaN
+        top = maximum(x -> isfinite(x) ? x : 0.0, (r.required, r.req_model, r.supplied))
+        text!(ax, i, top * 1.06,
+              text = isfinite(rm) ? @sprintf("B %.2f / M %.2f", ratio, rm) : @sprintf("%.2f", ratio),
+              align = (:center, :bottom),
+              fontsize = isfinite(rm) ? 11 : 13, font = :bold,
+              color = (isfinite(rm) ? rm : ratio) >= 1 ? :seagreen : :firebrick)
+        text!(ax, i, -0.02 * maximum(x -> max(x.required, isfinite(x.req_model) ? x.req_model : 0.0), RESULTS),
               text = @sprintf("%.0f→%.0f m\n%s", r.h0, r.h1, r.season),
               align = (:center, :top), fontsize = 9, color = :gray40)
     end
     # Room under the axis for the two-line annotation, which otherwise clips.
-    ylims!(ax, -0.17 * maximum(x -> x.required, RESULTS), nothing)
+    ylims!(ax, -0.17 * maximum(x -> max(x.required, isfinite(x.req_model) ? x.req_model : 0.0), RESULTS), nothing)
     axislegend(ax; position = :lt, framevisible = false, labelsize = 10)
     Label(fig[2, 1],
-          "Ratio ≥ 1: the energy to make that mixed layer is present in the forcing, so a model " *
-          "that falls short is not being starved.\nRatio < 1 is only evidence of a forcing " *
-          "deficit where buoyancy dominates — elsewhere the wind does the mixing and is not counted here.",
+          "Ratio ≥ 1: the buoyancy to make that mixed layer is present in the forcing. Wind " *
+          "supplies more on top and is NOT counted here, so a low ratio is not by itself a " *
+          "forcing deficit.\nB uses B-SOSE's column — is the forcing adequate in principle. " *
+          "M uses ours — is our drifted column still mixable by it. M far below B is a state " *
+          "problem, not a closure problem.",
           fontsize = 11, justification = :center)
     f2 = joinpath(OUTDIR, "mixing_energetics_$(YEAR).png"); save(f2, fig); @info "wrote $f2"
 end

@@ -26,7 +26,7 @@
 # ENV
 #     RUN     run name prefix                 (default: wind_fw_sw)
 #     DIR     where the .nc files live        (default: auto, "." then surface_tests)
-#     OUTDIR  figures                         (default: <DIR>/figs)
+#     OUTDIR  figures                         (default: surface_tests/figs, else plots)
 #     MONTHS  calendar months                 (default: 6,7,8,9,10,11,12,1)
 #     START   first day of the run            (default: 2014-06-01)
 #     MLD_DT  density threshold, kg/m3        (default: 0.03, de Boyer Montegut)
@@ -66,7 +66,11 @@ function resolve_dir(run)
 end
 
 const DIR     = resolve_dir(RUN)
-const OUTDIR  = get(ENV, "OUTDIR", joinpath(DIR, "figs"))
+# Figures live beside the sweep when that is what is being read, because `surface_tests/figs`
+# is where the seven arms' output already is. Anything else -- a single run out of the repo
+# root -- puts them in `plots/` with the rest, rather than scattering a `figs/` next to it.
+const OUTDIR  = get(ENV, "OUTDIR",
+                    DIR == "surface_tests" ? joinpath(DIR, "figs") : "plots")
 const MONTHS  = parse.(Int, split(get(ENV, "MONTHS", "6,7,8,9,10,11,12,1"), ","))
 const START   = DateTime(get(ENV, "START", "2014-06-01"))
 const MLD_MAX = parse(Float64, get(ENV, "MLD_MAX", "400"))
