@@ -29,7 +29,11 @@
 #   from B-SOSE's T,S at the START of the season, with h = B-SOSE's mixed layer depth at the
 #   END of it.
 #
-#   SUPPLIED, the time integral of the surface buoyancy flux as `setup_bsose.jl` delivers it:
+#   SUPPLIED, the time integral of the surface buoyancy flux as `setup_bsose.jl` delivers it,
+#   over the DEEPENING PHASE -- from the month the band first starts losing buoyancy to the
+#   month its mixed layer is deepest. Starting instead at the shallowest mixed layer charges
+#   the season for the whole summer restratification and makes the ratio a statement about
+#   that summer rather than about the forcing; see the season selection for the numbers:
 #
 #       B0 = g*alpha*Q/(rho0*cp) - g*beta*Fs/rho0        [m^2/s^3]
 #       Bsup = - integral of B0 dt  over the season      [m^2/s^2], positive = buoyancy LOST
@@ -47,6 +51,12 @@
 # therefore a bound, not a simulation: `supplied << required` is strong evidence the forcing is
 # deficient, while `supplied >= required` says only that the energy is there to be used.
 #
+# AND READ `req model` AGAINST `req BSOSE` FIRST. With MODEL_RUN set, the same deficit
+# integral is run on OUR column as well as B-SOSE's. That pair never touches `supplied`, so
+# unlike either ratio it carries no window sensitivity and no wind-stirring caveat: it asks
+# only whether our water is harder to mix than B-SOSE's at the same place and month. A large
+# excess in one band and not the others is a drifted state; a uniform one is a closure.
+#
 # EVERYTHING IS B-SOSE. Both sides use B-SOSE's own fields and the same equation of state, so
 # the potential-temperature versus conservative-temperature mismatch that matters when
 # comparing across the two models does not enter here.
@@ -60,6 +70,10 @@
 #     ZMAX        depth to read and integrate over, m        (default: 600)
 #     S0          reference salinity in the virtual flux     (default: 34.0, matches model.jl)
 #     MLD_DT      density threshold, kg/m^3                  (default: 0.03)
+#     WINDOW      where the freezing season starts          (default: deepening)
+#                 "deepening" = the autumn buoyancy-flux sign change
+#                 "mldmin"    = the shallowest mixed layer in Jan-Apr (pre-10.29.2026)
+#     MODEL_RUN   run name, to add OUR column beside B-SOSE's   (default: none)
 # ==============================================================================
 
 using NCDatasets, Dates, Printf, Statistics, CairoMakie
@@ -72,6 +86,14 @@ const ZMAX = parse(Float64, get(ENV, "ZMAX", "600"))
 const S0   = parse(Float64, get(ENV, "S0", "34.0"))
 # This one never reads run output, only B-SOSE, so there is no sweep case: always `plots/`.
 const OUTDIR = get(ENV, "OUTDIR", "plots")
+
+# WINDOW. Which month the freezing season is taken to START at. This turns out to matter more
+# than anything else in the script -- see the long comment above the season selection below.
+#     "deepening" (default)  the autumn sign change, when the band first starts losing buoyancy
+#     "mldmin"               the shallowest mixed layer in Jan-Apr; what this did before 10.29.2026
+const WINDOW = lowercase(get(ENV, "WINDOW", "deepening"))
+WINDOW in ("deepening", "mldmin") ||
+    error("WINDOW must be \"deepening\" or \"mldmin\", got \"$WINDOW\"")
 
 # Optional second column: OUR model's own stratification instead of B-SOSE's. The B-SOSE
 # column answers 'is the forcing adequate in principle'. This one answers 'is our drifted
@@ -412,18 +434,59 @@ function model_required(file, target_month, lo, hi, h)
     end
 end
 
+
+"""
+    deepening_start(kmin, ke, lo, hi)
+
+First month in `kmin:ke` whose band-mean surface buoyancy flux is NEGATIVE -- the autumn sign
+change, when the band actually begins losing buoyancy. Falls back to `kmin` with a warning if it
+never does before its mixed layer maximum, which would otherwise leave the window empty.
+
+Past the sign change the integral runs SIGNED through to `ke`: a single positive month inside the
+deepening phase genuinely slows the layer down and is not something to skip over.
+"""
+function deepening_start(kmin, ke, lo, hi)
+    span = [k for k in months if monthof(kmin) <= monthof(k) < monthof(ke)]
+    function isneg(k)
+        b = band_mean(B0[k][1], lo, hi)
+        return isfinite(b) && b < 0
+    end
+    hit = findfirst(isneg, span)
+    if hit === nothing
+        @warn "$(@sprintf("%.0fS-%.0fS", -lo, -hi)): surface buoyancy flux never turns negative " *
+              "before $(Dates.format(monthof(ke), "yyyy-mm")); keeping the mixed-layer minimum"
+        return kmin
+    end
+    return span[hit]
+end
 if HAS3D
     println()
     println("="^108)
     println("CAN THAT FORCING MAKE B-SOSE'S OWN MIXED LAYER?  season of $YEAR")
     println("="^108)
 
-    # Season: shallowest B-SOSE mixed layer in Jan-Apr, deepest in Aug-Nov, per band.
-    # Season from B-SOSE's own mixed layer: shallowest in Jan-Apr, deepest in Aug-Nov, per band.
+    # SEASON. `ke` is the deepest B-SOSE mixed layer in Aug-Nov, which sets the target depth.
+    # The START is the subtle end, and `WINDOW` chooses it.
+    #
+    # WHY THE DEFAULT IS NOT THE MIXED-LAYER MINIMUM. Anchoring at the shallowest mixed layer
+    # puts January and February inside the integral, so the season is charged for the whole
+    # summer restratification before any winter loss has begun. What the ratio then measures is
+    # how strong that particular summer was, not whether the forcing can make the mixed layer:
+    # 70S-65S came out at 0.91 for 2015 and 0.35 for 2016 off the same forcing product, and
+    # 60S-55S went NEGATIVE in 2016 -- a net buoyancy GAIN across its own freezing season, which
+    # is an artefact of the window and not a statement about anything physical. It is also
+    # internally inconsistent: `required` is read off the January column while `supplied`
+    # includes the summer flux that goes on to stratify that very column, so the two sides
+    # describe different water. Anchoring both at the autumn sign change makes them agree.
     cand_start = [k for k in months if month(monthof(k)) in 1:4]
     cand_end   = [k for k in months if month(monthof(k)) in 8:11]
     RESULTS = NamedTuple[]
     (isempty(cand_start) || isempty(cand_end)) && error("$YEAR does not cover Jan-Apr and Aug-Nov")
+
+    println("  window: $WINDOW -- the season starts at " *
+            (WINDOW == "deepening" ? "the autumn buoyancy-flux sign change" :
+                                     "the shallowest mixed layer in Jan-Apr") *
+            ", and both `required` columns are read at that month.")
 
     @printf("\n  %-10s %-9s %-9s %9s %9s %11s %11s %11s %8s %8s\n",
             "band", "start", "end", "MLD start", "MLD end",
@@ -432,8 +495,9 @@ if HAS3D
             "", "", "", "(m)", "(m)", "(m2/s2)", "(m2/s2)", "(m2/s2)", "", "")
 
     for (lo, hi) in BANDS
-        ks = cand_start[argmin([band_mean(mldof[k], lo, hi) for k in cand_start])]
-        ke = cand_end[argmax([band_mean(mldof[k], lo, hi) for k in cand_end])]
+        kmin  = cand_start[argmin([band_mean(mldof[k], lo, hi) for k in cand_start])]
+        ke    = cand_end[argmax([band_mean(mldof[k], lo, hi) for k in cand_end])]
+        ks    = WINDOW == "mldmin" ? kmin : deepening_start(kmin, ke, lo, hi)
         h_end = band_mean(mldof[ke], lo, hi)
 
         T0, S0f = load3d("Theta", ks), load3d("Salt", ks)
@@ -474,9 +538,15 @@ if HAS3D
     println()
     println("  ratio >= 1 : the forcing supplies enough buoyancy loss to make that mixed layer,")
     println("               so a model that does not make it is not being starved of energy.")
-    println("  ratio <  1 : the forcing cannot make it, and the shortfall is the size of the")
-    println("               forcing problem. Wind stirring adds to the supply and eddy")
-    println("               restratification adds to the requirement; neither is counted here.")
+    println("  ratio <  1 : buoyancy loss alone cannot make it. Wind stirring adds to the supply")
+    println("               and eddy restratification adds to the requirement, and neither is")
+    println("               counted here, so a ratio below 1 is expected and is not by itself")
+    println("               evidence of a forcing deficit.")
+    println()
+    println("  THE ROBUST COMPARISON IS `req model` AGAINST `req BSOSE`, not either ratio. That")
+    println("  pair never touches `supplied`, so it does not inherit the window sensitivity. It")
+    println("  asks only whether our column is harder to mix than B-SOSE's, and a large excess")
+    println("  in one band and not the others is a drifted state rather than a bad closure.")
 end
 
 # ── figures ───────────────────────────────────────────────────────────────────────────────────
@@ -518,7 +588,9 @@ f1 = joinpath(OUTDIR, "buoyancy_flux_$(YEAR).png"); save(f1, fig); @info "wrote 
 #    scalars per band, and the ratio is the whole answer.
 if HAS3D && !isempty(RESULTS)
     fig = Figure(size = (900, 460))
-    Label(fig[0, 1], "Can the applied surface forcing make B-SOSE's own mixed layer? — $YEAR",
+    Label(fig[0, 1],
+          "Can the applied surface forcing make B-SOSE's own mixed layer? — $YEAR" *
+          (WINDOW == "deepening" ? "" : "  (window: $WINDOW)"),
           fontsize = 17, font = :bold)
     ax = Axis(fig[1, 1], xlabel = "", ylabel = "buoyancy  (m² s⁻²)",
               xticks = (1:length(RESULTS), [r.band for r in RESULTS]))
@@ -548,11 +620,12 @@ if HAS3D && !isempty(RESULTS)
     ylims!(ax, -0.17 * maximum(x -> max(x.required, isfinite(x.req_model) ? x.req_model : 0.0), RESULTS), nothing)
     axislegend(ax; position = :lt, framevisible = false, labelsize = 10)
     Label(fig[2, 1],
-          "Ratio ≥ 1: the buoyancy to make that mixed layer is present in the forcing. Wind " *
-          "supplies more on top and is NOT counted here, so a low ratio is not by itself a " *
-          "forcing deficit.\nB uses B-SOSE's column — is the forcing adequate in principle. " *
-          "M uses ours — is our drifted column still mixable by it. M far below B is a state " *
-          "problem, not a closure problem.",
+          "Grey against orange is the robust comparison -- it never touches `supplied`. A large " *
+          "excess of orange over grey in one band and not the others is a drifted\nstate there, " *
+          "not a bad closure. The ratios do involve `supplied`, so they depend on where the " *
+          "season is taken to start (window: $WINDOW). Wind is NOT counted.",
           fontsize = 11, justification = :center)
-    f2 = joinpath(OUTDIR, "mixing_energetics_$(YEAR).png"); save(f2, fig); @info "wrote $f2"
+    f2 = joinpath(OUTDIR,
+                  "mixing_energetics_$(YEAR)$(WINDOW == "deepening" ? "" : "_" * WINDOW).png")
+    save(f2, fig); @info "wrote $f2"
 end
