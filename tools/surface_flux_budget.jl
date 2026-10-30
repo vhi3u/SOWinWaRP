@@ -322,10 +322,15 @@ if has_TS
     println()
     println("="^100)
     @printf("3. BUDGET over 0-%.0f m: flux implied vs B-SOSE's own change\n", ZTOP)
-    @printf("   !! ZTOP = %.0f m. If that is INSIDE the winter mixed layer (B-SOSE runs 180-215 m\n", ZTOP)
-    println("      here in Jun-Oct) the residual is mostly VERTICAL exchange with the water just")
-    println("      below, not lateral advection. Rerun with ZTOP=300 to enclose the mixed layer")
-    println("      and difference the two to separate them.")
+    if ZTOP < 250
+        @printf("   !! ZTOP = %.0f m is INSIDE the winter mixed layer (B-SOSE runs 177-215 m here\n", ZTOP)
+        println("      in Jun-Oct), so the residual is mostly VERTICAL exchange with the water just")
+        println("      below. Rerun with ZTOP=300 to enclose it; the difference is the vertical part.")
+    else
+        @printf("   ZTOP = %.0f m encloses B-SOSE's winter mixed layer (177-215 m Jun-Oct), so the\n", ZTOP)
+        println("   residual here is lateral convergence plus exchange ACROSS this depth, not the")
+        println("   mixed layer trading with the water below it. Compare against a ZTOP=100 run.")
+    end
     println("   Both in FLUX UNITS, so they read against each other directly.")
     println("     implied  = mean surface flux over the interval between month centres")
     println("     actual   = d/dt of the layer's heat/salt content over the same interval")
@@ -490,6 +495,135 @@ for (lo, hi) in BANDS
             a, b, a + b, abs(a) > 0 ? 100 * (1 - abs(a + b) / max(abs(a), abs(b))) : NaN)
 end
 
+# ══════════════════════════════════════════════════════════════════════════════════════════════
+# 6. IS THERE A RELAXATION TERM HIDING IN WHAT WE APPLY?
+#
+# model.jl forces with TFLUX and SFLUX. MITgcm describes those as matching heat- and
+# salt-CONTENT variations, which means they contain every term that changed the content --
+# including `TRELAX`/`SRELAX`, the restoring of the model's own surface toward observations.
+#
+# That distinction matters to us. A restoring term depends on B-SOSE's state, not ours. Applying
+# it to a model whose surface has drifted is the same frozen-feedback problem as the ice-ocean
+# heat flux: we would be handing our model a correction computed for a different ocean.
+#
+# TRELAX and SRELAX are not published on the data server. But MITgcm's decomposition is
+#
+#     TFLUX = oceQnet + oceFreez + TRELAX  (+ the heat carried by the freshwater flux)
+#     SFLUX = oceSflux          + SRELAX  (+ the salt carried by the freshwater flux)
+#
+# so the residual RECOVERS them, up to the freshwater-advection terms. Near zero means there is
+# no state correction in what we apply and TFLUX/SFLUX are safe to force with. Large means they
+# are not, and `oceQnet + oceFreez` / `oceSflux` are the physical-only alternatives.
+#
+# File token and variable name are NOT always the same here -- surfTflx holds TFLUX -- so both
+# are stated explicitly below rather than inferred.
+# ══════════════════════════════════════════════════════════════════════════════════════════════
+println()
+println("="^100)
+println("6. IMPLIED RELAXATION: TFLUX - (oceQnet + oceFreez), and SFLUX - oceSflux")
+println("   TRELAX/SRELAX are not published; this recovers them by difference.")
+println("="^100)
+
+function load_field(token, varname)
+    have(token) || (@warn "no $(basename(path(token))) -- skipping it"; return nothing)
+    ds = NCDataset(path(token))
+    haskey(ds, varname) || (close(ds);
+        @warn "$(basename(path(token))) has no \"$varname\""; return nothing)
+    mi = months_of(ds)
+    all(m -> haskey(mi, m), months) || (close(ds);
+        @warn "$token does not cover $(first(labels))..$(last(labels))"; return nothing)
+    A = zeros(ni, nj, nm)
+    for (n, m) in enumerate(months); A[:, :, n] = num(ds[varname][iu, ju, mi[m]]); end
+    close(ds)
+    @info "  loaded $token/$varname"
+    return A
+end
+
+QNET  = load_field("oceQnet",  "oceQnet")
+FREEZ = load_field("oceFreez", "oceFreez")
+SFLX  = load_field("oceSflux", "oceSflux")
+
+bandmask(lo, hi) = wet .& reshape([lo <= y < hi for y in lat], 1, :)
+
+function report_residual(label, base, parts, partnames, unit, fmt)
+    R = copy(base)
+    for P in parts; R .-= P; end
+    bm = [wmean(base[:, :, n], wet) for n in 1:nm]
+    rm_ = [wmean(R[:, :, n], wet) for n in 1:nm]
+    @printf("\n  %s - (%s)\n", label, join(partnames, " + "))
+    @printf("  %-9s |", "month")
+    for (lo, hi) in BANDS; @printf("%12s", @sprintf("%.0f-%.0fS", -lo, -hi)); end
+    @printf("%12s\n", "all")
+    println("  " * "-"^(12 + 12 * (length(BANDS) + 1)))
+    for n in 1:nm
+        @printf("  %-9s |", labels[n])
+        for (lo, hi) in BANDS
+            @printf("%12s", fmt(wmean(R[:, :, n], bandmask(lo, hi))))
+        end
+        @printf("%12s\n", fmt(rm_[n]))
+    end
+    frac = 100 * mean(abs, rm_) / mean(abs, bm)
+    @printf("\n  mean|%s| = %s,  mean|residual| = %s  ->  %.1f%% of the applied field\n",
+            label, fmt(mean(abs, bm)), fmt(mean(abs, rm_)), frac)
+    println(frac < 5 ? "  => NEGLIGIBLE. No state correction worth worrying about in $label." :
+            "  => NOT negligible. $label carries a term that is not a physical surface flux.")
+    return R, frac
+end
+
+wfmt(v) = isnan(v) ? "---" : @sprintf("%.2f", v)
+sfmt(v) = isnan(v) ? "---" : @sprintf("%.2e", v)
+
+Tres = Sres_ = nothing
+if QNET !== nothing
+    parts, names = Any[QNET], ["oceQnet"]
+    FREEZ === nothing || (push!(parts, FREEZ); push!(names, "oceFreez"))
+    Tres, _ = report_residual("TFLUX", TFLUX, parts, names, "W/m²", wfmt)
+end
+if SFLX !== nothing
+    Sres_, _ = report_residual("SFLUX", SFLUX, Any[SFLX], ["oceSflux"], "g/m²/s", sfmt)
+end
+
+# oceFreez on its own is the ice-ocean heat flux we have been trying to parameterise.
+if FREEZ !== nothing
+    fm = [wmean(FREEZ[:, :, n], wet) for n in 1:nm]
+    @printf("\n  oceFreez (heating from freezing) domain mean by month, W/m²:\n   ")
+    for n in 1:nm; @printf(" %s=%.2f", labels[n][end-1:end], fm[n]); end
+    println()
+    println("    This is the term a Losch-style freezing relaxation would have to reproduce.")
+end
+
+panels6 = Tuple{String,Array{Float64,3},String}[("TFLUX", TFLUX, "W/m²")]
+QNET  === nothing || push!(panels6, ("oceQnet", QNET, "W/m²"))
+FREEZ === nothing || push!(panels6, ("oceFreez", FREEZ, "W/m²"))
+Tres  === nothing || push!(panels6, ("implied TRELAX", Tres, "W/m²"))
+panels6s = Tuple{String,Array{Float64,3},String}[("SFLUX", SFLUX, "g/m²/s")]
+SFLX  === nothing || push!(panels6s, ("oceSflux", SFLX, "g/m²/s"))
+Sres_ === nothing || push!(panels6s, ("implied SRELAX", Sres_, "g/m²/s"))
+
+if length(panels6) > 1 || length(panels6s) > 1
+    ncol6 = max(length(panels6), length(panels6s))
+    fig6 = Figure(size = (300 * ncol6 + 160, 760))
+    Label(fig6[0, 1:(ncol6 + 1)],
+          "TFLUX and SFLUX decomposed, zonal mean -- the last panel of each row is what we apply " *
+          "that is NOT a physical surface flux", fontsize = 17, font = :bold)
+    for (row, group) in enumerate((panels6, panels6s))
+        Zs = [hcat([zonal(A[:, :, n], wet) for n in 1:nm]...)' for (_, A, _) in group]
+        local fin = filter(isfinite, vcat(vec.(Zs)...))
+        local lim = isempty(fin) ? 1.0 : quantile(abs.(fin), 0.99)
+        for (c, ((ttl, _, un), Z)) in enumerate(zip(group, Zs))
+            ax = Axis(fig6[row, c], title = ttl, xlabel = "month",
+                      ylabel = c == 1 ? "latitude (°N)" : "",
+                      xticks = (1:max(1, nm ÷ 4):nm, labels[1:max(1, nm ÷ 4):nm]),
+                      xticklabelrotation = π / 4)
+            hm = heatmap!(ax, 1:nm, lat, Z, colormap = :balance, colorrange = (-lim, lim),
+                          nan_color = :gray85)
+            c == length(group) && Colorbar(fig6[row, ncol6 + 1], hm, label = un)
+        end
+    end
+    f6 = joinpath(OUTDIR, "bsose_flux_decomposition.png")
+    save(f6, fig6); @info "wrote $f6"
+end
+
 println("\nReading this:")
 println("  * Section 0 must pass before anything else is believed. A wrong sign here is silent.")
 println("  * Section 2 turns W/m2 into degC/month, which is the unit our biases are in.")
@@ -498,3 +632,6 @@ println("    the ocean exports nearly everything it receives, and our model must
 println("    it will drift. If the residual is small, the forcing accumulates locally instead.")
 println("  * Section 4 bounds the S_ref = 34.0 approximation in model.jl.")
 println("  * Section 5 locates the coastal salting that the Aug-Oct surface maps confirmed.")
+println("  * Section 6 is the test of whether TFLUX/SFLUX are safe to force with at all. A large")
+println("    residual means we are applying B-SOSE's correction to its OWN state as if it were")
+println("    a physical flux -- in which case oceQnet+oceFreez and oceSflux are the alternatives.")
