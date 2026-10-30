@@ -77,6 +77,12 @@ Construct a `BSOSEMonthly` dataset descriptor.
 struct BSOSEMonthly <: BSOSEDataset
     dir::String
     iteration::Int
+    # Which cadence the SURFACE BUOYANCY FLUXES are read at; see `BSOSE_CADENCE_SWITCHABLE`.
+    # `:monthly` (the default) reads the one `2013to2024_monthly` file per variable, exactly as
+    # before. `:fiveday` reads the per-year `<token>_bsoseI156_<year>_5day.nc` files instead.
+    # Nothing else moves: winds, sea surface height and every 3-D boundary and sponge field stay
+    # monthly whatever this is set to.
+    surface_cadence::Symbol
 end
 
 function default_bsose_directory()
@@ -93,7 +99,8 @@ function default_bsose_directory()
     end
 end
 
-function BSOSEMonthly(; dir=default_bsose_directory(), iteration=nothing)
+function BSOSEMonthly(; dir=default_bsose_directory(), iteration=nothing,
+                        surface_cadence::Symbol=:monthly)
     # Auto-detect iteration if not explicitly given
     if isnothing(iteration)
         if isdir(dir)
@@ -109,10 +116,13 @@ function BSOSEMonthly(; dir=default_bsose_directory(), iteration=nothing)
             iteration = 156
         end
     end
-    return BSOSEMonthly(abspath(dir), iteration)
+    surface_cadence in (:monthly, :fiveday) ||
+        error("surface_cadence must be :monthly or :fiveday, got :$surface_cadence")
+    return BSOSEMonthly(abspath(dir), iteration, surface_cadence)
 end
 
-Base.summary(ds::BSOSEMonthly) = "BSOSEMonthly(iteration=$(ds.iteration), dir=\"$(ds.dir)\")"
+Base.summary(ds::BSOSEMonthly) =
+    "BSOSEMonthly(iteration=$(ds.iteration), surface_cadence=:$(ds.surface_cadence), dir=\"$(ds.dir)\")"
 
 
 # Variable name dictionary
@@ -263,6 +273,48 @@ bsose_filename(token, span, iteration) =
                        "bsose_i$(iteration)_$(span)_$(token).nc"
 
 """
+    BSOSE_CADENCE_SWITCHABLE
+
+The variables `BSOSEMonthly(; surface_cadence = :fiveday)` reads from the 5-day distribution.
+
+The four SURFACE BUOYANCY FLUXES and nothing else. Three things are deliberately left monthly:
+
+  - **Winds.** The 5-day wind arm was taken out of this project on request. The |tau| and u*^3
+    convexity argument for it still stands, but moving winds and fluxes together would make a
+    two-arm test change two things at once.
+  - **Sea surface height**, for the same reason.
+  - **Every 3-D boundary and sponge field.** B-SOSE at 1/6 degree is eddy-permitting and its
+    5-day eddies are a DIFFERENT REALIZATION from ours. Nudging the boundary to them through a
+    12 h sponge forces the interior to accept eddies it did not generate and cannot sustain,
+    which manufactures boundary noise rather than constraining anything. It is also 18.29 GB
+    per variable per year against 0.37 for a 2-D field.
+
+Heat and salt move together on purpose: brine rejection happens exactly when the ocean is
+losing heat, so splitting their cadences would decouple two halves of one process.
+"""
+const BSOSE_CADENCE_SWITCHABLE = (:surface_heat_flux, :surface_salt_flux,
+                                  :surface_freshwater_flux, :surface_shortwave)
+
+# 5-day files are per YEAR rather than one file per variable: `<token>_bsoseI156_<year>_5day.nc`,
+# 73 records each, stamped at the END of the window they average. Verified against
+# `oceTAUX_bsoseI156_2014_5day.nc`: 73 records, spacing min AND max exactly 5.0 days, first
+# 2014-01-05 (averaging Jan 1-5), last 2014-12-31. Unlike the monthly stamps these do not drift,
+# which is why the 5-day window below needs no snapping. Only iteration 156 ships them.
+bsose_fiveday_span(year) = "$(year)_5day"
+
+"""
+    bsose_variable_cadence(dataset, var)
+
+`:fiveday` when `var` is one of [`BSOSE_CADENCE_SWITCHABLE`](@ref) and `dataset` was built with
+`surface_cadence = :fiveday`; `:monthly` otherwise. Every other variable is monthly whatever the
+dataset says, so a single dataset object can serve 5-day surface fluxes and monthly boundaries
+at the same time -- which is exactly how `src/model.jl` uses it.
+"""
+bsose_variable_cadence(dataset::BSOSEDataset, var) =
+    (var in BSOSE_CADENCE_SWITCHABLE && dataset.surface_cadence === :fiveday) ? :fiveday : :monthly
+
+
+"""
     resolve_bsose_filename(dir, var_name, iteration)
 
 The bare filename for `var_name` at `iteration`, or an error.
@@ -271,7 +323,8 @@ Errors rather than falling back, by design -- see [`BSOSE_FILES`](@ref). The mes
 exact path that was expected and lists any `.nc` file in `dir` carrying the same token, so a
 wrong token in the table is a one-line fix rather than a debugging session.
 """
-function resolve_bsose_filename(dir::String, var_name::Symbol, iteration::Int)
+function resolve_bsose_filename(dir::String, var_name::Symbol, iteration::Int;
+                                date=nothing, cadence::Symbol=:monthly)
     haskey(BSOSE_FILES, iteration) ||
         error("No BSOSE filename table for iteration $iteration. Known: $(sort(collect(keys(BSOSE_FILES)))).")
 
@@ -282,6 +335,20 @@ function resolve_bsose_filename(dir::String, var_name::Symbol, iteration::Int)
                  Add it to `BSOSE_FILES` in src/setup_bsose.jl.""")
 
     token, span = table[var_name]
+
+    # A 5-day variable lives in one file PER YEAR, so which file it is depends on the date.
+    # Erroring on a missing date rather than defaulting to some year is the point: a silent
+    # default would read 2014 for every record of a 2016 run and look entirely plausible,
+    # which is precisely how the month-offset bug survived as long as it did.
+    if cadence === :fiveday
+        iteration == 156 ||
+            error("Only BSOSE iteration 156 ships 5-day files; got iteration $iteration for `$var_name`.")
+        isnothing(date) &&
+            error("""`$var_name` is being read at 5-day cadence, whose files are per year, but
+                     `resolve_bsose_filename` was called without a date. Pass `date = <the record>`.""")
+        span = bsose_fiveday_span(Dates.year(DateTime(date)))
+    end
+
     fname = bsose_filename(token, span, iteration)
     isfile(joinpath(dir, fname)) && return fname
 
@@ -346,7 +413,18 @@ DataWrangling.reversed_vertical_axis(::BSOSEDataset) = true
 The `(start, stop)` dates of the month a BSOSE monthly record averages, recovered from the
 date it is stamped with by snapping that stamp to the nearest month boundary.
 """
-function bsose_averaging_window(stamp)
+function bsose_averaging_window(stamp, cadence::Symbol=:monthly)
+    # A 5-DAY STAMP MUST NOT BE SNAPPED. The monthly branch below rounds to the nearest month
+    # boundary to undo the ~10 h drift in the monthly stamps. The 5-day stamps have NO drift
+    # (spacing min and max are both exactly 5.0 days), and snapping one would be catastrophic
+    # rather than merely wrong: 2014-01-05 rounds to 2014-01-01 and yields the window
+    # (2013-12-01, 2014-01-01) -- a month early, in the wrong direction, for every record.
+    # `bsose_window_center` feeds `native_times`, so that would place every sample about two
+    # weeks from where it belongs and the error would look like a physics result.
+    if cadence === :fiveday
+        window_stop = DateTime(stamp)
+        return (window_stop - Day(5), window_stop)
+    end
     window_stop = round(DateTime(stamp), Month)
     return (window_stop - Month(1), window_stop)
 end
@@ -359,13 +437,15 @@ interpolating `FieldTimeSeries` places that record's value. Half a month earlier
 date the record is stamped with, so it is the right thing to compare a simulation date
 against when choosing which records a run needs.
 """
-function bsose_window_center(stamp)
-    window_start, window_stop = bsose_averaging_window(stamp)
+function bsose_window_center(stamp, cadence::Symbol=:monthly)
+    window_start, window_stop = bsose_averaging_window(stamp, cadence)
     half = Dates.value(Millisecond(window_stop - window_start)) ÷ 2
     return window_start + Millisecond(half)
 end
 
-DataWrangling.averaging_window(metadatum::BSOSEMetadatum) = bsose_averaging_window(metadatum.dates)
+DataWrangling.averaging_window(metadatum::BSOSEMetadatum) =
+    bsose_averaging_window(metadatum.dates,
+                           bsose_variable_cadence(metadatum.dataset, metadatum.name))
 
 """
     model_clock_offset(metadata, reference_date)
@@ -400,7 +480,10 @@ function DataWrangling.default_download_directory(dataset::BSOSEDataset)
 end
 
 function DataWrangling.metadata_filename(dataset::BSOSEMonthly, name, date, region)
-    return resolve_bsose_filename(dataset.dir, name, dataset.iteration)
+    # `date` was accepted and discarded here until 5-day forcing arrived. It is the only thing
+    # that distinguishes one 5-day file from the next, so it is now forwarded.
+    return resolve_bsose_filename(dataset.dir, name, dataset.iteration;
+                                  date, cadence = bsose_variable_cadence(dataset, name))
 end
 
 # ------------------------------------------------------------------------------
@@ -786,7 +869,9 @@ function DataWrangling.inpainted_metadata_path(metadata::BSOSEMetadatum)
     dstr = metadata.dates isa Dates.AbstractDateTime ? Dates.format(metadata.dates, "yyyymmdd") : "all"
     suffix = bsose_region_suffix(metadata.region)
     geom_str = isempty(suffix) ? "_$(geom.Nx)x$(geom.Ny)" : suffix
-    name = "bsose_inpainted_i$(metadata.dataset.iteration)_$(metadata.name)_$(dstr)$(geom_str).jld2"
+    # Cadence in the key, or a 5-day record and the monthly record for the same day collide.
+    cad = bsose_variable_cadence(metadata.dataset, metadata.name) === :fiveday ? "_5day" : ""
+    name = "bsose_inpainted_i$(metadata.dataset.iteration)_$(metadata.name)_$(dstr)$(geom_str)$(cad).jld2"
     return joinpath(bsose_temp_directory(metadata.dataset), name)
 end
 
@@ -796,7 +881,9 @@ function DataWrangling.inpainted_metadata_path(metadata::BSOSEMetadata)
     end_str = Dates.format(last(metadata.dates), "yyyymmdd")
     suffix = bsose_region_suffix(metadata.region)
     geom_str = isempty(suffix) ? "_$(geom.Nx)x$(geom.Ny)" : suffix
-    name = "bsose_inpainted_i$(metadata.dataset.iteration)_$(metadata.name)_$(start_str)_to_$(end_str)$(geom_str).jld2"
+    # As above: the two cadences can span the same range, so the range alone is not a key.
+    cad = bsose_variable_cadence(metadata.dataset, metadata.name) === :fiveday ? "_5day" : ""
+    name = "bsose_inpainted_i$(metadata.dataset.iteration)_$(metadata.name)_$(start_str)_to_$(end_str)$(geom_str)$(cad).jld2"
     return joinpath(bsose_temp_directory(metadata.dataset), name)
 end
 
@@ -805,6 +892,10 @@ function DataWrangling.all_dates(dataset::BSOSEMonthly, var)
     # to a synthetic `2013-01-01:Month(1):2024-12-01` range, which meant an unreadable or
     # truncated file produced a plausible-looking date axis that did not match its own
     # contents -- a silent error of exactly the kind this module is trying to stop making.
+    if bsose_variable_cadence(dataset, var) === :fiveday
+        return bsose_fiveday_dates(dataset, var)
+    end
+
     fp = joinpath(dataset.dir, resolve_bsose_filename(dataset.dir, var, dataset.iteration))
     ds = Dataset(fp)
     try
@@ -812,6 +903,53 @@ function DataWrangling.all_dates(dataset::BSOSEMonthly, var)
     finally
         close(ds)
     end
+end
+
+"""
+    bsose_fiveday_dates(dataset, var)
+
+Every 5-day record stamp for `var`, concatenated across the per-year files that are actually in
+`dataset.dir`, in order.
+
+Scans the directory rather than assuming a year range, so a partial download gives a short axis
+instead of an error about a file nobody meant to have. It does error when there is nothing at
+all, naming the pattern it looked for, because the alternative is an empty date list that
+surfaces much later as a confusing failure somewhere in `resident_fts`.
+"""
+function bsose_fiveday_dates(dataset::BSOSEDataset, var)
+    token, _ = BSOSE_FILES[dataset.iteration][var]
+    isdir(dataset.dir) || error("BSOSE directory does not exist: $(dataset.dir)")
+
+    years = Int[]
+    for f in readdir(dataset.dir)
+        m = match(Regex("^" * token * "_bsoseI156_(\\d{4})_5day\\.nc\$"), f)
+        isnothing(m) || push!(years, parse(Int, m.captures[1]))
+    end
+    sort!(years)
+
+    isempty(years) && error("""No 5-day files for `$var` in $(dataset.dir).
+                               Looked for: $(token)_bsoseI156_<year>_5day.nc
+                               Either download them or build the dataset with
+                               `surface_cadence = :monthly`.""")
+
+    dates = DateTime[]
+    for y in years
+        fp = joinpath(dataset.dir, bsose_filename(token, bsose_fiveday_span(y), dataset.iteration))
+        ds = Dataset(fp)
+        try
+            append!(dates, [DateTime(t) for t in ds["time"][:]])
+        finally
+            close(ds)
+        end
+    end
+
+    # Each file is already ordered and the years are read in order, so this only catches a
+    # genuinely malformed file rather than doing real work.
+    issorted(dates) || sort!(dates)
+    allunique(dates) ||
+        error("Duplicate 5-day stamps for `$var` across years $(years) in $(dataset.dir); " *
+              "the same year is probably present twice under different names.")
+    return dates
 end
 
 function Downloads.download(metadata::Metadata{<:BSOSEDataset})
@@ -825,6 +963,19 @@ function Downloads.download(metadata::Metadata{<:BSOSEDataset})
     return path
 end
 
+"""
+    bsose_axis_cadence(time_raw)
+
+`:fiveday` or `:monthly`, from the spacing of a file's own time axis. 5-day records sit exactly
+5 days apart and monthly ones about 30, so the 15-day split has an order of magnitude of margin
+on both sides.
+"""
+function bsose_axis_cadence(time_raw)
+    length(time_raw) >= 2 || return :monthly
+    gap_days = Dates.value(Millisecond(DateTime(time_raw[2]) - DateTime(time_raw[1]))) / 86400_000
+    return gap_days < 15 ? :fiveday : :monthly
+end
+
 # Time-index resolver matching year & month
 function find_bsose_time_index(ds::Dataset, target_date)
     if isnothing(target_date)
@@ -836,6 +987,10 @@ function find_bsose_time_index(ds::Dataset, target_date)
 
     time_raw = ds["time"][:]
     target_dt = DateTime(target_date)
+
+    # Cadence straight off the file's own axis rather than threaded in from the caller: this
+    # function is handed a bare `Dataset` from several places, and the axis says what it is.
+    cadence = bsose_axis_cadence(time_raw)
 
     # A RECORD STAMP MEANS THAT RECORD. `dates = all_dates(dataset, var)` is the standard way
     # to build a `Metadata`, so most callers pass stamps rather than simulation dates: every
@@ -857,7 +1012,7 @@ function find_bsose_time_index(ds::Dataset, target_date)
     # 105 is stamped 2008-03-01T20:00, so a run starting 2008-03-01 would initialise from
     # February data while its boundary conditions and winds are already in March.
     for (i, t) in enumerate(time_raw)
-        window_start, window_stop = bsose_averaging_window(t)
+        window_start, window_stop = bsose_averaging_window(t, cadence)
         if window_start <= target_dt < window_stop
             return i
         end
@@ -1421,6 +1576,39 @@ function bsose_surface_wind_stress(grid;
 end
 
 """
+    surface_forcing_dates(dataset, var, dates)
+
+Which record stamps to actually read for `var`, given the dates a caller asked for. Identity at
+monthly cadence.
+
+THIS IS WHAT MAKES 5-DAY FORCING DO ANYTHING. `bsose_open_boundary_conditions` hands the surface
+builders the same `bc_dates` the BOUNDARIES use, and those are monthly stamps. Without this the
+5-day files would be read at 26 monthly stamps across a two-year run -- none of which exist in a
+5-day file, so every one would come back through the nearest-stamp fallback, the extra
+resolution would be silently discarded, and the arm would look like it ran. Here the monthly
+stamps are replaced by the 5-day stamps covering the same span, padded one record either side so
+the interpolation has something to stand on at each end.
+"""
+function surface_forcing_dates(dataset::BSOSEDataset, var, dates)
+    bsose_variable_cadence(dataset, var) === :fiveday || return dates
+    available = all_dates(dataset, var)
+    isempty(dates) && return available
+
+    lo_t, hi_t = DateTime(first(dates)), DateTime(last(dates))
+    inside = findall(d -> lo_t <= d <= hi_t, available)
+    if isempty(inside)
+        # No overlap at all: one nearest record beats an empty series, and the caller's own
+        # end-of-record warning will fire on it.
+        _, n = findmin(d -> abs(Dates.value(Millisecond(DateTime(d) - lo_t))), available)
+        return available[n:n]
+    end
+
+    lo = max(firstindex(available), first(inside) - 1)
+    hi = min(lastindex(available), last(inside) + 1)
+    return available[lo:hi]
+end
+
+"""
     bsose_surface_tracer_fluxes(grid;
                                 dataset = BSOSEMonthly(),
                                 dates = nothing,
@@ -1466,9 +1654,12 @@ function bsose_surface_tracer_fluxes(grid;
     if isnothing(dates)
         available = all_dates(dataset, :surface_heat_flux)
         dates = available[1:min(12, length(available))]
+    else
+        dates = surface_forcing_dates(dataset, :surface_heat_flux, dates)
     end
 
-    @info "Loading surface heat and salt fluxes ($(summary(dataset)))..."
+    @info @sprintf("Loading surface heat and salt fluxes (%s): %d records, %s to %s.",
+                   summary(dataset), length(dates), first(dates), last(dates))
     region = bsose_region(grid)
     heat_metadata = Metadata(:surface_heat_flux; dataset, dates, region)
     salt_metadata = Metadata(:surface_salt_flux; dataset, dates, region)
@@ -1962,9 +2153,12 @@ function bsose_penetrating_shortwave(grid;
     if isnothing(dates)
         available = all_dates(dataset, :surface_shortwave)
         dates = available[1:min(12, length(available))]
+    else
+        dates = surface_forcing_dates(dataset, :surface_shortwave, dates)
     end
 
-    @info "Loading penetrating shortwave radiation (oceQsw, $(summary(dataset)))..."
+    @info @sprintf("Loading penetrating shortwave (oceQsw, %s): %d records, %s to %s.",
+                   summary(dataset), length(dates), first(dates), last(dates))
     region = bsose_region(grid)
     shortwave_metadata = Metadata(:surface_shortwave; dataset, dates, region)
     shortwave_fts = resident_fts(shortwave_metadata, grid)
@@ -2218,6 +2412,12 @@ function bsose_open_boundary_conditions(grid;
 
     # Unified dataset filename
     wind_tag = winds === true ? "_winds" : ""
+    # DELIBERATELY NOT TAGGED BY `surface_cadence`. This cache holds boundary u/v/T/S and the
+    # wind stress and nothing else -- every one of them monthly in both arms, since the surface
+    # BUOYANCY fluxes are the only cadence-switchable variables and they are not stored here.
+    # Tagging it would make the 5-day arm rebuild the whole 3-D boundary dataset for a file
+    # identical to the one already on disk, which is the expensive half of a run's setup. The
+    # per-variable inpaint caches ARE tagged, because those do hold surfTflx and friends.
     default_dataset_name = "bsose_dataset_v2_$(dataset.iteration)_$(start_str)_to_$(end_str)_$(Nx)x$(Ny)x$(Nz)$(wind_tag).jld2"
     dataset_path = cache_file !== nothing ? cache_file : joinpath(dataset.dir, default_dataset_name)
 

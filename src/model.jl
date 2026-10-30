@@ -50,7 +50,7 @@ end
 # ---- run identity -------------------------------------------------------------------------
 # Prefixes every output file: RUN_NAME_surface.nc, _midlon.nc, _free_surface.nc.
 # Change it per experiment or runs overwrite each other. Animate: ./run_animate_simulation NAME
-const RUN_NAME = "2Y_wind_fw_sw"
+const RUN_NAME = "2Y_wind_fw_sw_5day"
 
 # ---- period and domain --------------------------------------------------------------------
 const START_DATE = DateTime("2014-06-01")
@@ -336,6 +336,26 @@ const SPONGE_TIMESCALE     = 12hours # matches the surface_tests sweep (Canary c
 const ATMOSPHERE           = :none  # :none | :era5 (bulk formulae; needs ~/.cdsapirc)
 const ERA5_THREADS         = 1      # CDS rejects concurrent queued requests
 
+# Cadence of the four SURFACE BUOYANCY FLUXES -- surfTflx, surfSflx, oceFWflx, oceQsw.
+# Winds, sea surface height and every 3-D boundary and sponge field stay monthly either way;
+# see `BSOSE_CADENCE_SWITCHABLE` in setup_bsose.jl for why.
+#
+# WHY 5-DAY. Brine rejection is episodic -- polynya events and storm-driven ice production --
+# and a monthly mean smears it into a steady trickle. Convection is nonlinear in the flux, so
+# the same salt delivered as a 30-day mean mixes SHALLOWER than the same integral delivered in
+# bursts. That is a mechanism which over-stratifies the seasonal ice zone specifically, which
+# is the band where our column measures ~45% harder to mix than B-SOSE's.
+#
+# This is built to be a TWO-ARM TEST: flip this one const, change nothing else, and the caches
+# are keyed separately so the two arms cannot contaminate each other.
+const SURFACE_CADENCE      = :fiveday   # :monthly | :fiveday
+
+if SURFACE_CADENCE === :fiveday && ATMOSPHERE !== :none
+    error("""SURFACE_CADENCE = :fiveday selects the cadence of B-SOSE's surface buoyancy \
+             fluxes, but ATMOSPHERE = :$(ATMOSPHERE) switches those fluxes off entirely in \
+             favour of bulk formulae. Pick one.""")
+end
+
 # Derived: BSOSE surface forcing only applies when no coupled atmosphere is computing it.
 const BSOSE_WINDS     = WINDS && ATMOSPHERE === :none
 const BSOSE_FLUXES    = SURFACE_FLUXES && ATMOSPHERE === :none
@@ -486,7 +506,7 @@ end
 
 # dataset conditonal
 
-dataset = BSOSEMonthly(iteration=BSOSE_ITERATION)
+dataset = BSOSEMonthly(iteration=BSOSE_ITERATION, surface_cadence=SURFACE_CADENCE)
 
 @info "Dataset: $(summary(dataset)) -- boundaries, forcing and initial conditions"
 
