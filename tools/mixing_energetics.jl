@@ -764,12 +764,12 @@ f1 = joinpath(OUTDIR, "buoyancy_flux_$(YEAR)$(CADTAG).png"); save(f1, fig); @inf
 # 2. required against supplied. A bar chart because the question is a comparison of two
 #    scalars per band, and the ratio is the whole answer.
 if HAS3D && !isempty(RESULTS)
-    fig = Figure(size = (900, 460))
+    fig = Figure(size = (900, 500))
     Label(fig[0, 1],
           "Can the applied surface forcing make B-SOSE's own mixed layer? — $YEAR" *
           (WINDOW == "deepening" ? "" : "  (window: $WINDOW)"),
           fontsize = 17, font = :bold)
-    ax = Axis(fig[1, 1], xlabel = "", ylabel = "buoyancy  (m² s⁻²)",
+    ax = Axis(fig[2, 1], xlabel = "", ylabel = "buoyancy  (m² s⁻²)",
               xticks = (1:length(RESULTS), [r.band for r in RESULTS]))
     n = length(RESULTS)
     hasmodel = any(r -> isfinite(r.req_model), RESULTS)
@@ -795,8 +795,11 @@ if HAS3D && !isempty(RESULTS)
     end
     # Room under the axis for the two-line annotation, which otherwise clips.
     ylims!(ax, -0.17 * maximum(x -> max(x.required, isfinite(x.req_model) ? x.req_model : 0.0), RESULTS), nothing)
-    axislegend(ax; position = :lt, framevisible = false, labelsize = 10)
-    Label(fig[2, 1],
+    # Inside the axis this sat on top of the 70S-65S ratio label whenever that band had the
+    # tallest bar. Its own row above the axis cannot collide with a label at all.
+    Legend(fig[1, 1], ax, orientation = :horizontal, framevisible = false, labelsize = 10)
+    rowgap!(fig.layout, 1, 2)
+    Label(fig[3, 1],
           "Grey against orange is the robust comparison -- it never touches `supplied`. A large " *
           "excess of orange over grey in one band and not the others is a drifted\nstate there, " *
           "not a bad closure. The ratios do involve `supplied`, so they depend on where the " *

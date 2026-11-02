@@ -39,6 +39,7 @@ using NCDatasets, Dates, Printf, Statistics, CairoMakie
 const DIR    = get(ENV, "BSOSE_DIR", "data")
 const YEARS  = parse.(Int, strip.(split(get(ENV, "YEARS", "2014,2015,2016"), ",")))
 const OUTDIR = get(ENV, "OUTDIR", "plots")
+const S0     = parse(Float64, get(ENV, "S0", "34.0"))   # matches src/model.jl and mixing_energetics
 
 # The freezing season, as the months the growth intervals are counted over. Apr-Oct is the
 # window `mixing_energetics` reports the brine sum across, so the two are directly comparable.
@@ -161,13 +162,24 @@ for y in YEARS
         end
     end
 
-    # surfSflx cross-check: the brine-only salt flux. If the ice says one year froze half as
-    # much and the salt flux agrees, the story closes without appeal to anything else.
-    sfx = nothing
-    if isfile(joinpath(DIR, fiveday_filename("surfSflx", y)))
+    # The salt side, which is what the ice is being checked against. Two terms, and they are
+    # the whole reason this is here: SFLUX is the real salt flux -- brine in, so negative-
+    # buoyancy -- while oceFWflx is a WATER flux that changes salinity by dilution without
+    # moving any salt. Their salt-equivalent sum `SFLUX - S0*oceFWflx` is what the buoyancy
+    # budget in mixing_energetics.jl actually sees, so a year whose brine held but whose net
+    # collapsed was freshened, not starved of ice.
+    sfx = fwx = netx = nothing
+    if isfile(joinpath(DIR, fiveday_filename("surfSflx", y))) &&
+       isfile(joinpath(DIR, fiveday_filename("oceFWflx", y)))
         S, _ = read5day("surfSflx", y, ("SFLUX", "surfSflx", "sflux"))
-        sfx = [mean(filter(isfinite, [band_mean(S[:, :, t], lo, hi) for t in srec]))
-               for (lo, hi) in BANDS]
+        F, _ = read5day("oceFWflx", y, ("oceFWflx", "OCEFWFLX", "ocefwflx"))
+        seasmean(A) = [mean(filter(isfinite, [band_mean(A[:, :, t], lo, hi) for t in srec]))
+                       for (lo, hi) in BANDS]
+        # oceFWflx is kg/m^2/s and positive DOWN (freshening), so S0*oceFWflx lands in the same
+        # g/m^2/s as SFLUX and subtracts from it.
+        sfx  = seasmean(S)
+        fwx  = seasmean(F)
+        netx = [sfx[b] - S0 * fwx[b] for b in eachindex(BANDS)]
     end
 
     Y[y] = (cen = cen, mid = mid, seas = seas, srec = srec,
@@ -175,7 +187,7 @@ for y in YEARS
                         for (lo, hi) in BANDS],
             freeze = [band_mean(frz, lo, hi) for (lo, hi) in BANDS],
             melt   = [band_mean(mlt, lo, hi) for (lo, hi) in BANDS],
-            cumb = cumb, sflux = sfx)
+            cumb = cumb, sflux = sfx, fwflx = fwx, netsalt = netx)
     @info "$y: $(length(seas)) growth intervals and $(length(srec)) records in " *
           "months $(first(SEASON))-$(last(SEASON))" *
           (sfx === nothing ? " (no 5-day surfSflx, skipping the cross-check)" : "")
@@ -187,27 +199,34 @@ println("SEA ICE OVER THE FREEZING SEASON (months $(first(SEASON))-$(last(SEASON
         "cos-lat weighted over wet cells")
 println("  freeze / melt are the per-cell thickness increments summed BY SIGN, so they are " *
         "metres of ice grown and lost;")
-println("  brine tracks `freeze`, not `net` and not area.  SFLUX is the season-mean " *
-        "brine-only salt flux (kg/m^2/s).")
+println("  brine tracks `freeze`, not `net` and not area.")
+println("  SFLUX is the brine salt flux and S0*FW the salt-equivalent of the freshwater flux, " *
+        "both g/m^2/s; `net salt` is\n  their difference, which is the term the buoyancy " *
+        "budget sees. NOTE d(SIHeff)/dt is local THICKENING, so `freeze`\n  and `melt` carry " *
+        "ice advection as well as thermodynamics -- read `net` and the area columns.")
 println("="^104)
 
 for (b, (lo, hi)) in enumerate(BANDS)
     @printf("\n  %.0fS to %.0fS\n", -lo, -hi)
-    @printf("    %-6s %10s %10s %10s %10s %10s %13s\n",
-            "year", "peak area", "mean area", "freeze", "melt", "net", "mean SFLUX")
-    @printf("    %-6s %10s %10s %10s %10s %10s %13s\n",
-            "", "(%)", "(%)", "(m)", "(m)", "(m)", "(kg/m2/s)")
+    @printf("    %-6s %9s %9s %8s %8s %8s %12s %12s %12s\n",
+            "year", "peak area", "mean area", "freeze", "melt", "net",
+            "SFLUX", "S0*FW", "net salt")
+    @printf("    %-6s %9s %9s %8s %8s %8s %12s %12s %12s\n",
+            "", "(%)", "(%)", "(m)", "(m)", "(m)", "(g/m2/s)", "(g/m2/s)", "(g/m2/s)")
     for y in YEARS
         d  = Y[y]
         a  = filter(isfinite, d.areaband[b])
         as = filter(isfinite, d.areaband[b][d.srec])
-        sf = d.sflux === nothing ? NaN : d.sflux[b]
-        @printf("    %-6d %10.1f %10.1f %10.3f %10.3f %10.3f %13s\n",
+        cell(v) = isfinite(v) ? @sprintf("%12.4e", v) : lpad("--", 12)
+        sf = d.sflux   === nothing ? NaN : d.sflux[b]
+        fw = d.fwflx   === nothing ? NaN : S0 * d.fwflx[b]
+        ns = d.netsalt === nothing ? NaN : d.netsalt[b]
+        @printf("    %-6d %9.1f %9.1f %8.3f %8.3f %8.3f %s %s %s\n",
                 y,
                 isempty(a) ? NaN : 100 * maximum(a),
                 isempty(as) ? NaN : 100 * mean(as),
                 d.freeze[b], d.melt[b], d.freeze[b] + d.melt[b],
-                isfinite(sf) ? @sprintf("%13.4e", sf) : lpad("--", 13))
+                cell(sf), cell(fw), cell(ns))
     end
     # Ratios against the first year, so the cross-year comparison reads without arithmetic.
     ref = Y[YEARS[1]].freeze[b]
@@ -220,9 +239,9 @@ for (b, (lo, hi)) in enumerate(BANDS)
     end
 end
 
-println("\n  Read `freeze` first. A year whose freeze falls while its melt holds is a net")
-println("  freshwater gain to the column even when its mean area looks ordinary, and that is")
-println("  the asymmetry behind a one-directional salinity drift.")
+println("\n  Read `net salt` against `net` ice. Ice volume up with `net salt` down means the")
+println("  freshwater term won, not that the ice failed -- and freshwater is the half of the")
+println("  budget our virtual salt flux handles differently from B-SOSE's real one.")
 
 # ── figure ────────────────────────────────────────────────────────────────────────────────────
 # Years overlaid on a day-of-year axis, because the question is which year differs, not when
