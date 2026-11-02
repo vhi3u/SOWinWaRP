@@ -150,6 +150,15 @@ function arm_profiles(arm)
             Float64.(coalesce.(mds[c[h]][:], NaN))
     end
     mt  = Float64.(mds["time"][:])
+    if isempty(mt)
+        close(mds)
+        # Oceananigans CREATES the file at init and appends, so zero records means the run died
+        # (walltime/OOM) or has not reached its first write -- not that the file is corrupt.
+        # Guard here rather than downstream: `minimum(mcen)` on an empty Vector{DateTime} throws
+        # `reducing over an empty collection`, which kills the whole report over one bad arm.
+        @warn "$(arm)_eke.nc has ZERO time records -- that run wrote no snapshot. Skipping $arm."
+        return (labels = String[], dS = Vector{Float64}[], dT = Vector{Float64}[])
+    end
     win = haskey(mds.attrib, "averaging_window_seconds") ?
           Float64(mds.attrib["averaging_window_seconds"]) : 30 * 86400.0
     mcen = [MSTART + Second(round(Int, x - win / 2)) for x in mt]
@@ -231,6 +240,7 @@ function arm_surface_drift(arm)
     try
         haskey(ds, "S") || return NaN
         nt = size(ds["S"], ndims(ds["S"]))
+        nt == 0 && return NaN
         A = Float64.(coalesce.(ndims(ds["S"]) == 4 ? ds["S"][:, :, 1, nt] : ds["S"][:, :, nt], NaN))
         v = filter(x -> isfinite(x) && x != 0, vec(A))
         return isempty(v) ? NaN : mean(v)
@@ -244,7 +254,7 @@ R = Dict{String,Any}()
 for a in ARMS
     @info "reading $a"
     pr = arm_profiles(a)
-    isempty(pr.labels) && (@warn "$a has no month pairing with B-SOSE; skipping"; continue)
+    isempty(pr.labels) && (@warn "$a produced no usable month pairs; skipping"; continue)
     rb, rm, he = arm_energetics(a)
     ser(v, bin, prof) = [bin_mean(prof[n], ZB, bin...) for n in eachindex(prof)]
     R[a] = (labels = pr.labels,
