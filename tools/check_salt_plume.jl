@@ -118,6 +118,48 @@ end
 SFLUX = load2d("surfSflx")
 SPFLX = load2d("oceSPflx")
 
+# ── is the field even populated? ─────────────────────────────────────────────
+# A field of EXACT zeros is the signature of two very different things: a diagnostic that was
+# compiled in but never activated, and a truncated NetCDF (a partial file opens without
+# complaint and reads zeros past the cut -- see the warning in download_bsose_5day.sh). Both
+# must be ruled out before a plumed fraction of -0.000 gets reported as if it meant something.
+let nz = count(x -> isfinite(x) && x != 0, vcat(vec.(SPFLX)...))
+    if nz == 0
+        ds = Dataset(plumefile); v = varname(ds, "oceSPflx"); nrec = size(ds[v], 3)
+        anywhere = 0
+        for k in 1:nrec
+            a = ds[v][is, js, k]
+            anywhere += count(x -> !ismissing(x) && isfinite(x) && x != 0, a)
+            anywhere > 0 && break
+        end
+        close(ds)
+        println("\n" * "="^100)
+        println("oceSPflx IS IDENTICALLY ZERO -- stopping, because every number below it would be")
+        println("="^100)
+        @printf("\n  file            %s\n", plumefile)
+        @printf("  size on disk    %.2f GB   (the server reports 0.70 GB for the monthly record)\n",
+                filesize(plumefile) / 1073741824)
+        @printf("  records         %d\n", nrec)
+        @printf("  nonzero cells   %d in %s..%s, %d anywhere in the whole record\n",
+                nz, first(LABELS), last(LABELS), anywhere)
+        println()
+        println("  TWO READINGS, and the size above separates them.")
+        println()
+        println("    Size well under 0.70 GB -- the download was truncated. Re-fetch; the job")
+        println("    byte-checks against Content-Length and will replace a short file:")
+        println("        ./download_bsose_5day.sh --monthly --vars oceSPflx")
+        println()
+        println("    Size correct and still zero everywhere -- SALT_PLUME is compiled into i156")
+        println("    but NOT ACTIVE. available_diagnostics.log lists what was BUILT, not what was")
+        println("    switched on. Then B-SOSE deposits its brine at the surface exactly as we do,")
+        println("    the vertical distribution of brine is NOT a difference between us, and the")
+        println("    salt-plume hypothesis is dead. Do not spend 35.76 GB on oceSPtnd to confirm")
+        println("    a zero.")
+        println("\n" * "="^100)
+        exit(anywhere == 0 ? 0 : 1)
+    end
+end
+
 finite(a) = filter(isfinite, vec(a))
 rms(a) = (v = finite(a); isempty(v) ? NaN : sqrt(mean(abs2, v)))
 avg(a) = (v = finite(a); isempty(v) ? NaN : mean(v))
