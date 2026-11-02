@@ -68,6 +68,7 @@
 #     ITER        B-SOSE iteration                           (default: 156)
 #     YEAR        the freezing season to analyse             (default: 2015)
 #     ZMAX        depth to read and integrate over, m        (default: 600)
+#     TRIM_SPONGE degrees of boundary sponge to exclude      (default: 3.0; 0 = whole band)
 #     S0          reference salinity in the virtual flux     (default: 34.0, matches model.jl)
 #     MLD_DT      density threshold, kg/m^3                  (default: 0.03)
 #     WINDOW      where the freezing season starts          (default: deepening)
@@ -215,7 +216,14 @@ stamps = [DateTime(t) for t in probe["time"][:]]
 close(probe)
 
 const LATS = yc[JR]
+const LONS = xc[IR]
 wet = depth .> 0
+
+# The 70-65S band is 18 of its 30 rows inside the southern sponge, where T and S are restored
+# to B-SOSE on 12 hours. Averaging over that water measures the restoring, not the drift, and
+# it can only bias `req model` TOWARD `req BSOSE` -- i.e. understate the excess.
+include(joinpath(@__DIR__, "sponge.jl"))
+const KEEP = sponge_trimmer(LON, LAT)
 
 # B-SOSE's vertical grid is SURFACE FIRST (RC = -2.1, -6.7, ...), the opposite of Oceananigans.
 gridfile = joinpath(DIR, ITER == 156 ? "grid.nc" : "grid105.nc")
@@ -393,6 +401,7 @@ function band_mean(A, lo, hi)
     num = den = 0.0
     for i in axes(A, 1), j in axes(A, 2)
         (lo <= LATS[j] < hi && isfinite(A[i, j])) || continue
+        KEEP(LONS[i], LATS[j]) || continue
         w = cosd(LATS[j]); num += w * A[i, j]; den += w
     end
     return den == 0 ? NaN : num / den
@@ -519,6 +528,24 @@ function coordvar(ds, cands, what)
     error("no $what coordinate in $(path(ds)); tried $(join(cands, ", ")). Keys: $(collect(keys(ds)))")
 end
 
+const MODEL_LON_WARNED = Ref(false)
+
+"""Model-grid cell-centre longitudes, for the sponge trim. Falls back to reconstructing them
+from the domain, which is exact for a LatitudeLongitudeGrid but wrong if the file is a subset,
+so the fallback says so -- once, not once per band."""
+function model_lons(ds)
+    cands = ["x_caa", "λ_caa", "λ_fca", "xC", "longitude", "lon", "x"]
+    hit = findfirst(c -> haskey(ds, c), cands)
+    hit !== nothing && return Float64.(coalesce.(ds[cands[hit]][:], NaN))
+    n = size(ds["S"], 1)
+    if !MODEL_LON_WARNED[]
+        @info "no longitude coordinate in the model file; assuming $n uniform cells over " *
+              "$(LON[1])-$(LON[2])E for the sponge trim"
+        MODEL_LON_WARNED[] = true
+    end
+    return [LON[1] + (i - 0.5) * (LON[2] - LON[1]) / n for i in 1:n]
+end
+
 """
     model_required(file, target_month, lo, hi, h)
 
@@ -548,12 +575,15 @@ function model_required(file, target_month, lo, hi, h)
         T = Float64.(coalesce.(ds["T"][:, :, :, n], NaN))
         S = Float64.(coalesce.(ds["S"][:, :, :, n], NaN))
         zs = reverse(zs_up)                                                 # surface-first
+        lons = model_lons(ds)
 
         num = den = 0.0
         for j in axes(T, 2)
             (lo <= lats[j] < hi) || continue
             w = cosd(lats[j])
             for i in axes(T, 1)
+                # Same trim as `band_mean`, so `req model` and `req BSOSE` cover the same water.
+                KEEP(lons[i], lats[j]) || continue
                 Tc, Sc = reverse(T[i, j, :]), reverse(S[i, j, :])
                 # Oceananigans writes immersed cells as EXACT zeros, so `S != 0` is the wet
                 # test. `isfinite` is not, for the same reason it is not on the B-SOSE side.
@@ -646,6 +676,14 @@ if HAS3D
                        "month earlier than the monthly arm\n  on the same files -- see the log " *
                        "lines above. `required` moves with it, so compare arms at a PINNED\n  " *
                        "window before reading anything into a difference." : ""))
+
+    println("\n  " * sponge_note(LON, LAT))
+    if SPONGE_TRIM > 0
+        spans = [(s = trimmed_band(LAT, lo, hi);
+                  s === nothing ? "none" : @sprintf("%.0fS-%.0fS", -s[1], -s[2]))
+                 for (lo, hi) in BANDS]
+        println("  bands therefore cover " * join(spans, ", ") * ".")
+    end
 
     @printf("\n  %-10s %-9s %-9s %9s %9s %11s %11s %11s %8s %8s\n",
             "band", "start", "end", "MLD start", "MLD end",

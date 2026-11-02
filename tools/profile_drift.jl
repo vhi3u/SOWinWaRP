@@ -17,6 +17,12 @@
 # This is a measurement, not a hypothesis, and it needs no download: it uses the monthly Theta
 # and Salt already on disk and the run's own output.
 #
+# THE SPONGE IS EXCLUDED BY DEFAULT. All four faces are open and `bsose_sponge_layer_forcing`
+# restores T, S, u and v to B-SOSE within SPONGE_WIDTH = 3 deg of every one of them, on a 12 h
+# timescale. That is 18 of the 30 rows of the 70-65S band -- the band this tool exists to
+# measure. Water in there is being held onto B-SOSE, so including it does not measure drift, it
+# measures how hard we are holding. See tools/sponge.jl; TRIM_SPONGE=0 reverts.
+#
 # BAND MEANS, NOT POINTWISE. The two grids differ horizontally (B-SOSE native vs our 1/6 deg),
 # so each side is cos-lat weighted over its OWN wet cells inside the band and only the two
 # resulting 1-D profiles are differenced -- the same convention `mixing_energetics.jl` uses for
@@ -33,6 +39,7 @@
 #     START_DATE    first month to compare                   (default: 2014-06-01)
 #     END_DATE      last month to compare                    (default: 2016-06-01)
 #     ZMAX          depth to compare over, m                 (default: 600)
+#     TRIM_SPONGE   degrees of sponge to exclude             (default: 3.0; 0 = whole band)
 #     OUTDIR        where the figures go                     (default: plots)
 # ==============================================================================
 
@@ -53,6 +60,9 @@ const LON   = (90.0, 150.0)
 const LAT   = (-70.0, -45.0)
 const BANDS = [(-70.0, -65.0), (-65.0, -60.0), (-60.0, -55.0), (-55.0, -50.0), (-50.0, -45.0)]
 const BINS  = [(0.0, 50.0), (50.0, 100.0), (100.0, 200.0), (200.0, 400.0), (400.0, 600.0)]
+
+include(joinpath(@__DIR__, "sponge.jl"))
+const KEEP = sponge_trimmer(LON, LAT)
 
 function window_center(stamp)
     stop = round(DateTime(stamp), Month)
@@ -96,6 +106,7 @@ bjs = findall(y -> LAT[1] <= y <= LAT[2], by)
 bstamps = [DateTime(t) for t in probe["time"][:]]
 close(probe)
 const BLAT = by[bjs]
+const BLON = bx[bis]
 
 gfile = joinpath(DIR, "grid.nc")
 isfile(gfile) || error("need $gfile for B-SOSE's vertical grid (RC)")
@@ -116,6 +127,19 @@ const MPATH = joinpath(MDIRS[hit], "$(RUN)_eke.nc")
 mds = Dataset(MPATH)
 const MZ_UP = coordvar(mds, ["z_aac", "zC", "z_c", "z"], "z")          # bottom-to-top, negative
 const MLAT  = coordvar(mds, ["y_aca", "φ_aca", "φ_cca", "yC", "latitude", "lat", "y"], "latitude")
+const MLON  = let cands = ["x_caa", "λ_caa", "λ_fca", "xC", "longitude", "lon", "x"],
+                  hit = findfirst(c -> haskey(mds, c), cands)
+    if hit === nothing
+        # A LatitudeLongitudeGrid is uniform in longitude, so rebuilding the centres from the
+        # domain is exact -- but only if the file spans the whole domain, which is why this is
+        # a logged fallback and not the primary path.
+        n = size(mds["S"], 1)
+        @info "no longitude coordinate in $MPATH; assuming $n uniform cells over $(LON[1])-$(LON[2])E"
+        [LON[1] + (i - 0.5) * (LON[2] - LON[1]) / n for i in 1:n]
+    else
+        Float64.(coalesce.(mds[cands[hit]][:], NaN))
+    end
+end
 const MT    = Float64.(mds["time"][:])
 const MWIN  = haskey(mds.attrib, "averaging_window_seconds") ?
               Float64(mds.attrib["averaging_window_seconds"]) : 30 * 86400.0
@@ -128,18 +152,22 @@ const MZ = -reverse(MZ_UP)                                            # positive
       "$(round(maximum(MZ), digits=1)) m"
 
 """Cos-lat weighted band-mean profile of a (ni, nj, nk) field, surface-first on return."""
-function band_profile(A, lats, lo, hi; surface_first)
+function band_profile(A, lons, lats, lo, hi; surface_first)
     nk = size(A, 3)
     num = zeros(nk); den = zeros(nk)
     for j in axes(A, 2)
         (lo <= lats[j] < hi) || continue
         w = cosd(lats[j])
-        for i in axes(A, 1), k in 1:nk
-            v = A[i, j, k]
-            # Oceananigans writes immersed cells as EXACT zeros, and B-SOSE's land comes back
-            # NaN; `isfinite && != 0` is the one wet test that is right for both.
-            (isfinite(v) && v != 0) || continue
-            num[k] += w * v; den[k] += w
+        for i in axes(A, 1)
+            # Once per COLUMN, not per cell -- the sponge mask has no depth dependence.
+            KEEP(lons[i], lats[j]) || continue
+            for k in 1:nk
+                v = A[i, j, k]
+                # Oceananigans writes immersed cells as EXACT zeros, and B-SOSE's land comes
+                # back NaN; `isfinite && != 0` is the one wet test that is right for both.
+                (isfinite(v) && v != 0) || continue
+                num[k] += w * v; den[k] += w
+            end
         end
     end
     p = [den[k] == 0 ? NaN : num[k] / den[k] for k in 1:nk]
@@ -150,11 +178,12 @@ end
 Counts a column if ANY level is wet, which is orientation-independent -- index 1 is the bottom
 on our side and the surface on B-SOSE's, so sampling a single level would undercount one of
 them wherever the bathymetry is shallow."""
-function band_cells(A, lats, lo, hi)
+function band_cells(A, lons, lats, lo, hi)
     n = 0
     for j in axes(A, 2)
         (lo <= lats[j] < hi) || continue
         for i in axes(A, 1)
+            KEEP(lons[i], lats[j]) || continue
             any(k -> (v = A[i, j, k]; isfinite(v) && v != 0), axes(A, 3)) && (n += 1)
         end
     end
@@ -190,14 +219,14 @@ for (n, p) in enumerate(pairs)
     MS = Float64.(coalesce.(md["S"][:, :, :, p.mk], NaN))
     MM = Float64.(coalesce.(md["T"][:, :, :, p.mk], NaN))
     for b in BANDS
-        bs = band_profile(BS, BLAT, b[1], b[2]; surface_first = true)
-        bt = band_profile(BT, BLAT, b[1], b[2]; surface_first = true)
-        ms = interp_depth(MZ, band_profile(MS, MLAT, b[1], b[2]; surface_first = false), ZB)
-        mt = interp_depth(MZ, band_profile(MM, MLAT, b[1], b[2]; surface_first = false), ZB)
+        bs = band_profile(BS, BLON, BLAT, b[1], b[2]; surface_first = true)
+        bt = band_profile(BT, BLON, BLAT, b[1], b[2]; surface_first = true)
+        ms = interp_depth(MZ, band_profile(MS, MLON, MLAT, b[1], b[2]; surface_first = false), ZB)
+        mt = interp_depth(MZ, band_profile(MM, MLON, MLAT, b[1], b[2]; surface_first = false), ZB)
         dS[b][:, n] = ms .- bs
         dT[b][:, n] = mt .- bt
-        n == 1 && (cells[b] = (band_cells(BS, BLAT, b[1], b[2]),
-                               band_cells(MS, MLAT, b[1], b[2])))
+        n == 1 && (cells[b] = (band_cells(BS, BLON, BLAT, b[1], b[2]),
+                               band_cells(MS, MLON, MLAT, b[1], b[2])))
     end
 end
 close(bS); close(bT); close(md)
@@ -206,13 +235,18 @@ close(bS); close(bT); close(md)
 println("\n" * "="^100)
 println("1. WET CELLS PER BAND -- the two sides are averaged over their OWN masks")
 println("="^100)
-@printf("\n    %-10s %12s %12s   %s\n", "band", "B-SOSE", "model", "note")
+println("\n  " * sponge_note(LON, LAT))
+@printf("\n    %-10s %12s %12s   %-14s %s\n", "band", "B-SOSE", "model", "covers", "note")
 for b in BANDS
     nb, nm = cells[b]
-    @printf("    %4.0fS-%2.0fS  %12d %12d   %s\n", -b[1], -b[2], nb, nm,
+    tb = trimmed_band(LAT, b[1], b[2])
+    cov = tb === nothing ? "NOTHING" : @sprintf("%.0fS-%.0fS", -tb[1], -tb[2])
+    @printf("    %4.0fS-%2.0fS  %12d %12d   %-14s %s\n", -b[1], -b[2], nb, nm, cov,
             nb == 0 || nm == 0 ? "EMPTY -- band means are meaningless here" : "")
 end
-println("\n  The counts differ because the grids differ; what matters is that neither is tiny.")
+println("\n  `covers` is what the band is left with after the sponge is removed, so the label")
+println("  and the water it stands for can be read against each other.")
+println("  The counts differ because the grids differ; what matters is that neither is tiny.")
 
 binof(z) = findfirst(i -> BINS[i][1] <= z < BINS[i][2], eachindex(BINS))
 
