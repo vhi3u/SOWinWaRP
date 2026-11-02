@@ -32,7 +32,7 @@ const REPO = normpath(joinpath(@__DIR__, ".."))
 const RESULTS = Tuple{String,Bool,String}[]
 
 """Run one check, record it, never throw. `f` returns a short string on success."""
-function check(name, f)
+function check(f, name)
     print(rpad(name, 52))
     try
         note = f()
