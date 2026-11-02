@@ -1,0 +1,222 @@
+#!/bin/bash
+#
+# Testbed sweep. One SLURM job per arm, every arm generated from src/model_testbed.jl by
+# rewriting its `const` lines, so there is ONE source of truth and no hand-edited copies.
+#
+#     ./run_testbed --list              # show what would be submitted, change nothing
+#     ./run_testbed                     # every arm
+#     ./run_testbed control sponge1     # only these
+#     ./run_testbed --stop 2015-10-01   # a different window
+#
+# READ THE CONTROL ARM FIRST. `control` is src/model_testbed.jl with every knob at its committed
+# value, so it must reproduce 2Y_wind_fw_sw_5day over the same window. If it does not, the
+# testbed itself is wrong and no other arm means anything.
+#
+# THE ARMS, and what each one decides:
+#
+#   control        the committed configuration. The reference every other arm is read against.
+#
+#   sponge1        southern sponge 3 deg -> 1 deg. THE CONTROL, not an experiment: 70-67S is
+#                  currently clamped to B-SOSE on 12 h, which is 18 of the 30 rows of the
+#                  70-65S band -- the band carrying the whole +56.8% stratification excess.
+#                  West/north/east stay at 3 deg, where a 6x knee at 18 cells was measured and
+#                  where the sponge is the only path for tangential velocity.
+#                  READ: does the excess survive? If it collapses, we have been studying the
+#                  sponge and arms below are moot.
+#
+#   nofw           FRESHWATER_FLUX=false. A bracket on the virtual salt flux, not a fix: it
+#                  removes a real term 5x the size of SFLUX at 70-65S. READ: if the 0-100 m
+#                  fresh anomaly AND the excess both collapse, wiring z-star through
+#                  `ocean_simulation` is worth building. If the excess survives, drop that line.
+#
+#   bsose_conv     B-SOSE's Laplacian values + convective adjustment, NO CATKE. The honest
+#                  "nearly the same closure as B-SOSE" arm. READ: the MLD and the required pair.
+#
+#   bsose_nocatke  the same without convective adjustment -- NO boundary-layer scheme at all.
+#                  A very shallow mixed layer is the EXPECTED outcome. This arm is not a
+#                  candidate configuration; it measures how much of our mixed layer CATKE makes.
+#
+#   gm             CLOSURE_CONFIG=henyey_gm, adding GM/Redi. Aimed at the 200-400 m salt drift
+#                  (+0.03 g/kg/yr, the only thing still running away), NOT at the mixed layer.
+#                  READ the 200-400 m dS trend, not the MLD.
+#
+#   wind5d         WIND_CADENCE=:fiveday. Buoyancy supplies only 16% of `required` at 70-65S,
+#                  so wind does the rest and wind is monthly; deepening goes like u*^3 and
+#                  <u^3> >> <u>^3. Counter-evidence: 55-50S has ratio B = 0.01, even more
+#                  wind-dominated, and is NOT over-stratified. NEEDS THE 5-DAY WIND FILES:
+#                      ./download_bsose_5day.sh --vars oceTAUX,oceTAUY --years 2014,2015,2016
+#                  0.40 GB/yr each. The arm ERRORS at startup if they are missing rather than
+#                  silently falling back to monthly.
+#
+#   freeze         FREEZING_RELAXATION=true. B-SOSE's TFLUX was computed against B-SOSE's SST;
+#                  once ours drops below the liquidus nothing pulls it back. One-sided.
+#
+# WINDOW. The default spans 2014-06-01 to 2015-10-01 because `mixing_energetics.jl` at
+# WINDOW=mldmin anchors the 2015 season in January and ends it in September -- a run that stops
+# earlier cannot produce `req model` for that year at all, and the sweep's headline number
+# would be blank for every arm.
+#
+# ANALYSIS IS OFFLINE, on purpose: an arm that completed has shown no figures because the
+# plotting died, and an arm that died early produced nothing even for the months it reached.
+# Run tools/testbed_report.jl on the login node over whatever is on disk, as often as you like.
+# ---------------------------------------------------------------------------------------------
+
+set -euo pipefail
+
+START="2014-06-01"
+STOP="2015-10-01"
+WALLTIME="08:00:00"
+ACCOUNT="gts-ldove6-paid"
+LIST_ONLY=0
+SELECTED=()
+
+# name|const overrides (semicolon separated)|optional per-arm walltime
+CONFIGS=(
+    "control|"
+    "sponge1|SPONGE_WIDTH_SOUTH=1.0"
+    "nofw|FRESHWATER_FLUX=false"
+    "bsose_conv|CLOSURE_CONFIG=\"bsose_conv\""
+    "bsose_nocatke|CLOSURE_CONFIG=\"bsose_nocatke\""
+    "gm|CLOSURE_CONFIG=\"henyey_gm\""
+    "wind5d|WIND_CADENCE=:fiveday"
+    "freeze|FREEZING_RELAXATION=true"
+)
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --walltime) WALLTIME="$2"; shift 2 ;;
+        --start)    START="$2"; shift 2 ;;
+        --stop)     STOP="$2"; shift 2 ;;
+        --account)  ACCOUNT="$2"; shift 2 ;;
+        --list)     LIST_ONLY=1; shift ;;
+        -h|--help)  sed -n '2,72p' "$0"; exit 0 ;;
+        -*) echo "unknown option: $1" >&2; exit 1 ;;
+        *) SELECTED+=("$1"); shift ;;
+    esac
+done
+
+mkdir -p testbed testbed/out testbed/figs logs
+
+# GATE. A global used before it is defined parses fine, lints fine, and dies with UndefVarError
+# at job start -- after the queue wait, the module load and the bathymetry build. Two submitted
+# jobs have been lost that way in this repo. One second here, hours there.
+if command -v julia >/dev/null 2>&1; then
+    julia tools/check_forward_refs.jl src/model_testbed.jl >/dev/null || {
+        echo "error: src/model_testbed.jl uses a global before it is defined; not submitting." >&2
+        julia tools/check_forward_refs.jl src/model_testbed.jl >&2
+        exit 1
+    }
+fi
+
+# Rewrite one `const` in a generated arm and VERIFY it landed. A silent miss means a job runs
+# for hours testing the committed configuration under another name -- which is the single most
+# expensive failure mode this sweep has.
+set_const() {
+    local name="$1" value="$2" file="$3"
+    grep -qE "^const ${name} *=" "$file" || {
+        echo "error: src/model_testbed.jl has no 'const ${name} =' to rewrite" >&2; exit 1; }
+    sed -i.bak -E "s|^const ${name} *=.*|const ${name} = ${value}|" "$file" && rm -f "${file}.bak"
+    grep -qxF "const ${name} = ${value}" "$file" || {
+        echo "error: failed to set ${name} = ${value} in ${file}" >&2; exit 1; }
+}
+
+submit_job() {
+    local job="$1"; shift
+    bash -n "$job" || { echo "error: generated job script $job is malformed; not submitting" >&2; exit 1; }
+    sbatch --parsable "$@" "$job"
+}
+
+echo "window=$START to $STOP   walltime=$WALLTIME"
+echo
+printf '%-15s %s\n' "ARM" "OVERRIDES"
+
+JIDS=()
+for entry in "${CONFIGS[@]}"; do
+    IFS='|' read -r name overrides arm_walltime <<< "$entry"
+    walltime="${arm_walltime:-$WALLTIME}"
+
+    if [ ${#SELECTED[@]} -gt 0 ]; then
+        wanted=0
+        for want in "${SELECTED[@]}"; do [ "$want" = "$name" ] && wanted=1; done
+        [ $wanted -eq 1 ] || continue
+    fi
+
+    variant="testbed/model_${name}.jl"
+
+    # `include("setup_bsose.jl")` resolves relative to the INCLUDING file, so it has to be
+    # redirected now that the arm lives in testbed/ rather than src/.
+    sed -e "s|^include(\"setup_bsose.jl\")|include(joinpath(@__DIR__, \"..\", \"src\", \"setup_bsose.jl\"))|" \
+        src/model_testbed.jl > "$variant"
+    grep -q 'include(joinpath(@__DIR__, "..", "src", "setup_bsose.jl"))' "$variant" || {
+        echo "error: could not redirect the setup_bsose.jl include in $variant" >&2; exit 1; }
+
+    set_const RUN_NAME   "\"testbed/${name}\""    "$variant"
+    set_const START_DATE "DateTime(\"${START}\")" "$variant"
+    set_const END_DATE   "DateTime(\"${STOP}\")"  "$variant"
+
+    if [ -n "$overrides" ]; then
+        IFS=';' read -ra pairs <<< "$overrides"
+        for pair in "${pairs[@]}"; do
+            [ -n "$pair" ] || continue
+            set_const "${pair%%=*}" "${pair#*=}" "$variant"
+        done
+    fi
+
+    printf '%-15s %s\n' "$name" "${overrides:-(committed configuration)}"
+
+    job="testbed/job_${name}.sh"
+    cat > "$job" <<EOF
+#!/bin/bash
+#SBATCH --account=${ACCOUNT}
+#SBATCH --output=logs/%x-%j.out
+#SBATCH --error=logs/%x-%j.err
+#SBATCH --time=${walltime}
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=4
+#SBATCH --gres=gpu:V100:1
+#SBATCH --mem-per-gpu=32G
+
+set -uo pipefail
+
+echo "=========================================================="
+echo " Arm       : ${name}"
+echo " Overrides : ${overrides:-none (committed configuration)}"
+echo " Window    : ${START} to ${STOP}"
+echo " Node      : \$(hostname)"
+echo " Start     : \$(date)"
+echo "=========================================================="
+
+module purge
+module load julia/1.12.5
+unset LD_LIBRARY_PATH
+export JULIA_CPU_TARGET=\${JULIA_CPU_TARGET:-generic}
+export JULIA_PKGIMAGES=\${JULIA_PKGIMAGES:-no}
+
+mkdir -p testbed/out
+if stdbuf -o0 -e0 julia --project=. ${variant} 2>&1 | tee testbed/out/${name}.log; then
+    echo "RESULT ${name}: completed ${START} to ${STOP}"
+else
+    echo "RESULT ${name}: FAILED exit \$? -- see above for where it diverged"
+fi
+
+echo " Finished  : \$(date)"
+EOF
+
+    if [ $LIST_ONLY -eq 1 ]; then
+        bash -n "$job" || { echo "error: $job is malformed" >&2; exit 1; }
+        continue
+    fi
+
+    jid=$(submit_job "$job" --job-name="tb_${name}")
+    JIDS+=("$jid")
+done
+
+if [ $LIST_ONLY -eq 0 ]; then
+    echo
+    echo "Submitted ${#JIDS[@]} arm(s). Watch with:  squeue -u \$USER"
+    echo "Watch one live:          tail -f testbed/out/<arm>.log"
+    echo "Collect outcomes:        grep -h '^RESULT' logs/tb_*.out"
+    echo
+    echo "Then, on the login node, over whatever has finished:"
+    echo "    julia --project=. tools/testbed_report.jl"
+fi

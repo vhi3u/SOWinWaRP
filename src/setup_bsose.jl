@@ -80,9 +80,13 @@ struct BSOSEMonthly <: BSOSEDataset
     # Which cadence the SURFACE BUOYANCY FLUXES are read at; see `BSOSE_CADENCE_SWITCHABLE`.
     # `:monthly` (the default) reads the one `2013to2024_monthly` file per variable, exactly as
     # before. `:fiveday` reads the per-year `<token>_bsoseI156_<year>_5day.nc` files instead.
-    # Nothing else moves: winds, sea surface height and every 3-D boundary and sponge field stay
-    # monthly whatever this is set to.
+    # Sea surface height and every 3-D boundary and sponge field stay monthly whatever this is.
     surface_cadence::Symbol
+    # Wind stress cadence, SEPARATE from the buoyancy fluxes because it answers a different
+    # question: whether a monthly-mean stress under-mixes. Deepening goes like u*^3 and
+    # <u^3> >> <u>^3, so a monthly mean is biased low wherever the stress is intermittent.
+    # oceTAUX/oceTAUY 5-day files are 0.40 GB/yr each (HEAD-checked 2026-11-01).
+    wind_cadence::Symbol
 end
 
 function default_bsose_directory()
@@ -100,7 +104,8 @@ function default_bsose_directory()
 end
 
 function BSOSEMonthly(; dir=default_bsose_directory(), iteration=nothing,
-                        surface_cadence::Symbol=:monthly)
+                        surface_cadence::Symbol=:monthly,
+                        wind_cadence::Symbol=:monthly)
     # Auto-detect iteration if not explicitly given
     if isnothing(iteration)
         if isdir(dir)
@@ -118,11 +123,14 @@ function BSOSEMonthly(; dir=default_bsose_directory(), iteration=nothing,
     end
     surface_cadence in (:monthly, :fiveday) ||
         error("surface_cadence must be :monthly or :fiveday, got :$surface_cadence")
-    return BSOSEMonthly(abspath(dir), iteration, surface_cadence)
+    wind_cadence in (:monthly, :fiveday) ||
+        error("wind_cadence must be :monthly or :fiveday, got :$wind_cadence")
+    return BSOSEMonthly(abspath(dir), iteration, surface_cadence, wind_cadence)
 end
 
 Base.summary(ds::BSOSEMonthly) =
-    "BSOSEMonthly(iteration=$(ds.iteration), surface_cadence=:$(ds.surface_cadence), dir=\"$(ds.dir)\")"
+    "BSOSEMonthly(iteration=$(ds.iteration), surface_cadence=:$(ds.surface_cadence), " *
+    "wind_cadence=:$(ds.wind_cadence), dir=\"$(ds.dir)\")"
 
 
 # Variable name dictionary
@@ -295,6 +303,10 @@ losing heat, so splitting their cadences would decouple two halves of one proces
 const BSOSE_CADENCE_SWITCHABLE = (:surface_heat_flux, :surface_salt_flux,
                                   :surface_freshwater_flux, :surface_shortwave)
 
+# Wind stress switches on `wind_cadence`, NOT `surface_cadence`, so the buoyancy-flux arm and
+# the wind arm can be varied one at a time. Momentum and buoyancy are separate questions here.
+const BSOSE_WIND_SWITCHABLE = (:zonal_wind_stress, :meridional_wind_stress)
+
 # 5-day files are per YEAR rather than one file per variable: `<token>_bsoseI156_<year>_5day.nc`,
 # 73 records each, stamped at the END of the window they average. Verified against
 # `oceTAUX_bsoseI156_2014_5day.nc`: 73 records, spacing min AND max exactly 5.0 days, first
@@ -310,8 +322,17 @@ bsose_fiveday_span(year) = "$(year)_5day"
 dataset says, so a single dataset object can serve 5-day surface fluxes and monthly boundaries
 at the same time -- which is exactly how `src/model.jl` uses it.
 """
-bsose_variable_cadence(dataset::BSOSEDataset, var) =
-    (var in BSOSE_CADENCE_SWITCHABLE && dataset.surface_cadence === :fiveday) ? :fiveday : :monthly
+function bsose_variable_cadence(dataset::BSOSEDataset, var)
+    if var in BSOSE_CADENCE_SWITCHABLE
+        return dataset.surface_cadence === :fiveday ? :fiveday : :monthly
+    elseif var in BSOSE_WIND_SWITCHABLE
+        # hasproperty, not a bare field access: a dataset type without the field predates it
+        # and is monthly by definition, and that should not be an error.
+        return (hasproperty(dataset, :wind_cadence) && dataset.wind_cadence === :fiveday) ?
+               :fiveday : :monthly
+    end
+    return :monthly
+end
 
 
 """
@@ -1548,8 +1569,19 @@ function bsose_surface_wind_stress(grid;
     end
     @info "Loading surface wind stress ($(summary(dataset)))..."
     region = bsose_region(grid)
-    taux_meta = Metadata(:zonal_wind_stress; dataset, dates, region)
-    tauy_meta = Metadata(:meridional_wind_stress; dataset, dates, region)
+    # At :fiveday these resolve the MONTHLY boundary dates handed in by
+    # `bsose_open_boundary_conditions` onto the 5-day axis. Without this the 5-day files would
+    # be read at ~26 monthly stamps across a two-year run, every one through the nearest-stamp
+    # fallback -- the arm would look like it ran while changing nothing. Same trap as the
+    # surface tracer fluxes; see `surface_forcing_dates`.
+    taux_dates = surface_forcing_dates(dataset, :zonal_wind_stress, dates)
+    tauy_dates = surface_forcing_dates(dataset, :meridional_wind_stress, dates)
+    if bsose_variable_cadence(dataset, :zonal_wind_stress) === :fiveday
+        @info "  wind stress on the 5-DAY axis: $(length(taux_dates)) records " *
+              "($(first(taux_dates)) to $(last(taux_dates)))"
+    end
+    taux_meta = Metadata(:zonal_wind_stress; dataset, dates=taux_dates, region)
+    tauy_meta = Metadata(:meridional_wind_stress; dataset, dates=tauy_dates, region)
     taux_fts = resident_fts(taux_meta, grid)
     tauy_fts = resident_fts(tauy_meta, grid)
 
@@ -2889,10 +2921,25 @@ end
 # ==============================================================================
 
 """
+    _sponge_taper(d, w)
+
+Raised-cosine taper for ONE face: 1 at or outside the edge (`d <= 0`), 0 at or beyond `w`,
+`0.5(1 + cos(pi d / w))` between. `w <= 0` disables that face. Top level, not a closure, so
+it compiles into the GPU mask kernel with nothing captured.
+"""
+@inline function _sponge_taper(d, w)
+    w <= 0 && return 0.0
+    d <= 0.0 && return 1.0
+    d >= w && return 0.0
+    return 0.5 * (1.0 + cos(π * d / w))
+end
+
+"""
     bsose_sponge_layer_forcing(grid;
                                dataset = BSOSEMonthly(),
                                dates = nothing,
                                sponge_width = 3.0,
+                               sponge_width_south = nothing,  # and _north, _west, _east
                                timescale = 5days,
                                restore_velocities = true,
                                reference_date = nothing)
@@ -2901,11 +2948,19 @@ Construct sponge layer forcing using `DatasetRestoring` for all open boundaries.
 A smooth cosine taper relaxes variables toward BSOSE values within `sponge_width`
 degrees of the boundary edges on a timescale of `timescale`, dropping to zero
 relaxation in the interior domain.
+
+Each face may override the common width. `nothing` (the default) means "use
+`sponge_width`", and a width of `0` turns that face's sponge off entirely. With all four
+equal this is EXACTLY the single-width mask it replaces -- see `_sponge_taper`.
 """
 function bsose_sponge_layer_forcing(grid;
     dataset=BSOSEMonthly(),
     dates=nothing,
     sponge_width=3.0, # degrees
+    sponge_width_south=nothing,
+    sponge_width_north=nothing,
+    sponge_width_west=nothing,
+    sponge_width_east=nothing,
     timescale=5days,
     restore_velocities=true,
     reference_date=nothing)
@@ -2918,25 +2973,26 @@ function bsose_sponge_layer_forcing(grid;
     φ_min = underlying.φᵃᶠᵃ[1]
     φ_max = underlying.φᵃᶠᵃ[underlying.Ny+1]
 
-    # Sponge mask: 1 at boundary edge, smoothly tapering to 0 at distance >= sponge_width.
-    # Oceananigans forcing kernels call mask functions as either mask(λ, φ, z, t) or mask(λ, φ, z).
-    compute_sponge = (λ, φ, z) -> begin
-        dist_s = φ - φ_min
-        dist_n = φ_max - φ
-        d_edge = min(dist_s, dist_n)
-        if !is_x_periodic
-            dist_w = λ - λ_min
-            dist_e = λ_max - λ
-            d_edge = min(d_edge, dist_w, dist_e)
-        end
+    # Per-face widths. `nothing` means "use the common width".
+    w_s = something(sponge_width_south, sponge_width)
+    w_n = something(sponge_width_north, sponge_width)
+    w_w = something(sponge_width_west, sponge_width)
+    w_e = something(sponge_width_east, sponge_width)
 
-        if d_edge >= sponge_width
-            return 0.0
-        elseif d_edge <= 0.0
-            return 1.0
-        else
-            return 0.5 * (1.0 + cos(π * d_edge / sponge_width))
+    # Sponge mask: 1 at a boundary edge, smoothly tapering to 0 at that face's width.
+    # Oceananigans forcing kernels call mask functions as either mask(λ, φ, z, t) or mask(λ, φ, z).
+    #
+    # TAKING THE MAX OF THE PER-FACE TAPERS IS EXACTLY THE OLD taper(min(distances)) WHEN THE
+    # WIDTHS ARE EQUAL, because `_sponge_taper` is monotonically DECREASING in distance: the
+    # nearest face gives the largest taper, so max-of-tapers picks the same face min-of-distances
+    # did, and returns the same number. Production behaviour is therefore unchanged, and the
+    # corner case the old form handled by construction (any distance <= 0 gives 1.0) still does.
+    compute_sponge = (λ, φ, z) -> begin
+        m = max(_sponge_taper(φ - φ_min, w_s), _sponge_taper(φ_max - φ, w_n))
+        if !is_x_periodic
+            m = max(m, _sponge_taper(λ - λ_min, w_w), _sponge_taper(λ_max - λ, w_e))
         end
+        return m
     end
 
     sponge_mask = (λ, φ, z, args...) -> compute_sponge(λ, φ, z)
