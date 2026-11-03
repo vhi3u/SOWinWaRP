@@ -25,9 +25,17 @@
 #
 # WHY SFLUX AND oceFWflx ARE SEPARATE TERMS AND NOT A DOUBLE COUNT. MITgcm ran with a real
 # freshwater flux, so P, E, runoff and ice melt move WATER: they change salinity by dilution
-# without moving salt mass, and so never enter a salt-CONTENT flux. What is left in SFLUX is
-# brine. tools/check_freshwater_flux.jl tested this rather than assuming it -- north of 65S,
-# where there is no ice to reject brine, SFLUX is ~2 orders of magnitude below -S0*oceFWflx.
+# without moving salt mass, and so never enter a salt-CONTENT flux.
+# tools/check_freshwater_flux.jl tested this rather than assuming it -- north of 65S, where
+# there is no ice, SFLUX is ~2 orders of magnitude below -S0*oceFWflx.
+#
+# SFLUX IS NOT BRINE REJECTION. Under a real freshwater flux the salinification from freezing
+# is carried ENTIRELY by oceFWflx -- the water leaves, the salt stays -- so brine never appears
+# in a salt-content flux either. What SFLUX carries is the small amount of salt that leaves IN
+# the ice, sea ice being ~4 g/kg rather than fresh. That is why SFLUX at 70-65S is most
+# NEGATIVE (freshening) in Aug-Sep at the ice maximum, exactly anti-phased with the dilution
+# term, and why its seasonal amplitude is ~12% of the dilution term's: 0.0219/0.1828 = 0.120,
+# and 0.120 * 34 = 4.1 g/kg, which is an ice salinity. Measured here, not looked up.
 #
 # VERIFICATION PANELS, included deliberately rather than trimmed away:
 #   oceSflux   must be bit-for-bit SFLUX (checked, ratio exactly 0 in check_flux_identities)
@@ -258,7 +266,7 @@ FW === nothing && error(FIVEDAY ?
     "no $(monthly_filename("oceFWflx"))")
 
 TERMS = Pair{String,Array{Float64,3}}[]
-push!(TERMS, "SFLUX (brine)"            => tend(SFLUX))
+push!(TERMS, "SFLUX (salt into ice)"    => tend(SFLUX))
 push!(TERMS, "-S0*oceFWflx (dilution)"  => tend(.-S0 .* FW))
 push!(TERMS, "net applied"              => tend(SFLUX .- S0 .* FW))
 
