@@ -55,16 +55,21 @@
 
 using NCDatasets, Dates, Printf, Statistics, CairoMakie
 
-const DIR    = get(ENV, "BSOSE_DIR", "data")
-const H_REF  = parse(Float64, get(ENV, "H_REF", "100"))
-const S0     = parse(Float64, get(ENV, "S0", "34.0"))
-const OUTDIR = get(ENV, "OUTDIR", "plots")
-const YEARS  = [parse(Int, strip(y)) for y in split(get(ENV, "YEARS", "2014,2015,2016"), ",")]
+const DIR     = get(ENV, "BSOSE_DIR", "data")
+const H_REF   = parse(Float64, get(ENV, "H_REF", "100"))
+const S0      = parse(Float64, get(ENV, "S0", "34.0"))
+const OUTDIR  = get(ENV, "OUTDIR", "plots")
+const YEARS   = [parse(Int, strip(y)) for y in split(get(ENV, "YEARS", "2014,2015,2016"), ",")]
 const YEARLIST = join(YEARS, ", ")
 const YEARSPAN = join(YEARS, "-")
+const CADENCE = get(ENV, "CADENCE", "fiveday")
+CADENCE in ("monthly", "fiveday") ||
+    error("CADENCE must be \"monthly\" or \"fiveday\", got \"$CADENCE\"")
+const FIVEDAY = CADENCE == "fiveday"
+const CADTAG  = FIVEDAY ? "_5day" : ""      # figure suffix, so the two cadences do not collide
 
 const ρ₀   = 1026.0                 # matches tools/mixing_energetics.jl
-const SPM  = 86400 * 30.44          # seconds per mean month, for the per-month tendency
+const SPM  = 86400 * 30.44          # seconds per mean month: the RATE unit, both cadences
 const LON  = (90.0, 150.0)
 const LAT  = (-70.0, -45.0)
 const BANDS = [(-70.0, -65.0), (-65.0, -60.0), (-60.0, -55.0), (-55.0, -50.0), (-50.0, -45.0)]
@@ -72,72 +77,144 @@ const BANDS = [(-70.0, -65.0), (-65.0, -60.0), (-60.0, -55.0), (-55.0, -50.0), (
 include(joinpath(@__DIR__, "sponge.jl"))
 const KEEP = sponge_trimmer(LON, LAT)
 
-"""B-SOSE stamps the END of the averaging window; the value belongs at the window's midpoint."""
+# ── file naming and the two time axes ─────────────────────────────────────────────────────────
+# Monthly is one file per variable spanning 2013-2024; 5-day is one file PER YEAR with 73
+# records. Which tokens exist at which cadence is not uniform, and that is the whole reason the
+# resolution below is per token rather than global:
+#
+#   surfSflx, oceFWflx   both cadences        the two terms the model actually applies
+#   oceSflux, oceFreez   MONTHLY only         verification panels
+#   SIArea,   SIHeff     5-DAY only           sea ice, the mechanism behind SFLUX
+#
+# So neither cadence can show everything, and a token that cannot match the chosen one is
+# SKIPPED with a reason rather than quietly read at the other -- two series on different time
+# axes in one panel would be a straightforward lie.
+monthly_filename(token) = joinpath(DIR, "$(token)_bsoseI156_2013to2024_monthly.nc")
+fiveday_filename(token, y) = joinpath(DIR, "$(token)_bsoseI156_$(y)_5day.nc")
+
+has_fiveday(token) = all(y -> isfile(fiveday_filename(token, y)), YEARS)
+has_monthly(token) = isfile(monthly_filename(token))
+
+"""Files for one token at the active cadence, or `nothing` if it cannot be read there."""
+function token_files(token)
+    if FIVEDAY
+        has_fiveday(token) || return nothing
+        return [fiveday_filename(token, y) for y in YEARS]
+    end
+    has_monthly(token) || return nothing
+    return [monthly_filename(token)]
+end
+
+"""B-SOSE stamps the END of the averaging window; the value belongs at the midpoint."""
 function window_center(stamp)
     stop  = round(DateTime(stamp), Month)
     start = stop - Month(1)
     return start + Millisecond(Dates.value(Millisecond(stop - start)) ÷ 2)
 end
 
-filename(token) = joinpath(DIR, "$(token)_bsoseI156_2013to2024_monthly.nc")
+# A 5-day stamp carries NO drift (spacing is exactly 5.0 days), so unlike the monthly stamps it
+# must NOT be snapped to anything -- the window is simply the 5 days behind it. Same trap
+# `bsose_averaging_window` warns about in setup_bsose.jl.
+fiveday_center(stamp) = DateTime(stamp) - Millisecond(Dates.value(Millisecond(Day(5))) ÷ 2)
 
-"""The variable inside the file, which is not always the filename token (surfSflx holds SFLUX)."""
+center_of(stamp) = FIVEDAY ? fiveday_center(stamp) : window_center(stamp)
+
+"""Seconds the record ending at `stamp` averages over. Months are not all 30.44 days."""
+function window_seconds(stamp)
+    FIVEDAY && return 5 * 86400.0
+    stop = round(DateTime(stamp), Month)
+    return Dates.value(Millisecond(stop - (stop - Month(1)))) / 1000
+end
+
+"""The variable inside the file, which is not always the filename token."""
 function varname(ds, token)
-    for c in (token, uppercase(token), lowercase(token),
-              token == "surfSflx" ? "SFLUX" : token,
-              token == "SIArea"   ? "SIarea" : token,
-              token == "SIHeff"   ? "SIheff" : token)
+    cands = [token, uppercase(token), lowercase(token), titlecase(token)]
+    token == "surfSflx" && push!(cands, "SFLUX")
+    token == "SIArea"   && append!(cands, ["SIarea", "SIAREA"])
+    token == "SIHeff"   && append!(cands, ["SIheff", "SIHEFF"])
+    for c in cands
         haskey(ds, c) && return c
     end
     avail = join(keys(ds), ", ")
     error("no variable for $token in the file; saw $avail")
 end
 
-# ── geometry, read once from whichever file is present ────────────────────────────────────────
-isfile(filename("surfSflx")) ||
-    error("no $(filename("surfSflx")). Set BSOSE_DIR, or fetch with\n" *
-          "  ./download_bsose_5day.sh --monthly --vars surfSflx,oceFWflx --dest $DIR")
+# ── geometry and the time axis, from the primary token ────────────────────────────────────────
+# surfSflx defines both. Every other token is checked against this axis, never the reverse.
+const PRIMARY = "surfSflx"
+if token_files(PRIMARY) === nothing
+    error(FIVEDAY ?
+        "CADENCE=fiveday needs $(join([basename(fiveday_filename(PRIMARY, y)) for y in YEARS], ", ")) " *
+        "in $DIR.\n  Fetch them, or re-run with CADENCE=monthly." :
+        "no $(monthly_filename(PRIMARY)). Set BSOSE_DIR, or fetch with\n" *
+        "  ./download_bsose_5day.sh --monthly --vars surfSflx,oceFWflx --dest $DIR")
+end
 
-probe = Dataset(filename("surfSflx"))
+probe = Dataset(first(token_files(PRIMARY)))
 xc = Float64.(probe["XC"][:]); yc = Float64.(probe["YC"][:])
 const IS = findall(x -> LON[1] <= x <= LON[2], xc)
 const JS = findall(y -> LAT[1] <= y <= LAT[2], yc)
 const XS, YS = xc[IS], yc[JS]
 const MASK = Float64.(probe["maskInC"][IS, JS]) .> 0.5
-stamps = [window_center(t) for t in probe["time"][:]]
 close(probe)
 
-const KS = [k for k in eachindex(stamps) if year(stamps[k]) in YEARS]
-isempty(KS) && error("no months in $(join(YEARS, ",")) -- the file covers " *
-                     "$(Dates.format(first(stamps), "yyyy-mm")) to $(Dates.format(last(stamps), "yyyy-mm"))")
-const TS     = stamps[KS]
+"""Stamps, centres and window lengths across every file of the active cadence."""
+function time_axis(token)
+    cent = DateTime[]; secs = Float64[]; keep = Vector{Tuple{Int,Int}}()
+    for (fi, f) in enumerate(token_files(token))
+        ds = Dataset(f)
+        try
+            for (k, t) in enumerate(ds["time"][:])
+                c = center_of(t)
+                year(c) in YEARS || continue      # monthly file spans 2013-2024
+                push!(cent, c); push!(secs, window_seconds(t)); push!(keep, (fi, k))
+            end
+        finally
+            close(ds)
+        end
+    end
+    return cent, secs, keep
+end
+
+const TS, DTS, KEEPIDX = time_axis(PRIMARY)
+isempty(TS) && error("no records in $(YEARLIST) at CADENCE=$CADENCE")
 const LABELS = [Dates.format(t, "yy-mm") for t in TS]
+@info "$CADENCE: $(length(TS)) records, $(LABELS[1]) to $(LABELS[end])"
 
 # KEEP has no time or depth dependence, so the column test is done ONCE here rather than inside
 # every band average: a (nx, ny) Bool that already folds in the land mask and the sponge trim.
 const USE = [MASK[i, j] && KEEP(XS[i], YS[j]) for i in eachindex(XS), j in eachindex(YS)]
 const WEIGHT = [cosd(YS[j]) for _ in eachindex(XS), j in eachindex(YS)]
-
 count(USE) == 0 && error("the trim removed every column; lower TRIM_SPONGE")
 
-"""Read one token over the domain and the selected months, as (nx, ny, nt) with land NaN."""
+"""Read one token over the domain and the selected records, as (nx, ny, nt) with land NaN."""
 function readterm(token)
-    p = filename(token)
-    isfile(p) || return nothing
-    ds = Dataset(p)
-    try
-        v = varname(ds, token)
-        A = Float64.(coalesce.(ds[v][IS, JS, KS], NaN))
-        for t in axes(A, 3), j in axes(A, 2), i in axes(A, 1)
-            USE[i, j] || (A[i, j, t] = NaN)
-        end
-        return A
-    finally
-        close(ds)
+    files = token_files(token)
+    files === nothing && return nothing
+    cent, _, keep = time_axis(token)
+    if length(cent) != length(TS) || any(cent .!= TS)
+        @info "$token has $(length(cent)) records against $PRIMARY's $(length(TS)) at " *
+              "CADENCE=$CADENCE -- skipping rather than plotting two time axes together"
+        return nothing
     end
+    A = fill(NaN, length(IS), length(JS), length(TS))
+    open_ds = Dict{Int,Any}()
+    try
+        for (n, (fi, k)) in enumerate(keep)
+            ds = get!(open_ds, fi) do; Dataset(files[fi]); end
+            v = varname(ds, token)
+            A[:, :, n] = Float64.(coalesce.(ds[v][IS, JS, k], NaN))
+        end
+    finally
+        for ds in values(open_ds); close(ds); end
+    end
+    for t in axes(A, 3), j in axes(A, 2), i in axes(A, 1)
+        USE[i, j] || (A[i, j, t] = NaN)
+    end
+    return A
 end
 
-"""Longitude mean at each latitude and month -> (ny, nt), the latitude-time Hovmoller."""
+"""Longitude mean at each latitude and record -> (ny, nt), the latitude-time Hovmoller."""
 function lat_time(A)
     ny, nt = size(A, 2), size(A, 3)
     out = fill(NaN, ny, nt)
@@ -152,11 +229,10 @@ function lat_time(A)
     return out
 end
 
-"""cos-lat weighted mean over one band at each month -> (nt,)."""
+"""cos-lat weighted mean over one band at each record -> (nt,)."""
 function band_series(A, lo, hi)
-    nt = size(A, 3)
-    out = fill(NaN, nt)
-    for t in 1:nt
+    out = fill(NaN, size(A, 3))
+    for t in axes(A, 3)
         num = 0.0; den = 0.0
         for j in axes(A, 2)
             (lo <= YS[j] < hi) || continue
@@ -170,38 +246,48 @@ function band_series(A, lo, hi)
     return out
 end
 
-# ── the terms, all in implied g/kg per month ──────────────────────────────────────────────────
-tend(F) = F .* (SPM / (ρ₀ * H_REF))     # g/m^2/s -> g/kg per month in H_REF metres
+# ── the terms, all as implied g/kg per MONTH (a rate, so both cadences are comparable) ────────
+tend(F) = F .* (SPM / (ρ₀ * H_REF))
 
-@info "reading surfSflx and oceFWflx over $(length(KS)) months, $(length(IS))x$(length(JS)) columns"
+@info "reading $PRIMARY and oceFWflx over $(length(TS)) records, $(length(IS))x$(length(JS)) columns"
 SFLUX = readterm("surfSflx")
 FW    = readterm("oceFWflx")
-SFLUX === nothing && error("missing $(filename("surfSflx"))")
-FW    === nothing && error("missing $(filename("oceFWflx"))")
+SFLUX === nothing && error("could not read surfSflx at CADENCE=$CADENCE")
+FW === nothing && error(FIVEDAY ?
+    "oceFWflx has no 5-day file for all of $YEARLIST in $DIR -- re-run with CADENCE=monthly" :
+    "no $(monthly_filename("oceFWflx"))")
 
 TERMS = Pair{String,Array{Float64,3}}[]
 push!(TERMS, "SFLUX (brine)"            => tend(SFLUX))
 push!(TERMS, "-S0*oceFWflx (dilution)"  => tend(.-S0 .* FW))
 push!(TERMS, "net applied"              => tend(SFLUX .- S0 .* FW))
 
-# Verification terms: present if downloaded, and expected to be boring. Their job is to fail.
+# Verification terms: present only at monthly, and expected to be boring. Their job is to fail.
 for (tok, lab) in (("oceSflux", "oceSflux (= SFLUX?)"), ("oceFreez", "oceFreez (= 0?)"))
     A = readterm(tok)
-    A === nothing ? @info("$tok not present -- skipping its panel") :
-                    push!(TERMS, lab => tend(A))
+    if A === nothing
+        @info "$tok unavailable at CADENCE=$CADENCE (it is monthly-only) -- panel skipped"
+    else
+        push!(TERMS, lab => tend(A))
+    end
 end
 
-# Sea ice is not a salt flux and gets its own figure, but it is the mechanism behind SFLUX.
+# Sea ice is not a salt flux and gets its own figure, but it IS the mechanism behind SFLUX.
 ICE = Pair{String,Array{Float64,3}}[]
-for (tok, lab) in (("SIArea", "sea ice area fraction"), ("SIHeff", "sea ice effective thickness (m)"))
+for (tok, lab) in (("SIArea", "sea ice area fraction"), ("SIHeff", "sea ice thickness (m)"))
     A = readterm(tok)
-    A === nothing ? @info("$tok not downloaded -- skipping (./download_bsose_5day.sh --monthly --vars $tok)") :
-                    push!(ICE, lab => A)
+    if A === nothing
+        @info "$tok unavailable at CADENCE=$CADENCE" *
+              (has_fiveday(tok) ? " (it is 5-day only -- re-run with CADENCE=fiveday)" : "")
+    else
+        push!(ICE, lab => A)
+    end
 end
 
 # ── the table: is any term seasonal, and in phase with what? ──────────────────────────────────
 println("\n" * "="^104)
 println("SURFACE SALINITY FORCING -- implied g/kg per month in the top $(Int(H_REF)) m, $YEARLIST")
+println("  cadence: $CADENCE ($(length(TS)) records); `accum` integrates the rate over each window.")
 println("="^104)
 println("\n  " * sponge_note(LON, LAT))
 println("  POSITIVE = SALINIFYING. S0 = $S0, rho0 = $ρ₀.\n")
@@ -210,6 +296,10 @@ println("  POSITIVE = SALINIFYING. S0 = $S0, rho0 = $ρ₀.\n")
         "term", "band", "mean/mo", "accum", "amp", "peak mo", "min mo")
 @printf("  %-24s %-9s %9s %9s %9s %9s %9s\n",
         "", "", "(g/kg)", "(g/kg)", "(g/kg)", "", "")
+"""Integral of a per-month RATE over the record, in g/kg. Weighted by each window's own
+length, so a 5-day series and a monthly series of the same forcing accumulate to the same total."""
+accum(v) = sum(isfinite(v[k]) ? v[k] * DTS[k] / SPM : 0.0 for k in eachindex(v))
+
 SERIES = Dict{Tuple{String,Tuple{Float64,Float64}},Vector{Float64}}()
 for (lab, A) in TERMS
     for b in BANDS
@@ -224,7 +314,7 @@ for (lab, A) in TERMS
         isempty(good) && continue
         amp = maximum(clim[good]) - minimum(clim[good])
         @printf("  %-24s %4.0fS-%2.0fS %9.4f %9.4f %9.4f %9s %9s\n",
-                lab, -b[1], -b[2], mean(f), sum(f), amp,
+                lab, -b[1], -b[2], mean(f), accum(s), amp,
                 Dates.format(DateTime(2015, good[argmax(clim[good])], 1), "u"),
                 Dates.format(DateTime(2015, good[argmin(clim[good])], 1), "u"))
     end
@@ -274,8 +364,8 @@ let n = length(TERMS)
     Colorbar(fig[1, n + 1], hm, label = "implied g/kg per month")
     Label(fig[2, 1:n], @sprintf("colour limit is the 99th percentile (%.3f); ice-edge cells saturate", lim),
           fontsize = 10, color = :gray40)
-    save(joinpath(OUTDIR, "surface_salt_forcing_hovmoller.png"), fig; px_per_unit = 2)
-    @info "wrote $(joinpath(OUTDIR, "surface_salt_forcing_hovmoller.png"))"
+    save(joinpath(OUTDIR, "surface_salt_forcing_hovmoller$(CADTAG).png"), fig; px_per_unit = 2)
+    @info "wrote $(joinpath(OUTDIR, "surface_salt_forcing_hovmoller$(CADTAG).png"))"
 end
 
 # 2. per-band time series, every term overlaid -- phase comparison
@@ -298,8 +388,8 @@ let
         hlines!(ax, [0], color = :gray50, linewidth = 1)
         n == 1 && axislegend(ax; position = :lb, labelsize = 8, framevisible = false)
     end
-    save(joinpath(OUTDIR, "surface_salt_forcing_bands.png"), fig; px_per_unit = 2)
-    @info "wrote $(joinpath(OUTDIR, "surface_salt_forcing_bands.png"))"
+    save(joinpath(OUTDIR, "surface_salt_forcing_bands$(CADTAG).png"), fig; px_per_unit = 2)
+    @info "wrote $(joinpath(OUTDIR, "surface_salt_forcing_bands$(CADTAG).png"))"
 end
 
 # 3. month-of-year climatology -- the seasonality question, answered directly
@@ -325,8 +415,8 @@ let
         hlines!(ax, [0], color = :gray50, linewidth = 1)
         n == 1 && axislegend(ax; position = :lb, labelsize = 8, framevisible = false)
     end
-    save(joinpath(OUTDIR, "surface_salt_forcing_seasonal.png"), fig; px_per_unit = 2)
-    @info "wrote $(joinpath(OUTDIR, "surface_salt_forcing_seasonal.png"))"
+    save(joinpath(OUTDIR, "surface_salt_forcing_seasonal$(CADTAG).png"), fig; px_per_unit = 2)
+    @info "wrote $(joinpath(OUTDIR, "surface_salt_forcing_seasonal$(CADTAG).png"))"
 end
 
 # 4. cumulative accumulation -- the size test, directly comparable to a g/kg error panel
@@ -343,15 +433,15 @@ let
         for (k, (lab, _)) in enumerate(TERMS)
             s = SERIES[(lab, b)]
             any(isfinite, s) || continue
-            c = cumsum([isfinite(v) ? v : 0.0 for v in s])
+            c = cumsum([isfinite(s[k]) ? s[k] * DTS[k] / SPM : 0.0 for k in eachindex(s)])
             lines!(ax, 1:length(TS), c; color = cols[mod1(k, length(cols))], linewidth = 2,
                    linestyle = occursin("?", lab) ? :dash : :solid, label = lab)
         end
         hlines!(ax, [0], color = :gray50, linewidth = 1)
         n == 1 && axislegend(ax; position = :lb, labelsize = 8, framevisible = false)
     end
-    save(joinpath(OUTDIR, "surface_salt_forcing_cumulative.png"), fig; px_per_unit = 2)
-    @info "wrote $(joinpath(OUTDIR, "surface_salt_forcing_cumulative.png"))"
+    save(joinpath(OUTDIR, "surface_salt_forcing_cumulative$(CADTAG).png"), fig; px_per_unit = 2)
+    @info "wrote $(joinpath(OUTDIR, "surface_salt_forcing_cumulative$(CADTAG).png"))"
 end
 
 # 5. sea ice, only if it was downloaded -- the mechanism behind SFLUX
@@ -366,8 +456,8 @@ if !isempty(ICE)
         hmk = heatmap!(ax, 1:length(TS), YS, permutedims(h); colormap = :ice)
         Colorbar(fig[1, length(ICE) + k], hmk)
     end
-    save(joinpath(OUTDIR, "surface_salt_forcing_seaice.png"), fig; px_per_unit = 2)
-    @info "wrote $(joinpath(OUTDIR, "surface_salt_forcing_seaice.png"))"
+    save(joinpath(OUTDIR, "surface_salt_forcing_seaice$(CADTAG).png"), fig; px_per_unit = 2)
+    @info "wrote $(joinpath(OUTDIR, "surface_salt_forcing_seaice$(CADTAG).png"))"
 end
 
 println("\n  figures in $OUTDIR")
