@@ -56,7 +56,8 @@ check("NumericalEarth loads") do
     @eval using NumericalEarth
     @eval using Oceananigans
     @eval using Oceananigans.Units
-    string(pkgversion(NumericalEarth))
+    # @eval: the binding made by `using` above is not visible in this call's world age.
+    @eval string(pkgversion(NumericalEarth))
 end
 
 # setup_bsose.jl was written against NumericalEarth 0.8.2. If the nested branch moved an API it

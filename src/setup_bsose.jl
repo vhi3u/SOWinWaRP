@@ -162,6 +162,10 @@ const BSOSE_VARIABLE_NAMES = Dict(
     # Unlike every other field here it marks land with 0.0 rather than NaN -- see
     # `bsose_exterior_free_surface`, which masks from Depth before using it.
     :sea_surface_height => "ETAN",
+    # The name NumericalEarth's nested-ocean code asks a parent dataset for. Same file and
+    # variable as :sea_surface_height; ETAN's land zeros are masked by surface hFacC in
+    # `retrieve_data`, so they are inpainted rather than read as sea level.
+    :free_surface => "ETAN",
     # Aliases
     :oceQsw => "oceQsw",
     :oceFWflx => "oceFWflx",
@@ -187,6 +191,7 @@ const BSOSE_FILE_TOKENS = Dict(
     :surfTflx => "surfTflx",
     :surfSflx => "surfSflx",
     :sea_surface_height => "SSH",
+    :free_surface => "SSH",
 )
 
 # Variable spatial locations on Arakawa C-grid
@@ -202,6 +207,7 @@ const BSOSE_LOCATIONS = Dict(
     :surface_shortwave => (Center, Center, Nothing),
     :surface_freshwater_flux => (Center, Center, Nothing),
     :sea_surface_height => (Center, Center, Nothing),
+    :free_surface => (Center, Center, Nothing),
     :oceQsw => (Center, Center, Nothing),
     :oceFWflx => (Center, Center, Nothing),
     :Theta => (Center, Center, Center),
@@ -258,6 +264,9 @@ const BSOSE_FILES = Dict(
         # oceFWflx file here, and `resolve_bsose_filename` is meant to stop rather than guess.
         :surface_freshwater_flux => ("oceFWflx", "2013to2024_monthly"),
         :sea_surface_height     => ("SSH",      "2013to2024_monthly"),
+        # Alias of :sea_surface_height for the nested-ocean parent interface. Monthly only:
+        # it feeds the boundaries, which stay monthly.
+        :free_surface           => ("SSH",      "2013to2024_monthly"),
         # The cluster carries BOTH `oceTAUX_bsoseI156_2013to2024_monthly.nc` and
         # `oceTAUX_bsoseI156_2014_5day.nc`. Monthly is the one this project uses: the 5-day
         # wind forcing was taken out deliberately. Switch the span to "2014_5day" to go back.
@@ -499,6 +508,10 @@ end
 function DataWrangling.default_download_directory(dataset::BSOSEDataset)
     return dataset.dir
 end
+
+# Margin around a requested BoundingBox. No generic fallback exists; the nested-ocean code uses
+# it for the boundary strips and the initial snapshot. Two native (1/6 deg) cells, as ERA5 does.
+DataWrangling.default_horizontal_padding(::BSOSEDataset) = 1/3
 
 function DataWrangling.metadata_filename(dataset::BSOSEMonthly, name, date, region)
     # `date` was accepted and discarded here until 5-day forcing arrived. It is the only thing

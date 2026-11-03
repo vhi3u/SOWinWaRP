@@ -43,7 +43,6 @@
 # ==============================================================================================
 
 using NumericalEarth
-using NumericalEarth.DataWrangling.IBCSO: IBCSOv2
 using Oceananigans
 using Oceananigans.Units
 using Dates, Printf
@@ -76,13 +75,14 @@ underlying_grid = LatitudeLongitudeGrid(ARCH;
                                         longitude = (λ₁, λ₂),
                                         latitude = (φ₁, φ₂))
 
-# IBCSOv2, not ETOPO: it is the Southern Ocean bathymetry product, and the shelf break between
-# 70S and 65S -- where the whole stratification problem lives -- is exactly where the two differ.
+# The knobs match src/model.jl:452 so the nested run differs from the current model in the
+# NESTING, not in the seafloor. (model.jl passes no `major_basins`, so it is the default 1.)
 bottom_height = regrid_bathymetry(underlying_grid;
-                                  dataset = IBCSOv2(),
+                                  dataset = ETOPO2022(),
+                                  height_above_water = 1,
                                   minimum_depth = 10,
                                   interpolation_passes = 5,
-                                  major_basins = 3)
+                                  major_basins = 1)
 
 grid = ImmersedBoundaryGrid(underlying_grid,
                             PartialCellBottom(bottom_height; minimum_fractional_cell_height = 0.2);
@@ -90,8 +90,8 @@ grid = ImmersedBoundaryGrid(underlying_grid,
 
 # ── the nest ──────────────────────────────────────────────────────────────────────────────────
 # `dates` is a (start, end) tuple expanded to B-SOSE's native cadence. open_sides defaults to
-# every bounded side of the grid, which for this box is all four -- the same four src/model.jl
-# opens today.
+# every bounded side of the grid, which for this box is all four. The south edge has no wet
+# columns (Antarctica), so in practice it is the same three src/model.jl opens: W, E, N.
 dataset = BSOSEMonthly(dir = BDIR, iteration = 156)
 
 ocean = nested_ocean_simulation(grid, dataset;
