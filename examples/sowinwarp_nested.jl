@@ -42,6 +42,7 @@
 #      `nofw` testbed arm and this branch are asking the same question two different ways.
 # ==============================================================================================
 
+using CUDA            # loads Oceananigans' CUDA extension, which is what defines `GPU()`
 using NumericalEarth
 using Oceananigans
 using Oceananigans.Units
@@ -51,6 +52,9 @@ include(joinpath(@__DIR__, "..", "src", "setup_bsose.jl"))   # BSOSEMonthly and 
 
 const SMOKE = get(ENV, "SMOKE", "0") == "1"
 const ARCH  = get(ENV, "ARCH", "GPU") == "CPU" ? CPU() : GPU()
+ARCH isa GPU && !CUDA.functional() &&
+    (CUDA.functional(true); error("CUDA is not functional on this node. Check the GPU allocation, or set ARCH=CPU."))
+ARCH isa GPU && @info "Running on GPU: $(CUDA.name(CUDA.device()))"
 const BDIR  = get(ENV, "BSOSE_DIR", default_bsose_directory())
 
 # ── domain: the production SOWinWaRP box at 1/6 deg ───────────────────────────────────────────
