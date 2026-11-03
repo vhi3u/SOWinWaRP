@@ -65,7 +65,11 @@ const Nx, Ny = Int(SCALING * (λ₂ - λ₁)), Int(SCALING * (φ₂ - φ₁))   
 const Nz = 40
 const DEPTH = 5500meters
 
-start_date = DateTime(2014, 6, 1)
+# Must be a NATIVE B-SOSE stamp (records sit at odd times: 2014-05-02T02:00, 2014-06-01T12:00, ...).
+# The initial snapshot goes through `bracketing_dates`, which looks `[start_date]` up in
+# `all_dates` by exact match and crashes on `nothing` when it is not there. Workaround until
+# that is fixed upstream on ss/nested-ocean-model.
+start_date = DateTime(2014, 6, 1, 12)
 end_date   = SMOKE ? DateTime(2014, 6, 3) : DateTime(2014, 8, 1)
 
 @info "SOWinWaRP nested: $(Nx)x$(Ny)x$(Nz) over $(λ₁)-$(λ₂)E, $(φ₁)-$(φ₂)S, $start_date to $end_date"
