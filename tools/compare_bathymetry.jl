@@ -63,23 +63,44 @@ const IBCSO_φ₂ = -50.0
 pick(ds, cands) = (h = findfirst(c -> haskey(ds, c), cands); h === nothing ? nothing : cands[h])
 
 # ── the model's own grid, from its output ─────────────────────────────────────────────────────
+const RUN_SUBDIRS = ("", "testbed", "surface_tests")
+
+"""Every `<name>_eke.nc` visible, as the name MODEL_RUN would take."""
+function available_runs()
+    out = String[]
+    for sub in RUN_SUBDIRS
+        d = isempty(sub) ? MDIR : joinpath(MDIR, sub)
+        isdir(d) || continue
+        for f in readdir(d)
+            endswith(f, "_eke.nc") || continue
+            push!(out, (isempty(sub) ? "" : sub * "/") * replace(f, "_eke.nc" => ""))
+        end
+    end
+    return sort(unique(out))
+end
+
 function find_run()
     want = get(ENV, "MODEL_RUN", "")
     if !isempty(want)
-        p = joinpath(MDIR, "$(want)_eke.nc")
-        isfile(p) && return p
-        error("no $p -- set MODEL_RUN/MODEL_DIR")
+        # Search the same subdirectories as the bare listing: runs live in surface_tests/ and
+        # testbed/ as often as in the root, and naming one should not also require MODEL_DIR.
+        for sub in RUN_SUBDIRS
+            d = isempty(sub) ? MDIR : joinpath(MDIR, sub)
+            p = joinpath(d, "$(want)_eke.nc")
+            isfile(p) && return p
+        end
+        av = available_runs()
+        error("no $(want)_eke.nc under $MDIR (or its testbed/, surface_tests/)\n" *
+              "  available: " * (isempty(av) ? "NOTHING -- wrong working directory?" : join(av, ", ")))
     end
-    hits = String[]
-    for sub in ("", "testbed", "surface_tests")
-        d = isempty(sub) ? MDIR : joinpath(MDIR, sub)
-        isdir(d) || continue
-        append!(hits, [joinpath(d, f) for f in readdir(d) if endswith(f, "_eke.nc")])
-    end
-    isempty(hits) && error("no *_eke.nc under $MDIR (or its testbed/, surface_tests/) -- " *
-                           "set MODEL_RUN, or run with SOURCES=etopo to regrid instead")
-    return first(sort(hits))
+    av = available_runs()
+    isempty(av) && error("no *_eke.nc under $MDIR (or its testbed/, surface_tests/) -- " *
+                         "set MODEL_RUN, or run with SOURCES=etopo to regrid instead")
+    return find_run_path(first(av))
 end
+
+find_run_path(name) = first(filter(isfile,
+    [joinpath(isempty(sub) ? MDIR : joinpath(MDIR, sub), "$(name)_eke.nc") for sub in RUN_SUBDIRS]))
 
 """
 Seafloor depth per column, recovered from a run's own output.
