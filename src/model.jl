@@ -50,7 +50,7 @@ end
 # ---- run identity -------------------------------------------------------------------------
 # Prefixes every output file: RUN_NAME_surface.nc, _midlon.nc, _free_surface.nc.
 # Change it per experiment or runs overwrite each other. Animate: ./run_animate_simulation NAME
-const RUN_NAME = "2Y_wind_fw_sw_5day"
+const RUN_NAME = "2Y_zstar"
 
 # ---- period and domain --------------------------------------------------------------------
 const START_DATE = DateTime("2014-06-01")
@@ -83,6 +83,31 @@ const Z_EXTENT   = 5800     # m, depth of the vertical grid
 const DZ_SURFACE = 8        # m, upper-ocean spacing
 const DZ_BOTTOM  = 400      # m, deep spacing
 const Z_CONSTANT_EXTENT = 250  # m, depth over which DZ_SURFACE is held before stretching
+
+# Z-STAR: let the cells stretch and compress with the free surface, instead of a static grid.
+#
+# WHY. Oceananigans has no real freshwater flux, so S is an ordinary tracer in a FIXED-VOLUME
+# cell and B-SOSE's oceFWflx has to be applied as a VIRTUAL SALT FLUX (-S*oceFWflx; see
+# FRESHWATER_FLUX). That reproduces the right salinity change and nothing else: no volume
+# appears, so there is no sea-surface rise, no pressure gradient and no divergence to export
+# the anomaly. It can only leave as an advected tracer. Real salt also leaves the domain, which
+# B-SOSE's does not.
+#
+# With ZSTAR the vertical coordinate carries eta and a per-column scaling sigma ~ (H+eta)/H,
+# updated every step, so freshwater raises the surface, thickens the cells and dilutes the
+# column -- the actual mechanism, and the anomaly can leave the way it does in nature.
+#
+# WHAT IT IS TESTING. The `nofw` testbed arm collapsed the 70-65S stratification excess from
+# +45.0% to -5.7% by DELETING the freshwater term, while leaving dS 0-100 unmoved. The forcing
+# itself is correct and fully accounted for (tools/surface_salt_forcing.jl recovers a 4.1 g/kg
+# sea-ice salinity from the SFLUX/dilution amplitude ratio), so what is wrong is the RESPONSE,
+# not the input. ZSTAR keeps every term and changes only the response. `nofw` was the bracket;
+# this is the experiment.
+#
+# UNVERIFIED AND THE REASON TO SMOKE-TEST FIRST: the open boundaries. PerturbationAdvection and
+# the barotropic U/V compute transports through faces whose thickness is now time dependent.
+# Given the history on those faces, do not assume this comes free.
+const ZSTAR = true
 
 # Nz = 53 (B-SOSE has 52), chosen 2026-10-26. Winter Water is a Tmin at 50-200 m, so the column
 # that decides the grid is cells<200m -- this keeps 8 m spacing through all of it:
@@ -417,18 +442,24 @@ end
 
 # z stretching so that the upper 500 meters of the ocean has dz = 5 meters, and the deeper ocean will gradually stretch to 200 m vertical resolution. 
 if arch isa CPU
-    z = ReferenceToStretchedDiscretization(; extent=Z_EXTENT,
+    z_reference = ReferenceToStretchedDiscretization(; extent=Z_EXTENT,
         constant_spacing=10,
         maximum_spacing=1000,
         constant_spacing_extent=Z_CONSTANT_EXTENT,
         stretching=PowerLawStretching(1.15))
 else
-    z = ReferenceToStretchedDiscretization(; extent=Z_EXTENT,
+    z_reference = ReferenceToStretchedDiscretization(; extent=Z_EXTENT,
         constant_spacing=DZ_SURFACE,
         maximum_spacing=DZ_BOTTOM,
         constant_spacing_extent=Z_CONSTANT_EXTENT,
         stretching=PowerLawStretching(1.12))
 end
+
+# Nz comes from the REFERENCE discretization, not from `z`: `length` has no method for a
+# MutableVerticalDiscretization, so `Nz = length(z)` throws the moment ZSTAR is on. Wrapping
+# after taking Nz also keeps the two branches' parameters stated once.
+Nz = length(z_reference)
+z  = ZSTAR ? MutableVerticalDiscretization(z_reference) : z_reference
 
 # grid
 # if running on CPU, do a 1 degree horizontal resolution run:
@@ -439,7 +470,6 @@ else
     Nx = Int(SCALING * (λ₂ - λ₁))
     Ny = Int(SCALING * (φ₂ - φ₁))
 end
-Nz = length(z)
 
 grid = LatitudeLongitudeGrid(arch;
     size=(Nx, Ny, Nz),
