@@ -152,7 +152,7 @@ end
 check("PrescribedOcean(region, dates, dataset)") do
     reg = NumericalEarth.BoundingBox(longitude = (90.0, 150.0), latitude = (-70.0, -45.0))
     po = NumericalEarth.Oceans.PrescribedOcean(reg, DATES, dataset; architecture = CPU(), dir = DIR)
-    "built; η is $(po.η === nothing ? "NOTHING -- nested needs it" : "present")"
+    "built; η is $(po.free_surface === nothing ? "NOTHING -- nested needs it" : "present")"
 end
 
 # ── summary ───────────────────────────────────────────────────────────────────────────────────
