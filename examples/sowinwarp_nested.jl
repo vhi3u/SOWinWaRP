@@ -43,8 +43,10 @@
 # ==============================================================================================
 
 using CUDA            # loads Oceananigans' CUDA extension, which is what defines `GPU()`
-using CopernicusClimateDataStore    # activates the ERA5 download backend (needs ~/.cdsapirc)
+using CopernicusClimateDataStore    # an ERA5 backend: the ERA5 constructors always call `download`, and
+                                    # without one that errors even when every file is on disk
 using NumericalEarth
+using NumericalEarth.DataWrangling: metadata_path
 using Oceananigans
 using Oceananigans.Units
 using Dates, Printf
@@ -110,17 +112,32 @@ ocean = nested_ocean_simulation(grid, dataset;
 child = ocean.model.child
 
 # ── atmosphere ────────────────────────────────────────────────────────────────────────────────
-# As src/model.jl does it: same directory and region, so hours the main runs already fetched
-# are read from cache. NEEDS CDS CREDENTIALS (~/.cdsapirc or .copernicus_env).
+# Yearly files cropped to the region, converted from the Globus copy of NCAR's ERA5 by
+# tools/download_era5_ncar.jl -- not downloaded from the CDS, whose queue made that impractical.
+# Same region and directory as that script, which names the files after them.
+#
+# Mean sea level pressure, not surface pressure: interpolated onto coastal ocean cells, the
+# surface pressure over the Antarctic ice sheet (tens of kPa lower) acts like a sea level step of
+# several meters. NumericalEarth's docstring recommends this for ocean runs.
 era5_dir = get(ENV, "ERA5_DIR", joinpath(BDIR, "era5"))
-mkpath(era5_dir)
 era5_region = BoundingBox(longitude = (λ₁ - 1.0, λ₂ + 1.0), latitude = (φ₁ - 1.0, φ₂ + 1.0))
+era5_dataset = ERA5YearlySingleLevel()
+era5_pressure = :mean_sea_level_pressure
 
-# Serially first: the constructors download one thread per variable, which CDS rejects.
-prefetch_era5!(; start_date, end_date, region = era5_region, dir = era5_dir, threads = 1)
+# Fail here rather than let the backend start a year-long CDS request for a missing file
+era5_names = (:eastward_velocity, :northward_velocity, :temperature, :dewpoint_temperature, era5_pressure,
+              :total_precipitation, :downwelling_shortwave_radiation, :downwelling_longwave_radiation)
+missing_era5 = [path for name in era5_names
+                for path in unique(metadata_path(Metadata(name; dataset = era5_dataset, start_date, end_date,
+                                                          dir = era5_dir, region = era5_region)))
+                if !isfile(path)]
+isempty(missing_era5) ||
+    error("Missing ERA5 files (run tools/download_era5_ncar.jl):\n  " * join(missing_era5, "\n  "))
 
-atmosphere = ERA5PrescribedAtmosphere(ARCH; start_date, end_date, region = era5_region, dir = era5_dir)
-radiation  = ERA5PrescribedRadiation(ARCH; start_date, end_date, region = era5_region, dir = era5_dir)
+atmosphere = ERA5PrescribedAtmosphere(ARCH; dataset = era5_dataset, start_date, end_date,
+                                      region = era5_region, dir = era5_dir, pressure = era5_pressure)
+radiation  = ERA5PrescribedRadiation(ARCH; dataset = era5_dataset, start_date, end_date,
+                                     region = era5_region, dir = era5_dir)
 
 coupled_model = OceanOnlyModel(ocean; atmosphere, radiation)      # see note 1 in the header
 
