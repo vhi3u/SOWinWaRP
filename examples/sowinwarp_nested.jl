@@ -43,6 +43,7 @@
 # ==============================================================================================
 
 using CUDA            # loads Oceananigans' CUDA extension, which is what defines `GPU()`
+using CopernicusClimateDataStore    # activates the ERA5 download backend (needs ~/.cdsapirc)
 using NumericalEarth
 using Oceananigans
 using Oceananigans.Units
@@ -109,11 +110,17 @@ ocean = nested_ocean_simulation(grid, dataset;
 child = ocean.model.child
 
 # ── atmosphere ────────────────────────────────────────────────────────────────────────────────
-# NEEDS CDS CREDENTIALS in ~/.cdsapirc, and the first call DOWNLOADS. Do it on a login node:
-# a compute node with no outbound network will hang or fail here, not at the model step.
-region = BoundingBox(grid; padding = 1)
-atmosphere = ERA5PrescribedAtmosphere(ARCH; start_date, end_date, region)
-radiation  = ERA5PrescribedRadiation(ARCH; start_date, end_date, region)
+# As src/model.jl does it: same directory and region, so hours the main runs already fetched
+# are read from cache. NEEDS CDS CREDENTIALS (~/.cdsapirc or .copernicus_env).
+era5_dir = get(ENV, "ERA5_DIR", joinpath(BDIR, "era5"))
+mkpath(era5_dir)
+era5_region = BoundingBox(longitude = (λ₁ - 1.0, λ₂ + 1.0), latitude = (φ₁ - 1.0, φ₂ + 1.0))
+
+# Serially first: the constructors download one thread per variable, which CDS rejects.
+prefetch_era5!(; start_date, end_date, region = era5_region, dir = era5_dir, threads = 1)
+
+atmosphere = ERA5PrescribedAtmosphere(ARCH; start_date, end_date, region = era5_region, dir = era5_dir)
+radiation  = ERA5PrescribedRadiation(ARCH; start_date, end_date, region = era5_region, dir = era5_dir)
 
 coupled_model = OceanOnlyModel(ocean; atmosphere, radiation)      # see note 1 in the header
 
