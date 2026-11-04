@@ -60,15 +60,16 @@ mset = MetadataSet(ERA5_VARIABLES...; dataset = ERA5HourlySingleLevel(),
                    start_date, end_date, dir = era5_dir, region = era5_region)
 
 # Fail fast on credentials instead of burning every retry on them. CDSAPI reads ~/.cdsapirc
-# BEFORE the CDSAPI_URL/CDSAPI_KEY env vars, and splits each non-empty line on ':', so a single
-# line without a colon (a comment, a wrapped key, `key=...`) crashes it even when the env vars
-# are set. It wants exactly `url: https://cds.climate.copernicus.eu/api` and `key: <token>`.
+# BEFORE the CDSAPI_URL/CDSAPI_KEY env vars, and splits every line on ':', so one line without
+# a colon crashes it even when the env vars are set. Before CDSAPI v2.3.1 that includes BLANK
+# lines (2.3.1 added the skip) -- the version Phoenix resolved. It wants exactly
+# `url: https://cds.climate.copernicus.eu/api` and `key: <token>`, nothing else.
 try
     CDSAPI.credentials()
 catch e
     error("CDSAPI cannot read credentials ($(first(split(sprint(showerror, e), '\n')))). " *
-          "Check ~/.cdsapirc: every non-empty line must be `name: value`. Find offenders with\n" *
-          "    awk -F: 'NF<2 && NF>0 {print \"line \" NR}' ~/.cdsapirc")
+          "Check ~/.cdsapirc: every line must be `name: value`, and CDSAPI < 2.3.1 also chokes " *
+          "on blank lines. Remove those with\n    sed -i '/^[[:space:]]*\$/d' ~/.cdsapirc")
 end
 
 # CDSAPI polls every second by default; a request can queue for hours, so ask less often.
