@@ -50,7 +50,7 @@ end
 # ---- run identity -------------------------------------------------------------------------
 # Prefixes every output file: RUN_NAME_surface.nc, _midlon.nc, _free_surface.nc.
 # Change it per experiment or runs overwrite each other. Animate: ./run_animate_simulation NAME
-const RUN_NAME = "2Y_zstar"
+const RUN_NAME = "2Y_wind5d_fw_sw_5day"
 
 # ---- period and domain --------------------------------------------------------------------
 const START_DATE = DateTime("2014-06-01")
@@ -85,29 +85,29 @@ const DZ_BOTTOM  = 400      # m, deep spacing
 const Z_CONSTANT_EXTENT = 250  # m, depth over which DZ_SURFACE is held before stretching
 
 # Z-STAR: let the cells stretch and compress with the free surface, instead of a static grid.
+# TRIED 2026-11-03 AND TURNED BACK OFF. Keep the switch; it costs nothing and ZSTAR = false is
+# bit-identical to the static grid that produced every result in the log.
 #
-# WHY. Oceananigans has no real freshwater flux, so S is an ordinary tracer in a FIXED-VOLUME
-# cell and B-SOSE's oceFWflx has to be applied as a VIRTUAL SALT FLUX (-S*oceFWflx; see
-# FRESHWATER_FLUX). That reproduces the right salinity change and nothing else: no volume
-# appears, so there is no sea-surface rise, no pressure gradient and no divergence to export
-# the anomaly. It can only leave as an advected tracer. Real salt also leaves the domain, which
-# B-SOSE's does not.
+# WHY IT WAS TRIED. Oceananigans has no real freshwater flux, so S is an ordinary tracer in a
+# FIXED-VOLUME cell and B-SOSE's oceFWflx has to be applied as a VIRTUAL SALT FLUX
+# (-S*oceFWflx; see FRESHWATER_FLUX). No volume appears, so there is no sea-surface rise and no
+# divergence to export the anomaly. With ZSTAR the coordinate carries eta and a per-column
+# sigma = (h+eta)/h, so freshwater raises the surface and thickens the cells instead.
 #
-# With ZSTAR the vertical coordinate carries eta and a per-column scaling sigma ~ (H+eta)/H,
-# updated every step, so freshwater raises the surface, thickens the cells and dilutes the
-# column -- the actual mechanism, and the anomaly can leave the way it does in nature.
+# WHY IT CHANGED NOTHING, which is worth keeping so it is not re-tried for the same reason:
+# the two formulations agree to FIRST order. For a column of depth h with freshwater Q*dt
+# added, static-z gives mean S0 - S0*Q*dt/h and z-star gives S0*h/(h+Q*dt), identical to first
+# order -- so the difference IS the second-order term, 3e-5 to 3e-3 g/kg here against a 0.1
+# g/kg drift. `2Y_zstar` and `2Y_wind_fw_sw_5day` came out indistinguishable in dS and dT
+# across all five bands. There is no ice-zone exception either: sigma is COLUMN UNIFORM
+# (`σᶜᶜⁿ[i, j, 1]` has no k index), so 1 m of ice formation over a 500 m column thins the 8 m
+# top cell by 0.2%, not the 12.5% a surface-layer picture suggests.
 #
-# WHAT IT IS TESTING. The `nofw` testbed arm collapsed the 70-65S stratification excess from
-# +45.0% to -5.7% by DELETING the freshwater term, while leaving dS 0-100 unmoved. The forcing
-# itself is correct and fully accounted for (tools/surface_salt_forcing.jl recovers a 4.1 g/kg
-# sea-ice salinity from the SFLUX/dilution amplitude ratio), so what is wrong is the RESPONSE,
-# not the input. ZSTAR keeps every term and changes only the response. `nofw` was the bracket;
-# this is the experiment.
-#
-# UNVERIFIED AND THE REASON TO SMOKE-TEST FIRST: the open boundaries. PerturbationAdvection and
-# the barotropic U/V compute transports through faces whose thickness is now time dependent.
-# Given the history on those faces, do not assume this comes free.
-const ZSTAR = true
+# If it is ever switched back on: NetCDFWriter then stores the reference coordinate as `r_aac`
+# and writes no `z_aac`, which the tools handle since 03c3e90. The open boundaries were never
+# verified under it -- PerturbationAdvection and the barotropic U/V push transports through
+# faces whose thickness becomes time dependent -- so smoke-test before a long job.
+const ZSTAR = false
 
 # Nz = 53 (B-SOSE has 52), chosen 2026-10-26. Winter Water is a Tmin at 50-200 m, so the column
 # that decides the grid is cells<200m -- this keeps 8 m spacing through all of it:
@@ -381,6 +381,33 @@ if SURFACE_CADENCE === :fiveday && ATMOSPHERE !== :none
              favour of bulk formulae. Pick one.""")
 end
 
+# WIND cadence is SEPARATE from the buoyancy cadence on purpose, so momentum and buoyancy can be
+# varied one at a time (`BSOSE_WIND_SWITCHABLE` vs `BSOSE_CADENCE_SWITCHABLE` in setup_bsose.jl).
+#
+# WHY 5-DAY WINDS. Wind-driven mixing scales as u*^3, and by Jensen <u*^3> >= <u*>^3, so a
+# MONTHLY mean systematically under-supplies mixing energy -- and the shortfall sits exactly in
+# the storms that set winter mixed layers. `tools/mixing_energetics.jl` reports wind at 3.4-5x
+# the PE needed using monthly winds; at 5-day that goes up. The MLD deficit is a deficit of
+# mixing, and this arm adds mixing energy without touching buoyancy at all.
+#
+# Run it WITH the 5-day buoyancy fluxes, not against them: ice forms during cold, windy events,
+# so the brine burst and the wind burst land in the same window and stack.
+#
+# CHECK THE LOG. At 5-day the wind line must read 154 records, not 26. 26 means the cadence did
+# not fire and the arm is monthly winds wearing a 5-day label -- see the cache note in
+# `setup_bsose.jl` for the trap that used to cause exactly that.
+const WIND_CADENCE = :fiveday   # :monthly | :fiveday
+
+if WIND_CADENCE === :fiveday && ATMOSPHERE !== :none
+    error("""WIND_CADENCE = :fiveday selects the cadence of B-SOSE's oceTAUX/oceTAUY, but \
+             ATMOSPHERE = :$(ATMOSPHERE) computes its own wind stress from bulk formulae and \
+             never reads them. Pick one.""")
+end
+
+if WIND_CADENCE === :fiveday && !WINDS
+    error("WIND_CADENCE = :fiveday but WINDS = false, so no wind stress is applied at all.")
+end
+
 # Derived: BSOSE surface forcing only applies when no coupled atmosphere is computing it.
 const BSOSE_WINDS     = WINDS && ATMOSPHERE === :none
 const BSOSE_FLUXES    = SURFACE_FLUXES && ATMOSPHERE === :none
@@ -536,7 +563,8 @@ end
 
 # dataset conditonal
 
-dataset = BSOSEMonthly(iteration=BSOSE_ITERATION, surface_cadence=SURFACE_CADENCE)
+dataset = BSOSEMonthly(iteration=BSOSE_ITERATION, surface_cadence=SURFACE_CADENCE,
+                       wind_cadence=WIND_CADENCE)
 
 @info "Dataset: $(summary(dataset)) -- boundaries, forcing and initial conditions"
 

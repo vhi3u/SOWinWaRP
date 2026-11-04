@@ -2445,11 +2445,22 @@ function bsose_open_boundary_conditions(grid;
     # Unified dataset filename
     wind_tag = winds === true ? "_winds" : ""
     # DELIBERATELY NOT TAGGED BY `surface_cadence`. This cache holds boundary u/v/T/S and the
-    # wind stress and nothing else -- every one of them monthly in both arms, since the surface
-    # BUOYANCY fluxes are the only cadence-switchable variables and they are not stored here.
-    # Tagging it would make the 5-day arm rebuild the whole 3-D boundary dataset for a file
-    # identical to the one already on disk, which is the expensive half of a run's setup. The
-    # per-variable inpaint caches ARE tagged, because those do hold surfTflx and friends.
+    # wind stress and nothing else, and the surface BUOYANCY fluxes -- the only variables
+    # `surface_cadence` switches -- are not stored here. Tagging it would make the 5-day
+    # buoyancy arm rebuild the whole 3-D boundary dataset for a file identical to the one
+    # already on disk, which is the expensive half of a run's setup. The per-variable inpaint
+    # caches ARE tagged, because those do hold surfTflx and friends.
+    #
+    # IT MUST BE TAGGED BY `wind_cadence` THOUGH, because this cache DOES hold the wind stress:
+    # it writes `wind_u`/`wind_v` below and serves them back without ever calling
+    # `bsose_surface_wind_stress`. Untagged, a `wind_cadence = :fiveday` run on a machine that
+    # already has the monthly cache silently gets MONTHLY winds wearing a 5-day label, with
+    # nothing in the log to show it -- which is what made the `wind5d` testbed arm come out
+    # bit-identical to control. Only the 5-day arm gets the suffix, so every monthly cache
+    # already on disk keeps its key and nothing rebuilds.
+    if winds === true && bsose_variable_cadence(dataset, :zonal_wind_stress) === :fiveday
+        wind_tag *= "_5day"
+    end
     default_dataset_name = "bsose_dataset_v2_$(dataset.iteration)_$(start_str)_to_$(end_str)_$(Nx)x$(Ny)x$(Nz)$(wind_tag).jld2"
     dataset_path = cache_file !== nothing ? cache_file : joinpath(dataset.dir, default_dataset_name)
 
