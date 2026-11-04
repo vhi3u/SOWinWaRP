@@ -118,7 +118,7 @@ function model_depth(path)
                   "or point MODEL_RUN at a run that had it on.")
         xn = pick(ds, ["x_caa", "λ_caa", "λ_fca", "xC", "longitude", "lon", "x"])
         yn = pick(ds, ["y_aca", "φ_aca", "φ_cca", "yC", "latitude", "lat", "y"])
-        zn = pick(ds, ["z_aac", "zC", "z_c", "z"])
+        zn = pick(ds, ["z_aac", "zC", "z_c", "z", "r_aac"])
         (xn === nothing || yn === nothing || zn === nothing) &&
             error("$path is missing a coordinate: x=$xn y=$yn z=$zn")
         lons = Float64.(coalesce.(ds[xn][:], NaN))

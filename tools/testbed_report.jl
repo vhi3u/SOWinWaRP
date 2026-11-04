@@ -141,7 +141,7 @@ const ZB = -RC_all[1:NZ]
 function arm_profiles(arm)
     mp = joinpath(TBDIR, "$(arm)_eke.nc")
     mds = Dataset(mp)
-    mz_up = coordvar(mds, ["z_aac", "zC", "z_c", "z"], "z")
+    mz_up = coordvar(mds, ["z_aac", "zC", "z_c", "z", "r_aac"], "z")
     mlat  = coordvar(mds, ["y_aca", "φ_aca", "φ_cca", "yC", "latitude", "lat", "y"], "latitude")
     mlon  = let c = ["x_caa", "λ_caa", "λ_fca", "xC", "longitude", "lon", "x"],
                 h = findfirst(k -> haskey(mds, k), c)

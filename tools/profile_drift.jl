@@ -125,7 +125,7 @@ const MPATH = joinpath(MDIRS[hit], "$(RUN)_eke.nc")
 @info "model column from $MPATH"
 
 mds = Dataset(MPATH)
-const MZ_UP = coordvar(mds, ["z_aac", "zC", "z_c", "z"], "z")          # bottom-to-top, negative
+const MZ_UP = coordvar(mds, ["z_aac", "zC", "z_c", "z", "r_aac"], "z")          # bottom-to-top, negative
 const MLAT  = coordvar(mds, ["y_aca", "φ_aca", "φ_cca", "yC", "latitude", "lat", "y"], "latitude")
 const MLON  = let cands = ["x_caa", "λ_caa", "λ_fca", "xC", "longitude", "lon", "x"],
                   hit = findfirst(c -> haskey(mds, c), cands)

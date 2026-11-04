@@ -520,7 +520,13 @@ if !isempty(MODEL_RUN)
 end
 
 # NetCDFWriter names its coordinates after the field's location, so the z of a Center field is
-# `z_aac` rather than anything guessable. Try the spellings in use and say what is there on a miss.
+# `z_aac` rather than anything guessable -- and under z-star (`ZSTAR = true` in src/model.jl) the
+# vertical coordinate is MUTABLE, so the writer stores the fixed REFERENCE coordinate under
+# `r_aac` and there is no `z_aac` at all. Reading `r` as `z` is safe for everything here:
+# Oceananigans defines `z = r * sigma + eta` with `sigma = (H + eta) / H`, so the error is
+# `eta * (1 + r/H)` -- at most |eta| right at the surface, falling linearly to ZERO at the
+# seafloor. With |eta| < 1 m that is sub-metre against bins 50-400 m deep. Try the spellings in
+# use and say what is there on a miss.
 function coordvar(ds, cands, what)
     for c in cands
         haskey(ds, c) && return Float64.(coalesce.(ds[c][:], NaN))
@@ -559,7 +565,7 @@ diverging is the whole signature of a state problem rather than a closure proble
 function model_required(file, target_month, lo, hi, h)
     ds = Dataset(file)
     try
-        zs_up = coordvar(ds, ["z_aac", "zC", "z_c", "z"], "z")              # bottom-to-top
+        zs_up = coordvar(ds, ["z_aac", "zC", "z_c", "z", "r_aac"], "z")              # bottom-to-top
         lats  = coordvar(ds, ["y_aca", "φ_aca", "φ_cca", "yC", "latitude", "lat", "y"], "latitude")
         tt    = Float64.(ds["time"][:])
         win   = haskey(ds.attrib, "averaging_window_seconds") ?
