@@ -56,6 +56,7 @@ using NumericalEarth.DataWrangling: metadata_path
 using Oceananigans
 using Oceananigans.Units
 using Oceananigans.Diagnostics: NaNChecker
+using Oceanostics.ProgressMessengers: TimedMessenger
 using NCDatasets      # loads Oceananigans' NetCDFWriter
 using Dates, Printf
 
@@ -115,9 +116,17 @@ grid = ImmersedBoundaryGrid(underlying_grid,
 # columns (Antarctica), so in practice it is the same three src/model.jl opens: W, E, N.
 dataset = BSOSEMonthly(dir = BDIR, iteration = 156)
 
+# EVERY parent record resident, as src/model.jl's `resident_fts` does, not the branch's default
+# of 2 streamed from disk. Loading (and inpainting) then all happens here, before the run, and the
+# stale-reload trap the `resident_fts` docstring measured cannot occur. The parent is only strips
+# along the open sides, so even ~26 monthly records of 5 variables is a small fraction of the GPU.
+parent_records = length(NumericalEarth.DataWrangling.bracketing_dates(dataset, :temperature, (start_date, end_date)))
+@info "B-SOSE parent: $parent_records monthly records held in memory"
+
 ocean = nested_ocean_simulation(grid, dataset;
                                 dates = (start_date, end_date),
-                                dir = BDIR)
+                                dir = BDIR,
+                                parent_time_indices_in_memory = parent_records)
 
 child = ocean.model.child
 
@@ -178,21 +187,22 @@ simulation.callbacks[:nan_checker] =
     Callback(NaNChecker(fields = merge(child.velocities, child.tracers), erroring = true),
              IterationInterval(1))
 
-# src/model.jl's coupled progress messenger, closing over the child (the coupled model has no
-# velocities of its own), without the eta and transport diagnostics. Daily; 6-hourly in smoke mode.
-const PROGRESS_WALL = Ref(time_ns())
-
-function coupled_progress(sim)
-    m = child
-    u, v, w = m.velocities
-    elapsed = (time_ns() - PROGRESS_WALL[]) / 1e9
-    PROGRESS_WALL[] = time_ns()
-    @info @sprintf("iter = %6d, time = %s, Δt = %s, walltime = %.1f s | |u⃗|ₘₐₓ = [%.2e, %.2e, %.2e] m/s",
-        iteration(sim), prettytime(m.clock.time), prettytime(sim.Δt), elapsed,
-        maximum(abs, u), maximum(abs, v), maximum(abs, w))
-    flush(stdout)
+# Oceanostics' TimedMessenger, as src/model.jl's BSOSE path uses. It reads velocities, the closure
+# and the CFL numbers off `simulation.model`, and the coupled model has none of them -- which is
+# why src/model.jl swaps it out on its coupled path. This view hands it the child ocean as the
+# model and the coupled simulation for everything else (Δt, time, iteration, stop time).
+struct ChildView{S}
+    simulation :: S
 end
-simulation.callbacks[:progress] = Callback(coupled_progress, TimeInterval(SMOKE ? 6hours : 1days))
+Base.getproperty(view::ChildView, name::Symbol) =
+    name === :model ? child : getproperty(getfield(view, :simulation), name)
+Oceananigans.Simulations.iteration(view::ChildView) = iteration(getfield(view, :simulation))   # the one Oceanostics calls
+Base.time(view::ChildView) = time(getfield(view, :simulation))
+
+output_interval = SMOKE ? 6hours : 1days
+
+progress = TimedMessenger()
+simulation.callbacks[:progress] = Callback(sim -> progress(ChildView(sim)), TimeInterval(output_interval))
 
 # ── output ────────────────────────────────────────────────────────────────────────────────────
 # The same four files src/model.jl writes, with the same names, fields, cadences and global
@@ -209,7 +219,6 @@ simulation.callbacks[:progress] = Callback(coupled_progress, TimeInterval(SMOKE 
 # `r_aac` -- the REFERENCE depth of each level at η = 0 -- not `z_aac`. The true depth of a level
 # is r * (1 + η/H) + η; with |η| ~ 1 m over thousands of metres the difference is far below a
 # level spacing, so plotting against r is fine.
-output_interval = SMOKE ? 6hours : 1days
 const EKE_WINDOW = 30days
 const EKE_STRIDE = 1
 
