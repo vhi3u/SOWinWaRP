@@ -36,6 +36,9 @@
 #     OUTDIR    figures                            (default "plots")
 #     START     model time zero                    (default: the file's start_date attribute)
 #     MIN_DAYS  fewest daily snapshots for a month (default 20)
+#     FIRST_MONTH, LAST_MONTH   yyyy-mm, compare only months in this window (default: all). Set,
+#               the figures are named <RUN>_<first>_<last>_surface_bias_*.png, so a window does
+#               not overwrite the whole-run figures; the colour limits come from the window alone.
 #     T_LIM     colour limit for ΔT maps, degC      (default: 99th percentile of |ΔT|)
 #     S_LIM     colour limit for ΔS maps, g/kg      (default: 99th percentile of |ΔS|)
 # ==============================================================================
@@ -52,6 +55,9 @@ isempty(RUN) && error("usage: julia --project=. tools/compare_surface_bsose.jl R
 const DIR      = get(ENV, "DIR", ".")
 const OUTDIR   = get(ENV, "OUTDIR", "plots")
 const MIN_DAYS = parse(Int, get(ENV, "MIN_DAYS", "20"))
+parse_month(s) = (d = Date(s * "-01"); (year(d), month(d)))
+const FIRST_MONTH = haskey(ENV, "FIRST_MONTH") ? parse_month(ENV["FIRST_MONTH"]) : nothing
+const LAST_MONTH  = haskey(ENV, "LAST_MONTH")  ? parse_month(ENV["LAST_MONTH"])  : nothing
 mkpath(OUTDIR)
 
 surf_file = joinpath(DIR, "$(RUN)_surface.nc")
@@ -98,11 +104,16 @@ dataset   = BSOSEMonthly(iteration = 156)
 available = all_dates(dataset, :temperature)
 record_of = Dict((year(bsose_window_center(d)), month(bsose_window_center(d))) => d for d in available)
 keys_kept = [k for k in keys_kept if haskey(record_of, k)]
-isempty(keys_kept) && error("no month of $RUN has both $MIN_DAYS+ days of output and a B-SOSE record")
+isnothing(FIRST_MONTH) || filter!(k -> k >= FIRST_MONTH, keys_kept)
+isnothing(LAST_MONTH)  || filter!(k -> k <= LAST_MONTH,  keys_kept)
+isempty(keys_kept) && error("no month of $RUN has both $MIN_DAYS+ days of output and a B-SOSE record" *
+                            (isnothing(FIRST_MONTH) && isnothing(LAST_MONTH) ? "" : " inside FIRST_MONTH..LAST_MONTH"))
 sel_dates = [record_of[k] for k in keys_kept]
 labels    = [@sprintf("%d-%02d", y, m) for (y, m) in keys_kept]
 nm        = length(keys_kept)
 @info "comparing $nm months: $(first(labels)) to $(last(labels))"
+# Whole-run figures keep their names; a window gets its own
+const PREFIX = isnothing(FIRST_MONTH) && isnothing(LAST_MONTH) ? RUN : "$(RUN)_$(first(labels))_$(last(labels))"
 
 # One layer centred on the model's top cell. z_aac on a static grid, r_aac (the reference depth)
 # on a z-star one; the surface file holds just the one level.
@@ -209,7 +220,7 @@ for (var, Δ, unit, key) in (("T", ΔT, "°C", "T_LIM"), ("S", ΔS, "g/kg", "S_L
           "Grey: land in either bathymetry. Colour limit ±$(round(lim, sigdigits = 2)) $unit" *
           (haskey(ENV, key) ? " (set by $key)." : " (99th percentile of |Δ$var|; set $key to fix it)."),
           fontsize = 11)
-    f = joinpath(OUTDIR, "$(RUN)_surface_bias_$(var).png"); save(f, fig); @info "wrote $f"
+    f = joinpath(OUTDIR, "$(PREFIX)_surface_bias_$(var).png"); save(f, fig); @info "wrote $f"
 end
 
 fig = Figure(size = (900, 520))
@@ -221,4 +232,4 @@ for (row, (var, Δ, unit)) in enumerate((("T", ΔT, "°C"), ("S", ΔS, "g/kg")))
     scatterlines!(ax, 1:nm, domain_rms.(Δ), color = :black, linestyle = :dash, label = "RMS")
     row == 1 && axislegend(ax; position = :lt, framevisible = false)
 end
-f = joinpath(OUTDIR, "$(RUN)_surface_bias_series.png"); save(f, fig); @info "wrote $f"
+f = joinpath(OUTDIR, "$(PREFIX)_surface_bias_series.png"); save(f, fig); @info "wrote $f"

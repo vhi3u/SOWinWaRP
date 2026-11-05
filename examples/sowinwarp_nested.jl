@@ -40,8 +40,11 @@
 #      nest's ocean coupling forwards to the child (NestedModels/nested_component.jl), so the ice
 #      sees the child ocean. B-SOSE's SIarea/SIheff are not wired into setup_bsose.jl, so the ice
 #      starts at zero on 1 June and forms over the first days from near-freezing coastal water;
-#      read the first week of the coastal band with that in mind. The ice has no open boundaries:
-#      none enters from the Ross or Weddell sides, and the side walls hold it at the coast.
+#      read the first week of the coastal band with that in mind. The ice model's sides are walls,
+#      so ice is deleted in the 4-cell relaxation band along the open W, E and N sides every step
+#      (it leaves, as it would); none enters from outside. The wizard also limits Δt on the ICE
+#      speed, and a run stops if any ice passes 50 m. 2Y_nested_seaice_full had none of these
+#      three: its ice piled against the east edge from day 110 and grew to 10⁶ m.
 #      The ocean-only runs (2Y_nested_test, 2Y_nested_bsosez) had none of this. Their coast went
 #      warm and salty every summer, with nothing melting into it: the missing sea-ice cycle.
 #
@@ -197,9 +200,26 @@ simulation = Simulation(coupled_model; Δt = 1seconds,
 # simulation's model for its advective timescale, and the model here is the coupled
 # EarthSystemModel, which has no such method for an ocean-only nest (NumericalEarth forwards it
 # only for NestedModel itself and for nested ATMOSPHERES). So hand it the child ocean's directly.
-child_advection_timescale(_) = Oceananigans.Advection.cell_advection_timescale(child)
+#
+# The ICE is advected on the same Δt and is faster: 2Y_nested_seaice_full reached 1-4 m/s ice
+# against Δt of 20-40 min, i.e. ice CFL above 1 on these 6-8 km cells, and the thickness grew
+# without bound (8 m on day 105, 1 km by day 180, hundreds of km after). Oceananigans'
+# cell_advection_timescale wants 3-D velocities, so the ice gets a conservative bound instead:
+# its fastest u and v over the smallest Δx and Δy anywhere on the grid. The wizard takes the
+# shorter of the two, so Δt only drops when fast ice demands it; it is not a fixed cap.
+const ICE_Δx_MIN = minimum_xspacing(child.grid.underlying_grid)
+const ICE_Δy_MIN = minimum_yspacing(child.grid.underlying_grid)
+
+function ice_advection_timescale()
+    uᵢ, vᵢ = sea_ice.model.velocities
+    inverse = maximum(abs, uᵢ) / ICE_Δx_MIN + maximum(abs, vᵢ) / ICE_Δy_MIN
+    return inverse > 0 ? 1 / inverse : Inf
+end
+
+coupled_advection_timescale(_) = min(Oceananigans.Advection.cell_advection_timescale(child),
+                                     ice_advection_timescale())
 wizard = TimeStepWizard(cfl = 0.6, max_change = 1.1, min_Δt = 0.1,
-                        cell_advection_timescale = child_advection_timescale)
+                        cell_advection_timescale = coupled_advection_timescale)
 simulation.callbacks[:wizard] = Callback(wizard, IterationInterval(10))
 
 # Fail loudly and early on NaN: every field, every step, and throw (see src/model.jl).
@@ -208,6 +228,40 @@ simulation.callbacks[:nan_checker] =
                                        (; h = sea_ice.model.ice_thickness, ℵ = sea_ice.model.ice_concentration)),
                         erroring = true),
              IterationInterval(1))
+
+# ── ice leaves through the open sides ─────────────────────────────────────────────────────────
+# The ocean's W, E and N sides are open, but the ice model's are walls: ice drifting west along
+# the coast piled against the west edge, ice carried east by the ACC against the east edge, and
+# the first runaway thickness in 2Y_nested_seaice_full started at the east edge (i = 360, day 110).
+# So the ice is removed in the band where the nest relaxes the ocean to B-SOSE (8/12 deg, 4 cells
+# here), every step: ice reaching an open side leaves the domain, as it would. Inside that band
+# the ocean is restored to B-SOSE on 6 hours, which absorbs the freshwater the deleted ice never
+# returns. No ice enters from outside either: B-SOSE's SIarea/SIheff are not wired in.
+const ICE_EDGE = 4
+const ICE_FIELDS = (sea_ice.model.ice_thickness, sea_ice.model.ice_concentration, sea_ice.model.snow_thickness)
+
+function remove_edge_ice!(_)
+    for field in ICE_FIELDS
+        data = interior(field)
+        data[1:ICE_EDGE, :, :] .= 0                # west
+        data[Nx-ICE_EDGE+1:Nx, :, :] .= 0          # east
+        data[:, Ny-ICE_EDGE+1:Ny, :] .= 0          # north
+    end
+    return nothing
+end
+simulation.callbacks[:remove_edge_ice] = Callback(remove_edge_ice!, IterationInterval(1))
+
+# Thickness can run away without ever going NaN (the NaN checker did not fire on 2Y_nested_seaice_full,
+# whose ice reached 10⁶ m). No real Antarctic ice is 50 m thick, so stop there.
+const ICE_MAX_THICKNESS = 50
+function check_ice_thickness(sim)
+    h_max = maximum(sea_ice.model.ice_thickness)
+    h_max > ICE_MAX_THICKNESS &&
+        error(@sprintf("sea ice %.1f m thick at t = %.2f days, iteration %d: the ice is blowing up",
+                       h_max, time(sim) / 86400, iteration(sim)))
+    return nothing
+end
+simulation.callbacks[:ice_thickness] = Callback(check_ice_thickness, IterationInterval(10))
 
 # Oceanostics' TimedMessenger, as src/model.jl's BSOSE path uses. It reads velocities, the closure
 # and the CFL numbers off `simulation.model`, and the coupled model has none of them -- which is
