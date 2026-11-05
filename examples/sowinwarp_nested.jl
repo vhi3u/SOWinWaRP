@@ -40,12 +40,14 @@
 #      `OceanSeaIceModel(ocean, sea_ice; atmosphere, radiation)`; going there means ClimaSeaIce.
 #      This script is ocean-only ON PURPOSE, as the first thing to get running, NOT as physics.
 #
-#   2. Z-STAR COMES FREE. `ExponentialDiscretization(...; mutable = true)` is a
-#      MutableVerticalDiscretization, so the free surface moves the levels. Our current model is
-#      static-z, which is exactly why freshwater enters as a VIRTUAL SALT FLUX with no volume:
-#      B-SOSE adds water, eta rises, divergence exports the anomaly; we remove salt and the
-#      anomaly can only leave as an advected tracer. Moving here changes that mechanism, so the
-#      `nofw` testbed arm and this branch are asking the same question two different ways.
+#   2. STATIC Z ON B-SOSE'S OWN LEVELS. The 52 levels of B-SOSE iteration 156 (4.2 m at the
+#      surface to 400 m, 6000 m), not mutable. The parent's state then lands on the child level
+#      for level, with no vertical interpolation at the boundaries, and the top cell is the same
+#      4.2 m layer B-SOSE's surface fields describe. Static z as in src/model.jl, whose own grid
+#      (8 m to 250 m, then stretched, 53 levels) is close but not identical. The first 2-year run
+#      (2Y_nested_test) used a 40-level z-star ExponentialDiscretization instead: 11 m at the top,
+#      11 levels in the upper 200 m. Its output names the vertical coordinate r_aac rather than
+#      z_aac; tools/compare_surface_bsose.jl reads either.
 # ==============================================================================================
 
 using CUDA            # loads Oceananigans' CUDA extension, which is what defines `GPU()`
@@ -74,8 +76,19 @@ const λ₁, λ₂ = 90.0, 150.0
 const φ₁, φ₂ = -70.0, -45.0
 const SCALING = 6
 const Nx, Ny = Int(SCALING * (λ₂ - λ₁)), Int(SCALING * (φ₂ - φ₁))   # 360 x 150
-const Nz = 40
-const DEPTH = 5500meters
+
+# B-SOSE iteration 156's level thicknesses, top down: `DRF` in its grid.nc (identical in i105's
+# Theta/Salt files). 52 levels, 4.2 m to 400 m, summing to 6000 m.
+const BSOSE_DRF = [4.2, 5.0, 5.9, 6.9, 8.5, 9.5, 10.0, 10.0, 10.0, 10.0,
+                   10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 13.0, 17.0, 20.0, 20.0,
+                   20.0, 20.0, 20.0, 20.0, 22.0, 30.0, 38.0, 45.0, 50.0, 50.0,
+                   53.0, 72.0, 100.0, 100.0, 100.0, 100.0, 100.0, 150.0, 200.0, 200.0,
+                   200.0, 220.0, 300.0, 380.0, 400.0, 400.0, 400.0, 400.0, 400.0, 400.0,
+                   400.0, 400.0]
+
+# Faces bottom to top, as LatitudeLongitudeGrid wants them: -6000 m ... 0
+z = reverse(-vcat(0.0, cumsum(BSOSE_DRF))) .+ 0.0     # .+ 0.0 turns the top face's -0.0 into 0.0
+const Nz = length(z) - 1
 
 # Must be a NATIVE B-SOSE stamp (records sit at odd times: 2014-05-02T02:00, 2014-06-01T12:00, ...).
 # The initial snapshot goes through `bracketing_dates`, which looks `[start_date]` up in
@@ -87,8 +100,6 @@ const RUN_NAME = get(ENV, "RUN_NAME", SMOKE ? "nested_smoke" :
                      "nested_" * Dates.format(start_date, "yyyymmdd") * "_" * Dates.format(end_date, "yyyymmdd"))
 
 @info "SOWinWaRP nested: $(Nx)x$(Ny)x$(Nz) over $(λ₁)-$(λ₂)E, $(φ₁)-$(φ₂)S, $start_date to $end_date"
-
-z = ExponentialDiscretization(Nz, -DEPTH, 0; scale = DEPTH / 4, mutable = true)
 
 underlying_grid = LatitudeLongitudeGrid(ARCH;
                                         size = (Nx, Ny, Nz),
@@ -214,11 +225,6 @@ simulation.callbacks[:progress] = Callback(sim -> progress(ChildView(sim)), Time
 #   RUN_NAME_eke.nc           30-day means of u, v, T, S, uu, vv at cell centres, full depth
 #
 # Written off `child`, NOT off the NestedModel: the nest's prognostic state is the child.
-#
-# ONE DIFFERENCE: the levels move with η (z-star), so NetCDFWriter names the vertical coordinate
-# `r_aac` -- the REFERENCE depth of each level at η = 0 -- not `z_aac`. The true depth of a level
-# is r * (1 + η/H) + η; with |η| ~ 1 m over thousands of metres the difference is far below a
-# level spacing, so plotting against r is fine.
 const EKE_WINDOW = 30days
 const EKE_STRIDE = 1
 
@@ -232,7 +238,7 @@ output_metadata = Dict("run_name" => RUN_NAME,
     "dataset" => "BSOSE",
     "boundaries" => "one-way nest in B-SOSE (NumericalEarth nested_ocean_simulation)",
     "atmosphere" => "ERA5 (NCAR ds633.0), $(era5_pressure)",
-    "vertical_coordinate" => "z-star: r_aac is the reference depth at eta = 0")
+    "vertical_coordinate" => "static z, B-SOSE i156's 52 levels")
 
 ocean.output_writers[:surface] = NetCDFWriter(
     child,
