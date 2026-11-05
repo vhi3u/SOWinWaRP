@@ -55,6 +55,7 @@ using NumericalEarth
 using NumericalEarth.DataWrangling: metadata_path
 using Oceananigans
 using Oceananigans.Units
+using Oceananigans.Diagnostics: NaNChecker
 using NCDatasets      # loads Oceananigans' NetCDFWriter
 using Dates, Printf
 
@@ -157,22 +158,41 @@ radiation  = ERA5PrescribedRadiation(ARCH; dataset = era5_dataset, start_date = 
 
 coupled_model = OceanOnlyModel(ocean; atmosphere, radiation)      # see note 1 in the header
 
-simulation = Simulation(coupled_model; Δt = 5minutes,
+# ── stepping and progress, as src/model.jl ────────────────────────────────────────────────────
+# Start with a very small Δt so the first CATKE evaluation is numerically gentle;
+# the wizard will ramp this up within a few iterations.
+simulation = Simulation(coupled_model; Δt = 1seconds,
                         stop_time = (end_date - start_date).value / 1000)
 
-wall = Ref(time_ns())
-function progress(sim)
-    u, v, w = child.velocities
-    T, S = child.tracers.T, child.tracers.S
-    elapsed = 1e-9 * (time_ns() - wall[])
-    @info @sprintf("t = %s | Δt = %s | |u| = %.2e %.2e %.2e | T %.2f..%.2f | S %.2f..%.2f | %.1f s",
-                   prettytime(sim), prettytime(sim.Δt),
-                   maximum(abs, u), maximum(abs, v), maximum(abs, w),
-                   minimum(T), maximum(T), minimum(S), maximum(S), elapsed)
-    wall[] = time_ns()
-    return nothing
+# Adaptive time step on the advective CFL, with src/model.jl's settings. The wizard asks the
+# simulation's model for its advective timescale, and the model here is the coupled
+# EarthSystemModel, which has no such method for an ocean-only nest (NumericalEarth forwards it
+# only for NestedModel itself and for nested ATMOSPHERES). So hand it the child ocean's directly.
+child_advection_timescale(_) = Oceananigans.Advection.cell_advection_timescale(child)
+wizard = TimeStepWizard(cfl = 0.6, max_change = 1.1, min_Δt = 0.1,
+                        cell_advection_timescale = child_advection_timescale)
+simulation.callbacks[:wizard] = Callback(wizard, IterationInterval(10))
+
+# Fail loudly and early on NaN: every field, every step, and throw (see src/model.jl).
+simulation.callbacks[:nan_checker] =
+    Callback(NaNChecker(fields = merge(child.velocities, child.tracers), erroring = true),
+             IterationInterval(1))
+
+# src/model.jl's coupled progress messenger, closing over the child (the coupled model has no
+# velocities of its own), without the eta and transport diagnostics. Daily; 6-hourly in smoke mode.
+const PROGRESS_WALL = Ref(time_ns())
+
+function coupled_progress(sim)
+    m = child
+    u, v, w = m.velocities
+    elapsed = (time_ns() - PROGRESS_WALL[]) / 1e9
+    PROGRESS_WALL[] = time_ns()
+    @info @sprintf("iter = %6d, time = %s, Δt = %s, walltime = %.1f s | |u⃗|ₘₐₓ = [%.2e, %.2e, %.2e] m/s",
+        iteration(sim), prettytime(m.clock.time), prettytime(sim.Δt), elapsed,
+        maximum(abs, u), maximum(abs, v), maximum(abs, w))
+    flush(stdout)
 end
-add_callback!(simulation, progress, TimeInterval(SMOKE ? 6hours : 1days))
+simulation.callbacks[:progress] = Callback(coupled_progress, TimeInterval(SMOKE ? 6hours : 1days))
 
 # ── output ────────────────────────────────────────────────────────────────────────────────────
 # The same four files src/model.jl writes, with the same names, fields, cadences and global
