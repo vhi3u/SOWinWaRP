@@ -20,6 +20,8 @@
 #     BSOSE_ITERATION    156 (2013–2024, 1/6°) or 105 (2008–2012, 1/3°)
 #     START_DATE         "2014-06-01"
 #     END_DATE           "2016-06-01"
+#     FULL_TIME          "true" animates every record in the file, ignoring
+#                        START_DATE and END_DATE ("false")
 #     LON_BOUNDS         "90,150"
 #     LAT_BOUNDS         "-70,-45"
 #     ANIMATION_OUTPUT   full output path, overriding the generated name
@@ -29,10 +31,9 @@
 #     VIDEO_COMPRESSION  ffmpeg -crf, mp4 only (20)
 #     T_LIMS S_LIMS U_LIMS V_LIMS
 #                        colour limits, read exactly as animate_simulation.jl
-#                        reads them. Unset, the panels use the model animation's
-#                        limits pinned below rather than BSOSE's own range.
-#     CLIM_QUANTILE      affects only the BSOSE range reported for comparison;
-#                        the panels themselves use the pinned limits.
+#                        reads them. Unset, the panels use BSOSE's own range over
+#                        the months animated.
+#     CLIM_QUANTILE      quantile for that range, 1.0 being the full min/max
 #
 # Iteration 156's monthly Theta/Salt/Uvel/Vvel files live on the cluster, not in
 # the repo's data/, so this normally runs on a CPU node with BSOSE_DIR pointing at
@@ -62,6 +63,7 @@ end
 const BSOSE_ITERATION = parse(Int, get(ENV, "BSOSE_ITERATION", "156"))
 const START_DATE = DateTime(get(ENV, "START_DATE", "2014-06-01"))
 const END_DATE = DateTime(get(ENV, "END_DATE", "2016-06-01"))
+const FULL_TIME = parse(Bool, get(ENV, "FULL_TIME", "false"))
 const LON_BOUNDS = env_pair("LON_BOUNDS", (90.0, 150.0))
 const LAT_BOUNDS = env_pair("LAT_BOUNDS", (-70.0, -45.0))
 const FRAMERATE = parse(Int, get(ENV, "FRAMERATE", "4"))
@@ -243,8 +245,10 @@ k_surface = argmin(abs.(z))
 
 # Months to animate: every record whose averaging window CENTRE falls inside the
 # run, which is the same test src/model.jl uses to choose its forcing records.
+# FULL_TIME skips that test and takes everything the file holds.
 stamps = ds_T["time"][:]
-frames = findall(s -> START_DATE <= bsose_window_center(s) <= END_DATE, stamps)
+frames = FULL_TIME ? collect(eachindex(stamps)) :
+         findall(s -> START_DATE <= bsose_window_center(s) <= END_DATE, stamps)
 
 if isempty(frames)
     error("""$(basename(theta_path)) holds no monthly record centred between $START_DATE and \
@@ -309,59 +313,23 @@ close(ds_S)
 close(ds_U)
 close(ds_V)
 
-# ── Colour limits: pinned to the model animation ──────────────────────────────
-#
-# TEMPORARY, and the one place to edit. These are the limits the 2YS6_surface_flux
-# surface animation scanned for itself, so the two movies can be read side by side
-# on one scale instead of each picking its own.
-#
-# They were read off that movie's colorbars. The velocity ends are exact (its end
-# ticks are labelled ±2.5 and ±3); the temperature and salinity ends are
-# extrapolated from the tick spacing and are good to about a tenth. The exact
-# numbers are printed in that run's animation log, under "Colorbar limits" —
-# paste them in here.
-#
-# Note what pinning costs: the model's velocity range is roughly four times
-# BSOSE's (BSOSE peaks near 0.8 m/s here), so the BSOSE u and v panels are nearly
-# flat at this scale. That is the comparison rather than a fault in the plot — the
-# model's extremes sit far outside anything BSOSE produces in this domain, as does
-# a surface temperature below seawater's freezing point. BSOSE's own range is
-# printed below for reference.
-const MODEL_T_LIMS = (-6.1, 25.1)   # °C
-const MODEL_S_LIMS = (32.4, 35.5)   # PSU
-const MODEL_U_LIMS = (-2.5, 2.5)    # m/s
-const MODEL_V_LIMS = (-3.0, 3.0)    # m/s
-
-"The limits from `ENV[key]` if it is set, otherwise the model animation's."
-function pinned_lims(key, model_lims)
-    given = env_lims(key)
-    return given === nothing ? (model_lims, "matched to the model animation") : (given, "set via $key")
-end
+# ── Colour limits: scanned from BSOSE ─────────────────────────────────────────
 
 valid_T = filter(!isnan, T_data)
 valid_S = filter(!isnan, S_data)
 valid_u = filter(!isnan, u_data)
 valid_v = filter(!isnan, v_data)
 
-T_lims, T_src = pinned_lims("T_LIMS", MODEL_T_LIMS)
-S_lims, S_src = pinned_lims("S_LIMS", MODEL_S_LIMS)
-u_lims, u_src = pinned_lims("U_LIMS", MODEL_U_LIMS)
-v_lims, v_src = pinned_lims("V_LIMS", MODEL_V_LIMS)
+T_lims, T_src = resolve_lims("T_LIMS", scan_lims(valid_T, (-2.0, 20.0); clim_q=CLIM_QUANTILE))
+S_lims, S_src = resolve_lims("S_LIMS", scan_lims(valid_S, (32.5, 35.5); clim_q=CLIM_QUANTILE))
+u_lims, u_src = resolve_lims("U_LIMS", scan_sym_lims(valid_u, (-0.5, 0.5); clim_q=CLIM_QUANTILE))
+v_lims, v_src = resolve_lims("V_LIMS", scan_sym_lims(valid_v, (-0.3, 0.3); clim_q=CLIM_QUANTILE))
 
 report_limits((("Temperature (T)", "°C", T_lims, T_src),
         ("Salinity (S)", "PSU", S_lims, S_src),
         ("Zonal vel (u)", "m/s", u_lims, u_src),
         ("Merid vel (v)", "m/s", v_lims, v_src)), CLIM_QUANTILE)
 
-# What BSOSE on its own would have asked for. Printed, not used: seeing how much
-# narrower it is explains at a glance why the pinned panels look washed out.
-println("BSOSE's own range over these months (not used for the panels):")
-for (name, unit, lims) in (("Temperature (T)", "°C", scan_lims(valid_T, MODEL_T_LIMS; clim_q=CLIM_QUANTILE)),
-    ("Salinity (S)", "PSU", scan_lims(valid_S, MODEL_S_LIMS; clim_q=CLIM_QUANTILE)),
-    ("Zonal vel (u)", "m/s", scan_sym_lims(valid_u, MODEL_U_LIMS; clim_q=CLIM_QUANTILE)),
-    ("Merid vel (v)", "m/s", scan_sym_lims(valid_v, MODEL_V_LIMS; clim_q=CLIM_QUANTILE)))
-    @printf("  - %-17s : %8.2f .. %8.2f %s\n", name, lims..., unit)
-end
 report_speeds(valid_u, valid_v, false)
 
 # ── Animate ───────────────────────────────────────────────────────────────────
