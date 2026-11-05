@@ -5,6 +5,9 @@
 #     julia --project=. tools/test_bathymetry_section.jl          # the mid-longitude, 119.917E
 #     LON=119.917 LAT_RANGE=-68:-64 julia --project=. tools/test_bathymetry_section.jl
 #
+# Both panels span 70-45S, the upper 500 m first, as the mid-longitude section plots do.
+# LAT_RANGE only sets the window of the printed shallowest points.
+#
 # Along one model column it draws:
 #
 #   ETOPO2022 native     the 1-arcminute source, as the min-max envelope of the 10 native columns
@@ -109,26 +112,34 @@ println()
 
 # ── figure ────────────────────────────────────────────────────────────────────────────────────
 mkpath(OUTDIR)
-fig = Figure(size = (1100, 900))
+# Each panel's plot area is the size of one panel in tools/animate_simulation.jl's section
+# animations (a 2x2 grid with colorbars in a 1400x950 figure, fontsize 14), measured from that
+# layout, so this figure overlays on those frames at the same scale. The figure grows to fit.
+const PANEL_WIDTH, PANEL_HEIGHT = 526, 365
+fig = Figure(fontsize = 14)
 
-for (row, (title, limits)) in enumerate(((@sprintf("Seafloor along %.3f°E, %.0f to %.0f°N", λ, lat_lim...), lat_lim),
-                                         ("Whole section", (φ₁, φ₂))))
-    ax = Axis(fig[row, 1]; title, xlabel = "Latitude (°N)", ylabel = "Height (m)")
+# Both panels span the whole domain in latitude, as the mid-longitude section plots do; the
+# first is their focus view (upper 500 m), the second full depth.
+for (row, (title, depth_limits)) in enumerate(((@sprintf("Seafloor along %.3f°E, upper 500 m", λ), (-500, 0)),
+                                               ("Full depth", nothing)))
+    ax = Axis(fig[row, 1]; title, xlabel = "Latitude (°N)", ylabel = "Height (m)",
+              width = PANEL_WIDTH, height = PANEL_HEIGHT)
     band!(ax, native_lat, native_min, native_max; color = (:grey50, 0.35),
           label = "ETOPO2022 native, min–max across the cell")
     lines!(ax, native_lat, native_mean; color = :grey30, linewidth = 1, label = "ETOPO2022 native, mean")
     stairs!(ax, φc, wet(z1); step = :center, color = :royalblue, linewidth = 2, label = "regridded, passes = 1")
     stairs!(ax, φc, wet(z5); step = :center, color = :firebrick, linewidth = 2, label = "regridded, passes = 5 (the run)")
     stairs!(ax, φc, wet(zb); step = :center, color = :black, linewidth = 2, linestyle = :dash, label = "B-SOSE Depth")
-    xlims!(ax, limits...)
-    row == 1 && ylims!(ax, -4000, 100)
-    row == 1 && axislegend(ax; position = :rb, framevisible = false)
+    xlims!(ax, φ₁, φ₂)
+    isnothing(depth_limits) ? ylims!(ax; high = 100) : ylims!(ax, depth_limits...)
+    row == 1 && Legend(fig[3, 1], ax; framevisible = false, tellwidth = false, tellheight = true)
 end
 
-Label(fig[3, 1], "ETOPO2022 is the surface version: over ice shelves it is the ice top. " *
+Label(fig[4, 1], "ETOPO2022 is the surface version: over ice shelves it is the ice top. " *
                  "The regridded and B-SOSE curves are cell values; NaN (land) is not drawn.";
-      fontsize = 12, tellwidth = false)
+      fontsize = 12, tellwidth = false, word_wrap = true)
 
 out = joinpath(OUTDIR, @sprintf("bathymetry_section_%.3fE.png", λ))
+resize_to_layout!(fig)
 save(out, fig)
 @info "wrote $out"
