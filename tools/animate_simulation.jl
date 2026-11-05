@@ -346,7 +346,8 @@ function animate_midlon(midlon_file, output, output_focus; framerate, clim_q, fo
     println("\nLoading mid-longitude fields from: ", midlon_file)
     ds = Dataset(midlon_file)
     lat = Float64.(ds["φ_aca"][:])
-    z = Float64.(ds["z_aac"][:])
+    # z-star runs (examples/sowinwarp_nested.jl) write the reference depth `r_aac` instead
+    z = Float64.(ds[haskey(ds, "z_aac") ? "z_aac" : "r_aac"][:])
     times = Float64.(ds["time"][:])
     mid_lon = haskey(ds, "λ_caa") ? ds["λ_caa"][1] : 120.0
     Nt, Ny, Nz = length(times), length(lat), length(z)

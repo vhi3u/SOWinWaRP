@@ -7,7 +7,9 @@
 #     END_DATE=2016-06-01T12:00 julia --project=. examples/sowinwarp_nested.jl   # 2 years
 #
 # END_DATE can be any time up to 2016-12-31T22:00 (the ERA5 converted so far covers 2014-2016).
-# Outputs are tagged with the window (or SMOKE / RUN_NAME), so runs do not overwrite each other.
+# OUTPUT follows src/model.jl, so `./run_animate_simulation RUN_NAME` works on it unchanged:
+# RUN_NAME_surface.nc, _midlon.nc, _free_surface.nc and _eke.nc in the working directory.
+# RUN_NAME defaults to nested_smoke or nested_<start>_<end>, so runs do not overwrite each other.
 #
 # RUN examples/nested_probe.jl FIRST. This script needs BSOSEMonthly to satisfy the parent
 # dataset interface; the probe says whether it does and what is missing. Starting here instead
@@ -53,6 +55,7 @@ using NumericalEarth
 using NumericalEarth.DataWrangling: metadata_path
 using Oceananigans
 using Oceananigans.Units
+using NCDatasets      # loads Oceananigans' NetCDFWriter
 using Dates, Printf
 
 include(joinpath(@__DIR__, "..", "src", "setup_bsose.jl"))   # BSOSEMonthly and its file map
@@ -78,8 +81,8 @@ const DEPTH = 5500meters
 # that is fixed upstream on ss/nested-ocean-model.
 start_date = DateTime(2014, 6, 1, 12)
 end_date   = SMOKE ? DateTime(2014, 6, 3) : DateTime(get(ENV, "END_DATE", "2014-08-01T00:00"))
-run_name   = get(ENV, "RUN_NAME", SMOKE ? "smoke" :
-                 Dates.format(start_date, "yyyymmdd") * "_" * Dates.format(end_date, "yyyymmdd"))
+const RUN_NAME = get(ENV, "RUN_NAME", SMOKE ? "nested_smoke" :
+                     "nested_" * Dates.format(start_date, "yyyymmdd") * "_" * Dates.format(end_date, "yyyymmdd"))
 
 @info "SOWinWaRP nested: $(Nx)x$(Ny)x$(Nz) over $(λ₁)-$(λ₂)E, $(φ₁)-$(φ₂)S, $start_date to $end_date"
 
@@ -172,39 +175,98 @@ end
 add_callback!(simulation, progress, TimeInterval(SMOKE ? 6hours : 1days))
 
 # ── output ────────────────────────────────────────────────────────────────────────────────────
-# Written off `child`, NOT off the NestedModel: the nest's prognostic state is the child.
-# `including = []`: the writers otherwise serialize coriolis/buoyancy/closure from the
-# simulation's model, which is the NestedModel and has none of them (a warning, nothing lost).
+# The same four files src/model.jl writes, with the same names, fields, cadences and global
+# attributes, so tools/animate_simulation.jl and the analysis tools read both runs alike:
 #
-# The levels move with eta (z-star), so the 3-D output carries eta at the same times: the depth
-# of a level k is only recoverable with the eta it was written with.
-outputs = merge(child.velocities, child.tracers)
-η = child.free_surface.displacement
+#   RUN_NAME_surface.nc       u, v, T, S at k = Nz, daily
+#   RUN_NAME_midlon.nc        u, v, T, S on the mid-longitude section, daily
+#   RUN_NAME_free_surface.nc  η, daily
+#   RUN_NAME_eke.nc           30-day means of u, v, T, S, uu, vv at cell centres, full depth
+#
+# Written off `child`, NOT off the NestedModel: the nest's prognostic state is the child.
+#
+# ONE DIFFERENCE: the levels move with η (z-star), so NetCDFWriter names the vertical coordinate
+# `r_aac` -- the REFERENCE depth of each level at η = 0 -- not `z_aac`. The true depth of a level
+# is r * (1 + η/H) + η; with |η| ~ 1 m over thousands of metres the difference is far below a
+# level spacing, so plotting against r is fine.
+output_interval = SMOKE ? 6hours : 1days
+const EKE_WINDOW = 30days
+const EKE_STRIDE = 1
 
-ocean.output_writers[:surface] =
-    JLD2Writer(child, outputs;
-               schedule = TimeInterval(SMOKE ? 6hours : 1days),
-               filename = "sowinwarp_nested_$(run_name)_surface",
-               indices = (:, :, Nz),
-               including = [],
-               overwrite_files = true)
+u, v, w = child.velocities
+T, S = child.tracers.T, child.tracers.S
 
-ocean.output_writers[:free_surface] =
-    JLD2Writer(child, (; η);
-               schedule = TimeInterval(SMOKE ? 6hours : 1days),
-               filename = "sowinwarp_nested_$(run_name)_free_surface",
-               including = [],
-               overwrite_files = true)
+# Stamped on every file so the animation captions frames with calendar dates
+output_metadata = Dict("run_name" => RUN_NAME,
+    "start_date" => string(start_date),
+    "end_date" => string(end_date),
+    "dataset" => "BSOSE",
+    "boundaries" => "one-way nest in B-SOSE (NumericalEarth nested_ocean_simulation)",
+    "atmosphere" => "ERA5 (NCAR ds633.0), $(era5_pressure)",
+    "vertical_coordinate" => "z-star: r_aac is the reference depth at eta = 0")
 
-# ~45 MB a snapshot: 2 years at 5 days is ~150 snapshots, ~7 GB
-ocean.output_writers[:fields] =
-    JLD2Writer(child, merge(outputs, (; η));
-               schedule = TimeInterval(SMOKE ? 12hours : 5days),
-               filename = "sowinwarp_nested_$(run_name)_fields",
-               including = [],
-               overwrite_files = true)
+ocean.output_writers[:surface] = NetCDFWriter(
+    child,
+    (; u, v, T, S),
+    filename="$(RUN_NAME)_surface.nc",
+    schedule=TimeInterval(output_interval),
+    indices=(:, :, Nz),
+    global_attributes=output_metadata,
+    overwrite_files=true
+)
 
-@info "output tag $run_name"
+mid_lon_idx = div(Nx, 2)
+ocean.output_writers[:mid_lon] = NetCDFWriter(
+    child,
+    (; u, v, T, S),
+    filename="$(RUN_NAME)_midlon.nc",
+    schedule=TimeInterval(output_interval),
+    indices=(mid_lon_idx, :, :),
+    global_attributes=output_metadata,
+    overwrite_files=true
+)
+
+# η lives at (Center, Center, Face) on a single level, which NetCDFWriter cannot write
+# directly; reducing over the (length-one) vertical gives an ordinary 2D field.
+η_2d = Field(Average(child.free_surface.displacement, dims=3))
+
+ocean.output_writers[:free_surface] = NetCDFWriter(
+    child,
+    (; η=η_2d),
+    filename="$(RUN_NAME)_free_surface.nc",
+    schedule=TimeInterval(output_interval),
+    global_attributes=output_metadata,
+    overwrite_files=true
+)
+
+# Co-located velocities, squared after interpolating (see src/model.jl's EKE block). T and S
+# ride along: this is the only full-depth output.
+u_cc = @at (Center, Center, Center) u
+v_cc = @at (Center, Center, Center) v
+eke_outputs = (; u=u_cc, v=v_cc, T, S, uu=u_cc^2, vv=v_cc^2)
+
+eke_metadata = merge(output_metadata, Dict(
+    "averaging_window_seconds" => Float64(EKE_WINDOW),
+    "averaging_stride" => EKE_STRIDE,
+    "moment_location" => "Center, Center, Center",
+    "eke_recipe" => "EKE = 0.5*((uu - u^2) + (vv - v^2)); MKE = 0.5*(u^2 + v^2)"))
+
+simulation_seconds = (end_date - start_date).value / 1000
+if EKE_WINDOW > simulation_seconds
+    @warn "EKE_WINDOW ($(EKE_WINDOW / 1days) days) is longer than the run: $(RUN_NAME)_eke.nc will be created and left empty."
+end
+
+ocean.output_writers[:eke] = NetCDFWriter(
+    child,
+    eke_outputs,
+    filename="$(RUN_NAME)_eke.nc",
+    schedule=AveragedTimeInterval(EKE_WINDOW, window=EKE_WINDOW, stride=EKE_STRIDE),
+    indices=(:, :, :),
+    global_attributes=eke_metadata,
+    overwrite_files=true
+)
+
+@info "output: $(RUN_NAME)_{surface,midlon,free_surface,eke}.nc in $(pwd())"
 
 @info "starting"
 run!(simulation)
