@@ -2,8 +2,12 @@
 # sowinwarp_nested.jl -- SOWinWaRP as a one-way nest in B-SOSE, on NumericalEarth's
 # ss/nested-ocean-model branch. Modelled on examples/bouvet_nested_ocean_simulation.jl.
 #
-#     SMOKE=1 julia --project=. examples/sowinwarp_nested.jl     # 2 days, proves it starts
-#     julia --project=. examples/sowinwarp_nested.jl             # the real window
+#     SMOKE=1 julia --project=. examples/sowinwarp_nested.jl     # 1.5 days, proves it starts
+#     julia --project=. examples/sowinwarp_nested.jl             # Jun-Aug 2014
+#     END_DATE=2016-06-01T12:00 julia --project=. examples/sowinwarp_nested.jl   # 2 years
+#
+# END_DATE can be any time up to 2016-12-31T22:00 (the ERA5 converted so far covers 2014-2016).
+# Outputs are tagged with the window (or SMOKE / RUN_NAME), so runs do not overwrite each other.
 #
 # RUN examples/nested_probe.jl FIRST. This script needs BSOSEMonthly to satisfy the parent
 # dataset interface; the probe says whether it does and what is missing. Starting here instead
@@ -73,7 +77,9 @@ const DEPTH = 5500meters
 # `all_dates` by exact match and crashes on `nothing` when it is not there. Workaround until
 # that is fixed upstream on ss/nested-ocean-model.
 start_date = DateTime(2014, 6, 1, 12)
-end_date   = SMOKE ? DateTime(2014, 6, 3) : DateTime(2014, 8, 1)
+end_date   = SMOKE ? DateTime(2014, 6, 3) : DateTime(get(ENV, "END_DATE", "2014-08-01T00:00"))
+run_name   = get(ENV, "RUN_NAME", SMOKE ? "smoke" :
+                 Dates.format(start_date, "yyyymmdd") * "_" * Dates.format(end_date, "yyyymmdd"))
 
 @info "SOWinWaRP nested: $(Nx)x$(Ny)x$(Nz) over $(λ₁)-$(λ₂)E, $(φ₁)-$(φ₂)S, $start_date to $end_date"
 
@@ -124,19 +130,26 @@ era5_region = BoundingBox(longitude = (λ₁ - 1.0, λ₂ + 1.0), latitude = (φ
 era5_dataset = ERA5YearlySingleLevel()
 era5_pressure = :mean_sea_level_pressure
 
+# One extra hour at each end: ERA5 values are means over the hour ending at their stamp, so
+# NumericalEarth places them half an hour earlier, and a series on exactly [start, end] leaves the
+# first and last 30 minutes to `Cyclical()` wrap-around from the other end of the record.
+era5_start = start_date - Hour(1)
+era5_end   = end_date + Hour(1)
+
 # Fail here rather than let the backend start a year-long CDS request for a missing file
 era5_names = (:eastward_velocity, :northward_velocity, :temperature, :dewpoint_temperature, era5_pressure,
               :total_precipitation, :downwelling_shortwave_radiation, :downwelling_longwave_radiation)
 missing_era5 = [path for name in era5_names
-                for path in unique(metadata_path(Metadata(name; dataset = era5_dataset, start_date, end_date,
+                for path in unique(metadata_path(Metadata(name; dataset = era5_dataset,
+                                                          start_date = era5_start, end_date = era5_end,
                                                           dir = era5_dir, region = era5_region)))
                 if !isfile(path)]
 isempty(missing_era5) ||
     error("Missing ERA5 files (run tools/download_era5_ncar.jl):\n  " * join(missing_era5, "\n  "))
 
-atmosphere = ERA5PrescribedAtmosphere(ARCH; dataset = era5_dataset, start_date, end_date,
+atmosphere = ERA5PrescribedAtmosphere(ARCH; dataset = era5_dataset, start_date = era5_start, end_date = era5_end,
                                       region = era5_region, dir = era5_dir, pressure = era5_pressure)
-radiation  = ERA5PrescribedRadiation(ARCH; dataset = era5_dataset, start_date, end_date,
+radiation  = ERA5PrescribedRadiation(ARCH; dataset = era5_dataset, start_date = era5_start, end_date = era5_end,
                                      region = era5_region, dir = era5_dir)
 
 coupled_model = OceanOnlyModel(ocean; atmosphere, radiation)      # see note 1 in the header
@@ -160,19 +173,38 @@ add_callback!(simulation, progress, TimeInterval(SMOKE ? 6hours : 1days))
 
 # ── output ────────────────────────────────────────────────────────────────────────────────────
 # Written off `child`, NOT off the NestedModel: the nest's prognostic state is the child.
+# `including = []`: the writers otherwise serialize coriolis/buoyancy/closure from the
+# simulation's model, which is the NestedModel and has none of them (a warning, nothing lost).
+#
+# The levels move with eta (z-star), so the 3-D output carries eta at the same times: the depth
+# of a level k is only recoverable with the eta it was written with.
 outputs = merge(child.velocities, child.tracers)
+η = child.free_surface.displacement
+
 ocean.output_writers[:surface] =
     JLD2Writer(child, outputs;
                schedule = TimeInterval(SMOKE ? 6hours : 1days),
-               filename = "sowinwarp_nested_surface",
+               filename = "sowinwarp_nested_$(run_name)_surface",
                indices = (:, :, Nz),
+               including = [],
                overwrite_files = true)
 
 ocean.output_writers[:free_surface] =
-    JLD2Writer(child, (; η = child.free_surface.displacement);
+    JLD2Writer(child, (; η);
                schedule = TimeInterval(SMOKE ? 6hours : 1days),
-               filename = "sowinwarp_nested_free_surface",
+               filename = "sowinwarp_nested_$(run_name)_free_surface",
+               including = [],
                overwrite_files = true)
+
+# ~45 MB a snapshot: 2 years at 5 days is ~150 snapshots, ~7 GB
+ocean.output_writers[:fields] =
+    JLD2Writer(child, merge(outputs, (; η));
+               schedule = TimeInterval(SMOKE ? 12hours : 5days),
+               filename = "sowinwarp_nested_$(run_name)_fields",
+               including = [],
+               overwrite_files = true)
+
+@info "output tag $run_name"
 
 @info "starting"
 run!(simulation)
