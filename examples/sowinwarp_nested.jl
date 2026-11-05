@@ -280,6 +280,87 @@ output_interval = SMOKE ? 6hours : 1days
 progress = TimedMessenger()
 simulation.callbacks[:progress] = Callback(sim -> progress(ChildView(sim)), TimeInterval(output_interval))
 
+# ── health check: one line per output interval, a @warn when something looks wrong ─────────────
+# 2Y_nested_seaice_full went wrong for months without a NaN, and the surface only showed it ~130
+# days after the ice did. This prints, once per output interval, the numbers that would have shown
+# it: surface S and T ranges, the largest change since the last check, the domain-mean drift since
+# the start, and the ice. It never stops the run (the NaN checker and the 50 m ice guard do that).
+#
+# Cheap by construction: the top level and the ice are copied to the CPU (about 2 MB) once per
+# interval and summarised there, a few ms against the tens of seconds a model day takes.
+#
+# The thresholds are deliberately loose. The top cell is 4.2 m, so freezing 0.1 m of ice adds
+# ~0.8 g/kg to it before mixing, melting 0.5 m removes ~3.5 g/kg, and a front crossing a cell can
+# move it ~1 g/kg in a day: a single cell over the limit is weather, many at once are not.
+const HEALTH_S_RANGE   = (30.0, 36.0)   # g/kg, surface
+const HEALTH_T_RANGE   = (-2.5, 25.0)   # degC, surface
+const HEALTH_ΔS_CELL   = 1.0            # g/kg per check: a cell counts as "jumping" past this
+const HEALTH_ΔT_CELL   = 2.0            # degC per check
+const HEALTH_JUMPERS   = 100            # warn when more cells than this jump at once (of ~46,000 wet)
+const HEALTH_DRIFT_S   = 0.25           # g/kg, |domain-mean surface S - its starting value|
+const HEALTH_DRIFT_T   = 1.0            # degC
+const HEALTH_ICE_SOUTH = -55.0          # warn on ice north of this latitude...
+const HEALTH_ICE_ℵ     = 0.15           # ...at more than this concentration
+
+# The child's own seafloor (after the nest blended it onto the parent's): stored as a Field or as
+# its bare offset array depending on how the grid was built, and both index the interior as 1:N
+health_wet = Array(child.grid.immersed_boundary.bottom_height[1:Nx, 1:Ny, 1]) .< 0
+health_λ   = Array(λnodes(child.grid, Center()))
+health_φ   = Array(φnodes(child.grid, Center()))
+health_w   = [health_wet[i, j] * cosd(health_φ[j]) for i in 1:Nx, j in 1:Ny]   # area weights, 0 on land
+health_north = [φ > HEALTH_ICE_SOUTH for _ in 1:Nx, φ in health_φ]
+const HEALTH_STATE = Dict{Symbol, Any}()
+
+surface_slice(field) = Array(view(interior(field), :, :, Nz:Nz))[:, :, 1]   # copies the top level only
+ice_slice(field)     = Array(interior(field))[:, :, 1]
+weighted_mean(X, w)  = sum(X .* w) / sum(w)
+where_is(X, k)       = @sprintf("%.2f at %.1fE %.1fS", X[k], health_λ[k[1]], -health_φ[k[2]])
+
+function health_check(sim)
+    S, T = surface_slice(child.tracers.S), surface_slice(child.tracers.T)
+    h, ℵ = ice_slice(sea_ice.model.ice_thickness), ice_slice(sea_ice.model.ice_concentration)
+    day  = time(sim) / 86400
+    S̄, T̄ = weighted_mean(S, health_w), weighted_mean(T, health_w)
+
+    if isempty(HEALTH_STATE)
+        HEALTH_STATE[:S₀], HEALTH_STATE[:T₀] = S̄, T̄
+        HEALTH_STATE[:S], HEALTH_STATE[:T] = S, T
+        return nothing
+    end
+
+    ΔS = abs.(S .- HEALTH_STATE[:S]) .* health_wet
+    ΔT = abs.(T .- HEALTH_STATE[:T]) .* health_wet
+    HEALTH_STATE[:S], HEALTH_STATE[:T] = S, T
+
+    Sw = ifelse.(health_wet, S, NaN); Tw = ifelse.(health_wet, T, NaN)
+    lo(X) = argmin(map(x -> isnan(x) ? Inf : x, X))     # CartesianIndex of the wet minimum
+    hi(X) = argmax(map(x -> isnan(x) ? -Inf : x, X))
+    kSmin, kSmax, kTmin, kTmax = lo(Sw), hi(Sw), lo(Tw), hi(Tw)
+    kΔS, kΔT, kh = argmax(ΔS), argmax(ΔT), argmax(h)
+    nΔS, nΔT     = count(>(HEALTH_ΔS_CELL), ΔS), count(>(HEALTH_ΔT_CELL), ΔT)
+    ice_area     = weighted_mean(ℵ, health_w)
+    ice_volume   = weighted_mean(h .* ℵ, health_w)                       # m of ice, domain mean
+    ice_north    = sum(ℵ .* health_w .* health_north) / sum(health_w .* health_north)
+
+    @info @sprintf("health day %.1f, Δt %.1f min | S %.2f-%.2f, mean %+.3f since start, max Δ %.2f (%d cells > %.1f) | T %.2f-%.2f, mean %+.2f, max Δ %.2f (%d > %.1f) | ice: area %.3f, volume %.3f m, max h %.1f m, north of %.0fS %.3f",
+                   day, sim.Δt / 60, S[kSmin], S[kSmax], S̄ - HEALTH_STATE[:S₀], ΔS[kΔS], nΔS, HEALTH_ΔS_CELL,
+                   T[kTmin], T[kTmax], T̄ - HEALTH_STATE[:T₀], ΔT[kΔT], nΔT, HEALTH_ΔT_CELL,
+                   ice_area, ice_volume, h[kh], -HEALTH_ICE_SOUTH, ice_north)
+
+    S[kSmin] < HEALTH_S_RANGE[1] && @warn "health: surface S below $(HEALTH_S_RANGE[1]) g/kg: $(where_is(S, kSmin))"
+    S[kSmax] > HEALTH_S_RANGE[2] && @warn "health: surface S above $(HEALTH_S_RANGE[2]) g/kg: $(where_is(S, kSmax))"
+    T[kTmin] < HEALTH_T_RANGE[1] && @warn "health: surface T below $(HEALTH_T_RANGE[1]) degC: $(where_is(T, kTmin))"
+    T[kTmax] > HEALTH_T_RANGE[2] && @warn "health: surface T above $(HEALTH_T_RANGE[2]) degC: $(where_is(T, kTmax))"
+    nΔS > HEALTH_JUMPERS && @warn "health: $nΔS surface cells changed S by > $(HEALTH_ΔS_CELL) g/kg since the last check; largest $(where_is(ΔS, kΔS))"
+    nΔT > HEALTH_JUMPERS && @warn "health: $nΔT surface cells changed T by > $(HEALTH_ΔT_CELL) degC since the last check; largest $(where_is(ΔT, kΔT))"
+    abs(S̄ - HEALTH_STATE[:S₀]) > HEALTH_DRIFT_S && @warn @sprintf("health: domain-mean surface S has drifted %+.3f g/kg since the start", S̄ - HEALTH_STATE[:S₀])
+    abs(T̄ - HEALTH_STATE[:T₀]) > HEALTH_DRIFT_T && @warn @sprintf("health: domain-mean surface T has drifted %+.2f degC since the start", T̄ - HEALTH_STATE[:T₀])
+    ice_north > HEALTH_ICE_ℵ && @warn @sprintf("health: mean ice concentration north of %.0fS is %.3f; there should be almost none", -HEALTH_ICE_SOUTH, ice_north)
+    h[kh] > 10 && @warn "health: thickest ice is $(where_is(h, kh)) (m); the run stops at $(ICE_MAX_THICKNESS) m"
+    return nothing
+end
+simulation.callbacks[:health] = Callback(health_check, TimeInterval(output_interval))
+
 # ── output ────────────────────────────────────────────────────────────────────────────────────
 # The same four files src/model.jl writes, with the same names, fields, cadences and global
 # attributes, so tools/animate_simulation.jl and the analysis tools read both runs alike:
