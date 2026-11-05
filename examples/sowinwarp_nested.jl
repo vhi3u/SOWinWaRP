@@ -8,7 +8,8 @@
 #
 # END_DATE can be any time up to 2016-12-31T22:00 (the ERA5 converted so far covers 2014-2016).
 # OUTPUT follows src/model.jl, so `./run_animate_simulation RUN_NAME` works on it unchanged:
-# RUN_NAME_surface.nc, _midlon.nc, _free_surface.nc and _eke.nc in the working directory.
+# RUN_NAME_surface.nc, _midlon.nc, _free_surface.nc and _eke.nc in the working directory, plus
+# _sea_ice.nc (h, ℵ, snow, ice u/v daily).
 # RUN_NAME defaults to nested_smoke or nested_<start>_<end>, so runs do not overwrite each other.
 #
 # RUN examples/nested_probe.jl FIRST. This script needs BSOSEMonthly to satisfy the parent
@@ -33,12 +34,16 @@
 #
 # TWO THINGS TO DECIDE BEFORE READING ANY RESULT:
 #
-#   1. NO SEA ICE. `OceanOnlyModel` is ocean-only, and ERA5 gives ATMOSPHERIC state, not the
-#      post-ice ocean fluxes B-SOSE's TFLUX/SFLUX carry. Over 70-45S that deletes the brine
-#      rejection that makes Winter Water -- the variable this project exists to study. At
-#      Bouvet (~54S, largely ice-free) it is fine; here it is not. The branch has
-#      `OceanSeaIceModel(ocean, sea_ice; atmosphere, radiation)`; going there means ClimaSeaIce.
-#      This script is ocean-only ON PURPOSE, as the first thing to get running, NOT as physics.
+#   1. SEA ICE, STARTED FROM NONE. `OceanSeaIceModel` with ClimaSeaIce through NumericalEarth's
+#      `sea_ice_simulation`, on the child's grid, all defaults: slab ice + snow, ice salinity 4 g/kg
+#      (B-SOSE implies 4.1), EVP dynamics, no-slip coasts, three-equation ice-ocean heat flux. The
+#      nest's ocean coupling forwards to the child (NestedModels/nested_component.jl), so the ice
+#      sees the child ocean. B-SOSE's SIarea/SIheff are not wired into setup_bsose.jl, so the ice
+#      starts at zero on 1 June and forms over the first days from near-freezing coastal water;
+#      read the first week of the coastal band with that in mind. The ice has no open boundaries:
+#      none enters from the Ross or Weddell sides, and the side walls hold it at the coast.
+#      The ocean-only runs (2Y_nested_test, 2Y_nested_bsosez) had none of this. Their coast went
+#      warm and salty every summer, with nothing melting into it: the missing sea-ice cycle.
 #
 #   2. STATIC Z ON B-SOSE'S OWN LEVELS. The 52 levels of B-SOSE iteration 156 (4.2 m at the
 #      surface to 400 m, 6000 m), not mutable. The parent's state then lands on the child level
@@ -176,7 +181,11 @@ atmosphere = ERA5PrescribedAtmosphere(ARCH; dataset = era5_dataset, start_date =
 radiation  = ERA5PrescribedRadiation(ARCH; dataset = era5_dataset, start_date = era5_start, end_date = era5_end,
                                      region = era5_region, dir = era5_dir)
 
-coupled_model = OceanOnlyModel(ocean; atmosphere, radiation)      # see note 1 in the header
+# ── sea ice: see note 1 in the header ─────────────────────────────────────────────────────────
+# On the child's grid, so ice and ocean share cells and the exchange grid is the child's own.
+sea_ice = sea_ice_simulation(child.grid, ocean; advection = WENO(order = 5))
+
+coupled_model = OceanSeaIceModel(ocean, sea_ice; atmosphere, radiation)
 
 # ── stepping and progress, as src/model.jl ────────────────────────────────────────────────────
 # Start with a very small Δt so the first CATKE evaluation is numerically gentle;
@@ -195,7 +204,9 @@ simulation.callbacks[:wizard] = Callback(wizard, IterationInterval(10))
 
 # Fail loudly and early on NaN: every field, every step, and throw (see src/model.jl).
 simulation.callbacks[:nan_checker] =
-    Callback(NaNChecker(fields = merge(child.velocities, child.tracers), erroring = true),
+    Callback(NaNChecker(fields = merge(child.velocities, child.tracers,
+                                       (; h = sea_ice.model.ice_thickness, ℵ = sea_ice.model.ice_concentration)),
+                        erroring = true),
              IterationInterval(1))
 
 # Oceanostics' TimedMessenger, as src/model.jl's BSOSE path uses. It reads velocities, the closure
@@ -238,6 +249,7 @@ output_metadata = Dict("run_name" => RUN_NAME,
     "dataset" => "BSOSE",
     "boundaries" => "one-way nest in B-SOSE (NumericalEarth nested_ocean_simulation)",
     "atmosphere" => "ERA5 (NCAR ds633.0), $(era5_pressure)",
+    "sea_ice" => "ClimaSeaIce via sea_ice_simulation defaults, started ice-free",
     "vertical_coordinate" => "static z, B-SOSE i156's 52 levels")
 
 ocean.output_writers[:surface] = NetCDFWriter(
@@ -301,7 +313,22 @@ ocean.output_writers[:eke] = NetCDFWriter(
     overwrite_files=true
 )
 
-@info "output: $(RUN_NAME)_{surface,midlon,free_surface,eke}.nc in $(pwd())"
+# Sea ice, daily: thickness, concentration, snow and the ice velocities
+sea_ice_outputs = merge((; h = sea_ice.model.ice_thickness,
+                           ℵ = sea_ice.model.ice_concentration,
+                           hs = sea_ice.model.snow_thickness),
+                        sea_ice.model.velocities)
+
+sea_ice.output_writers[:sea_ice] = NetCDFWriter(
+    sea_ice.model,
+    sea_ice_outputs,
+    filename="$(RUN_NAME)_sea_ice.nc",
+    schedule=TimeInterval(output_interval),
+    global_attributes=output_metadata,
+    overwrite_files=true
+)
+
+@info "output: $(RUN_NAME)_{surface,midlon,free_surface,eke,sea_ice}.nc in $(pwd())"
 
 @info "starting"
 run!(simulation)
