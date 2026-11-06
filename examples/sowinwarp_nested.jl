@@ -44,7 +44,7 @@
 #      read the first week of the coastal band with that in mind. The ice model's sides are walls,
 #      so ice is deleted in the 4-cell relaxation band along the open W, E and N sides every step
 #      (it leaves, as it would); none enters from outside. The wizard also limits Δt on the ICE
-#      speed, and a run stops if any ice passes 50 m. 2Y_nested_seaice_full had none of these
+#      speed, and a run stops if the ice volume h·ℵ passes 50 m. 2Y_nested_seaice_full had none of these
 #      three: its ice piled against the east edge from day 110 and grew to 10⁶ m.
 #      The ocean-only runs (2Y_nested_test, 2Y_nested_bsosez) had none of this. Their coast went
 #      warm and salty every summer, with nothing melting into it: the missing sea-ice cycle.
@@ -67,6 +67,7 @@ using NumericalEarth.DataWrangling: metadata_path
 using Oceananigans
 using Oceananigans.Units
 using Oceananigans.Diagnostics: NaNChecker
+using Oceananigans.BoundaryConditions: fill_halo_regions!
 using Oceanostics.ProgressMessengers: TimedMessenger
 using NCDatasets      # loads Oceananigans' NetCDFWriter
 using Dates, Printf
@@ -126,6 +127,33 @@ bottom_height = regrid_bathymetry(underlying_grid;
                                   minimum_depth = 10,
                                   interpolation_passes = 5,
                                   major_basins = 1)
+
+# Fill dead-end pockets: an ocean column with land on 3 or 4 of its 4 sides becomes land, repeated
+# until none is left, so one-cell inlets close from their dead end outward. 2Y_nested_seaice_fix1
+# had one at 142.6E 67.1S (i = 316, j = 18): 10 m deep (minimum_depth), open only to the north,
+# under a polynya. Ice formed there all the time and its brine could neither sink nor mix out, so
+# the surface went from 34.5 to 46 g/kg in 26 days. Off the grid counts as OCEAN, so the open
+# sides are never filled. Land is written as 0, which the immersed boundary treats as dry.
+function fill_dead_end_pockets!(bottom_height)
+    z = Array(interior(bottom_height))[:, :, 1]
+    nx, ny = size(z)
+    land(i, j) = 1 <= i <= nx && 1 <= j <= ny && z[i, j] >= 0
+    filled = 0
+    while true
+        pockets = [(i, j) for i in 1:nx, j in 1:ny
+                   if z[i, j] < 0 && count((land(i-1, j), land(i+1, j), land(i, j-1), land(i, j+1))) >= 3]
+        isempty(pockets) && break
+        for (i, j) in pockets
+            z[i, j] = 0
+        end
+        filled += length(pockets)
+    end
+    set!(bottom_height, reshape(z, nx, ny, 1))
+    fill_halo_regions!(bottom_height)
+    return filled
+end
+
+@info "bathymetry: $(fill_dead_end_pockets!(bottom_height)) dead-end pocket cells filled"
 
 grid = ImmersedBoundaryGrid(underlying_grid,
                             PartialCellBottom(bottom_height; minimum_fractional_cell_height = 0.2);
@@ -253,17 +281,19 @@ function remove_edge_ice!(_)
 end
 simulation.callbacks[:remove_edge_ice] = Callback(remove_edge_ice!, IterationInterval(1))
 
-# Thickness can run away without ever going NaN (the NaN checker did not fire on 2Y_nested_seaice_full,
-# whose ice reached 10⁶ m). No real Antarctic ice is 50 m thick, so stop there.
-const ICE_MAX_THICKNESS = 50
-function check_ice_thickness(sim)
-    h_max = maximum(sea_ice.model.ice_thickness)
-    h_max > ICE_MAX_THICKNESS &&
-        error(@sprintf("sea ice %.1f m thick at t = %.2f days, iteration %d: the ice is blowing up",
-                       h_max, time(sim) / 86400, iteration(sim)))
+# Ice can run away without ever going NaN (the NaN checker did not fire on 2Y_nested_seaice_full,
+# whose ice reached 10⁶ m). Watched as VOLUME per unit area, h·ℵ: h alone is the thickness of the
+# ice that is there, and at the ice edge a cell with ℵ ≈ 0 can carry a meaningless h (21.6 m at
+# ℵ = 0.000 on day 22 of 2Y_nested_seaice_fix1). No real Antarctic ice holds 50 m per square metre.
+const ICE_MAX_VOLUME = 50
+function check_ice_volume(sim)
+    v_max = maximum(interior(sea_ice.model.ice_thickness) .* interior(sea_ice.model.ice_concentration))
+    v_max > ICE_MAX_VOLUME &&
+        error(@sprintf("sea ice volume %.1f m (h·ℵ) at t = %.2f days, iteration %d: the ice is blowing up",
+                       v_max, time(sim) / 86400, iteration(sim)))
     return nothing
 end
-simulation.callbacks[:ice_thickness] = Callback(check_ice_thickness, IterationInterval(10))
+simulation.callbacks[:ice_volume] = Callback(check_ice_volume, IterationInterval(10))
 
 # Oceanostics' TimedMessenger, as src/model.jl's BSOSE path uses. It reads velocities, the closure
 # and the CFL numbers off `simulation.model`, and the coupled model has none of them -- which is
@@ -286,7 +316,7 @@ simulation.callbacks[:progress] = Callback(sim -> progress(ChildView(sim)), Time
 # 2Y_nested_seaice_full went wrong for months without a NaN, and the surface only showed it ~130
 # days after the ice did. This prints, once per output interval, the numbers that would have shown
 # it: surface S and T ranges, the largest change since the last check, the domain-mean drift since
-# the start, and the ice. It never stops the run (the NaN checker and the 50 m ice guard do that).
+# the start, and the ice. It never stops the run (the NaN checker and the 50 m ice-volume guard do that).
 #
 # Cheap by construction: the top level and the ice are copied to the CPU (about 2 MB) once per
 # interval and summarised there, a few ms against the tens of seconds a model day takes.
@@ -338,16 +368,17 @@ function health_check(sim)
     lo(X) = argmin(map(x -> isnan(x) ? Inf : x, X))     # CartesianIndex of the wet minimum
     hi(X) = argmax(map(x -> isnan(x) ? -Inf : x, X))
     kSmin, kSmax, kTmin, kTmax = lo(Sw), hi(Sw), lo(Tw), hi(Tw)
-    kΔS, kΔT, kh = argmax(ΔS), argmax(ΔT), argmax(h)
+    hℵ = h .* ℵ
+    kΔS, kΔT, kv = argmax(ΔS), argmax(ΔT), argmax(hℵ)
     nΔS, nΔT     = count(>(HEALTH_ΔS_CELL), ΔS), count(>(HEALTH_ΔT_CELL), ΔT)
     ice_area     = weighted_mean(ℵ, health_w)
-    ice_volume   = weighted_mean(h .* ℵ, health_w)                       # m of ice, domain mean
+    ice_volume   = weighted_mean(hℵ, health_w)                           # m of ice, domain mean
     ice_north    = sum(ℵ .* health_w .* health_north) / sum(health_w .* health_north)
 
-    @info @sprintf("health day %.1f, Δt %.1f min | S %.2f-%.2f, mean %+.3f since start, max Δ %.2f (%d cells > %.1f) | T %.2f-%.2f, mean %+.2f, max Δ %.2f (%d > %.1f) | ice: area %.3f, volume %.3f m, max h %.1f m, north of %.0fS %.3f",
+    @info @sprintf("health day %.1f, Δt %.1f min | S %.2f-%.2f, mean %+.3f since start, max Δ %.2f (%d cells > %.1f) | T %.2f-%.2f, mean %+.2f, max Δ %.2f (%d > %.1f) | ice: area %.3f, volume %.3f m, max h·ℵ %s m, north of %.0fS %.3f",
                    day, sim.Δt / 60, S[kSmin], S[kSmax], S̄ - HEALTH_STATE[:S₀], ΔS[kΔS], nΔS, HEALTH_ΔS_CELL,
                    T[kTmin], T[kTmax], T̄ - HEALTH_STATE[:T₀], ΔT[kΔT], nΔT, HEALTH_ΔT_CELL,
-                   ice_area, ice_volume, h[kh], -HEALTH_ICE_SOUTH, ice_north)
+                   ice_area, ice_volume, where_is(hℵ, kv), -HEALTH_ICE_SOUTH, ice_north)
 
     S[kSmin] < HEALTH_S_RANGE[1] && @warn "health: surface S below $(HEALTH_S_RANGE[1]) g/kg: $(where_is(S, kSmin))"
     S[kSmax] > HEALTH_S_RANGE[2] && @warn "health: surface S above $(HEALTH_S_RANGE[2]) g/kg: $(where_is(S, kSmax))"
@@ -358,7 +389,7 @@ function health_check(sim)
     abs(S̄ - HEALTH_STATE[:S₀]) > HEALTH_DRIFT_S && @warn @sprintf("health: domain-mean surface S has drifted %+.3f g/kg since the start", S̄ - HEALTH_STATE[:S₀])
     abs(T̄ - HEALTH_STATE[:T₀]) > HEALTH_DRIFT_T && @warn @sprintf("health: domain-mean surface T has drifted %+.2f degC since the start", T̄ - HEALTH_STATE[:T₀])
     ice_north > HEALTH_ICE_ℵ && @warn @sprintf("health: mean ice concentration north of %.0fS is %.3f; there should be almost none", -HEALTH_ICE_SOUTH, ice_north)
-    h[kh] > 10 && @warn "health: thickest ice is $(where_is(h, kh)) (m); the run stops at $(ICE_MAX_THICKNESS) m"
+    hℵ[kv] > 10 && @warn "health: most ice is $(where_is(hℵ, kv)) (m of h·ℵ); the run stops at $(ICE_MAX_VOLUME) m"
     return nothing
 end
 simulation.callbacks[:health] = Callback(health_check, TimeInterval(output_interval))
