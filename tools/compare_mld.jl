@@ -3,6 +3,7 @@
 #
 #     RUN=wind_fw_sw julia --project=. tools/compare_mld.jl
 #     RUN=2Y_wind_fw_sw MONTHS=8,9,10 julia --project=. tools/compare_mld.jl
+#     RUN=2Y_nested_seaice_fix3 MONTHS=6,7,8,9,10 julia --project=. tools/compare_mld.jl
 #
 # WHY. The summer salinity bias and the pre-shortwave-split warm band both sit in the seasonal
 # ice zone, and both are what you would expect from a mixed layer that is too shallow: the same
@@ -14,7 +15,10 @@
 #                       model writes. Gives the MLD MAP.
 #     <RUN>_midlon.nc   daily, full depth, one meridian. Gives the MLD SECTION, and the
 #                       Jensen check below.
-# It will run with either alone and says which figures it is skipping.
+# It will run with either alone and says which figures it is skipping. The vertical levels and
+# the sea floor come from those files too (z_aac/z_aaf or r_aac/r_aaf, inactive_nodes_ccc or
+# bottom_height), so a run on any grid -- src/model.jl or examples/sowinwarp_nested.jl -- is
+# compared at its own depths, and B-SOSE is regridded onto them.
 #
 # MLD OF A MEAN IS NOT A MEAN OF MLDs. B-SOSE's monthly record is a monthly MEAN of T and S,
 # so `mld(B-SOSE monthly)` is "the mixed layer of the monthly-mean state". To compare like with
@@ -99,29 +103,98 @@ end
 const RUN_END = START + Second(round(Int, run_seconds))
 @info "run window: $START to $RUN_END"
 
+# The vertical levels and the sea floor are READ OFF THE OUTPUT, so the depths match the run:
+# src/model.jl's stretched static z (full cells), examples/sowinwarp_nested.jl's 52 B-SOSE
+# levels (partial cells, pocket fill), a z-star run's reference levels. This script used to
+# rebuild src/model.jl's grid for every run, which put a nested run's T and S on the wrong
+# depths with no error. The rebuild is kept only for a file that carries neither.
 SCALING = 6
-z = ReferenceToStretchedDiscretization(; extent = Z_EXTENT, constant_spacing = DZ_SURFACE,
-                                       maximum_spacing = DZ_BOTTOM,
-                                       constant_spacing_extent = Z_CONST,
-                                       stretching = PowerLawStretching(1.12))
-Nx, Ny, Nz = Int(SCALING * (λ₂ - λ₁)), Int(SCALING * (φ₂ - φ₁)), length(z)
+Nx, Ny = Int(SCALING * (λ₂ - λ₁)), Int(SCALING * (φ₂ - φ₁))
+geom_path = has_eke ? eke_path : sect_path
+
+"""Cell centres and faces of the vertical grid, from `z_aac`/`z_aaf` (static z) or `r_aac`/`r_aaf` (z-star)."""
+function file_levels(ds)
+    for (c, f) in (("z_aac", "z_aaf"), ("r_aac", "r_aaf"))
+        haskey(ds, c) && haskey(ds, f) && return Float64.(ds[c][:]), Float64.(ds[f][:]), c
+    end
+    return nothing
+end
+
+"""Deepest wet index per column, from the model's own mask if the file has it, else from `bottom_height`."""
+function file_kbot(ds, zc, zf)
+    if haskey(ds, "inactive_nodes_ccc")
+        A = ds["inactive_nodes_ccc"][:, :, :]
+        return [findfirst(k -> A[i, j, k] == 0, axes(A, 3)) for i in axes(A, 1), j in axes(A, 2)],
+               "inactive_nodes_ccc"
+    elseif haskey(ds, "bottom_height")
+        b = Float64.(coalesce.(ds["bottom_height"][:, :], NaN))
+        kind = try ds.group["grid_reconstruction_metadata"].attrib["immersed_boundary_type"] catch; "" end
+        # PartialCellBottom keeps the cell the floor cuts through; GridFittedBottom drops it
+        # unless its centre is above the floor.
+        wet(k, h) = occursin("Partial", kind) ? zf[k + 1] > h : zc[k] > h
+        return [isfinite(b[i, j]) && b[i, j] < 0 ? findfirst(k -> wet(k, b[i, j]), eachindex(zc)) : nothing
+                for i in axes(b, 1), j in axes(b, 2)],
+               "bottom_height ($(isempty(kind) ? "full cells assumed" : kind))"
+    end
+    return nothing
+end
+
+geom   = Dataset(geom_path)
+levels = file_levels(geom)
+floor  = levels === nothing ? nothing : file_kbot(geom, levels[1], levels[2])
+close(geom)
+
+if levels === nothing || floor === nothing
+    @warn "$geom_path carries no vertical levels or sea floor: rebuilding src/model.jl's grid. " *
+          "That is only right for a src/model.jl run."
+    z = ReferenceToStretchedDiscretization(; extent = Z_EXTENT, constant_spacing = DZ_SURFACE,
+                                           maximum_spacing = DZ_BOTTOM,
+                                           constant_spacing_extent = Z_CONST,
+                                           stretching = PowerLawStretching(1.12))
+    fitted = LatitudeLongitudeGrid(CPU(); size = (Nx, Ny, length(z)), longitude = (λ₁, λ₂),
+                                   latitude = (φ₁, φ₂), z, halo = (7, 7, 7))
+    bottom = regrid_bathymetry(fitted; height_above_water = 1, minimum_depth = 10,
+                               interpolation_passes = 5)
+    fix_boundary_topography!(bottom, fitted; minimum_boundary_depth = 100)
+    fitted = ImmersedBoundaryGrid(fitted, GridFittedBottom(bottom))
+    zc = Array(znodes(fitted, Center())); zf = Array(znodes(fitted, Face()))
+    kbot_model = [findfirst(k -> !immersed_cell(i, j, k, fitted), eachindex(zc)) for i in 1:Nx, j in 1:Ny]
+    @info "levels and sea floor: rebuilt src/model.jl grid"
+else
+    zc, zf, zname = levels
+    kbot_model, floor_source = floor
+    @info "levels and sea floor from $(basename(geom_path)): $(length(zc)) levels ($zname), " *
+          "$(round(-zc[end], digits = 1)) m top centre, sea floor from $floor_source"
+end
+Nz = length(zc)
+
 nxf === nothing || nxf == Nx ||
     error("grid mismatch: $(RUN)_eke.nc is $(nxf) wide but a 1/$(SCALING) deg grid is $Nx")
+size(kbot_model, 2) == Ny ||
+    error("grid mismatch: the sea floor in $(basename(geom_path)) is $(size(kbot_model, 2)) rows, not $Ny")
 
+# B-SOSE is regridded onto the RUN's levels, so both sides are compared at the same depths
+# (exactly B-SOSE's own levels for a nested run).
 grid = LatitudeLongitudeGrid(CPU(); size = (Nx, Ny, Nz), longitude = (λ₁, λ₂),
-                             latitude = (φ₁, φ₂), z, halo = (7, 7, 7))
-bottom = regrid_bathymetry(grid; height_above_water = 1, minimum_depth = 10,
-                           interpolation_passes = 5)
-fix_boundary_topography!(bottom, grid; minimum_boundary_depth = 100)
-grid = ImmersedBoundaryGrid(grid, GridFittedBottom(bottom))
+                             latitude = (φ₁, φ₂), z = zf, halo = (7, 7, 7))
 
 λc = Array(λnodes(grid, Center())); φc = Array(φnodes(grid, Center()))
-zc = Array(znodes(grid, Center())); MID = div(Nx, 2)
-const SECT_LON = λ₁ + (MID - 0.5) / SCALING
 
-# Deepest wet index per column, in each grid. Everything below it is rock, and `mld` must not
-# search into it -- see the note in tools/mld.jl.
-kbot_model = [findfirst(k -> !immersed_cell(i, j, k, grid), 1:Nz) for i in 1:Nx, j in 1:Ny]
+# The section's column, from the writer's own indices attribute, e.g. "(180:180, 1:150, 1:52)"
+function section_column()
+    has_sect || return div(Nx, 2)
+    d = Dataset(sect_path)
+    s = haskey(d["T"].attrib, "indices") ? string(d["T"].attrib["indices"]) : ""
+    close(d)
+    m = match(r"^\(\s*(\d+)\s*:", s)
+    return m === nothing ? div(Nx, 2) : parse(Int, m[1])
+end
+const MID = section_column()
+const SECT_LON = λc[MID]
+
+# Deepest wet index per column. Everything below it is rock, and `mld` must not search into it
+# -- see the note in tools/mld.jl. A sea floor read from a section file is one column wide.
+size(kbot_model, 1) == 1 && (kbot_model = repeat(kbot_model, Nx, 1))
 dataset    = BSOSEMonthly(iteration = 156)
 pdepth     = bsose_depth(dataset, λc, φc)
 kbot_par   = [d <= 0 ? nothing : findfirst(k -> -zc[k] <= d, 1:Nz) for d in pdepth]
@@ -162,6 +235,7 @@ paired  = String[]
 
 if has_eke
     ds = Dataset(eke_path)
+    size(ds["T"], 3) == Nz || error("$(RUN)_eke.nc has $(size(ds["T"], 3)) levels, the grid $Nz")
     t  = Float64.(ds["time"][:])
     # The window length is carried on the file precisely so this does not have to be guessed;
     # an AveragedTimeInterval record is stamped at the END of its window.
@@ -199,6 +273,7 @@ sec_lat     = Float64[]
 
 if has_sect
     ds = Dataset(sect_path)
+    size(ds["T"], 3) == Nz || error("$(RUN)_midlon.nc has $(size(ds["T"], 3)) levels, the grid $Nz")
     t  = Float64.(ds["time"][:])
     dts = [START + Second(round(Int, s)) for s in t]
     kb_sec  = [kbot_model[MID, j] for j in 1:Ny]
