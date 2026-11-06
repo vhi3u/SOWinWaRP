@@ -11,6 +11,7 @@
 # RUN_NAME_surface.nc, _midlon.nc, _free_surface.nc and _eke.nc in the working directory, plus
 # _sea_ice.nc (h, ℵ, snow, ice u/v daily).
 # RUN_NAME defaults to nested_smoke or nested_<start>_<end>, so runs do not overwrite each other.
+# A checkpoint every 365 days and at the end; PICKUP=1 continues RUN_NAME from the latest one.
 #
 # RUN examples/nested_probe.jl FIRST. This script needs BSOSEMonthly to satisfy the parent
 # dataset interface; the probe says whether it does and what is missing. Starting here instead
@@ -73,6 +74,7 @@ using Dates, Printf
 include(joinpath(@__DIR__, "..", "src", "setup_bsose.jl"))   # BSOSEMonthly and its file map
 
 const SMOKE = get(ENV, "SMOKE", "0") == "1"
+const PICKUP = get(ENV, "PICKUP", "0") == "1"   # continue RUN_NAME from its latest checkpoint; see "checkpoints"
 const ARCH  = get(ENV, "ARCH", "GPU") == "CPU" ? CPU() : GPU()
 ARCH isa GPU && !CUDA.functional() &&
     (CUDA.functional(true); error("CUDA is not functional on this node. Check the GPU allocation, or set ARCH=CPU."))
@@ -394,7 +396,7 @@ ocean.output_writers[:surface] = NetCDFWriter(
     schedule=TimeInterval(output_interval),
     indices=(:, :, Nz),
     global_attributes=output_metadata,
-    overwrite_files=true
+    overwrite_files=!PICKUP
 )
 
 mid_lon_idx = div(Nx, 2)
@@ -405,7 +407,7 @@ ocean.output_writers[:mid_lon] = NetCDFWriter(
     schedule=TimeInterval(output_interval),
     indices=(mid_lon_idx, :, :),
     global_attributes=output_metadata,
-    overwrite_files=true
+    overwrite_files=!PICKUP
 )
 
 # η lives at (Center, Center, Face) on a single level, which NetCDFWriter cannot write
@@ -418,7 +420,7 @@ ocean.output_writers[:free_surface] = NetCDFWriter(
     filename="$(RUN_NAME)_free_surface.nc",
     schedule=TimeInterval(output_interval),
     global_attributes=output_metadata,
-    overwrite_files=true
+    overwrite_files=!PICKUP
 )
 
 # Co-located velocities, squared after interpolating (see src/model.jl's EKE block). T and S
@@ -445,7 +447,7 @@ ocean.output_writers[:eke] = NetCDFWriter(
     schedule=AveragedTimeInterval(EKE_WINDOW, window=EKE_WINDOW, stride=EKE_STRIDE),
     indices=(:, :, :),
     global_attributes=eke_metadata,
-    overwrite_files=true
+    overwrite_files=!PICKUP
 )
 
 # Sea ice, daily: thickness, concentration, snow and the ice velocities
@@ -460,11 +462,29 @@ sea_ice.output_writers[:sea_ice] = NetCDFWriter(
     filename="$(RUN_NAME)_sea_ice.nc",
     schedule=TimeInterval(output_interval),
     global_attributes=output_metadata,
-    overwrite_files=true
+    overwrite_files=!PICKUP
 )
 
 @info "output: $(RUN_NAME)_{surface,midlon,free_surface,eke,sea_ice}.nc in $(pwd())"
 
+# ── checkpoints ───────────────────────────────────────────────────────────────────────────────
+# Oceananigans' Checkpointer on the coupled simulation: the ocean child (the nest's parent is data,
+# reread on restart), the ice, the atmosphere's clock, the interfaces, and every writer's and
+# schedule's own state, so on pickup the NetCDF files are APPENDED to (overwrite_files = !PICKUP
+# above) and the 30-day EKE window resumes where it was. Every CHECKPOINT_DAYS (365; 1 in smoke
+# mode), and once more at the end, so a finished run can also be extended by raising END_DATE.
+# Files: RUN_NAME_checkpoint_iteration<N>.jld2 in the working directory, all kept.
+#
+#     PICKUP=1 RUN_NAME=... END_DATE=... julia --project=. examples/sowinwarp_nested.jl
+#
+# On pickup, Δt restarts at 1 s and the wizard ramps it back up (a few hundred iterations), and the
+# health check takes its drift baseline from the pickup time, not the original start.
+const CHECKPOINT_DAYS = parse(Float64, get(ENV, "CHECKPOINT_DAYS", SMOKE ? "1" : "365"))
+simulation.output_writers[:checkpointer] = Checkpointer(coupled_model;
+                                                        schedule = TimeInterval(CHECKPOINT_DAYS * days),
+                                                        prefix = "$(RUN_NAME)_checkpoint")
+
+PICKUP && @info "picking up $RUN_NAME from its latest checkpoint"
 @info "starting"
-run!(simulation)
+run!(simulation; pickup = PICKUP, checkpoint_at_end = true)
 @info "done"
