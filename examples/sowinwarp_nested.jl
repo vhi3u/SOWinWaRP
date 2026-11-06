@@ -36,8 +36,9 @@
 # TWO THINGS TO DECIDE BEFORE READING ANY RESULT:
 #
 #   1. SEA ICE, STARTED FROM NONE. `OceanSeaIceModel` with ClimaSeaIce through NumericalEarth's
-#      `sea_ice_simulation`, on the child's grid, all defaults: slab ice + snow, ice salinity 4 g/kg
-#      (B-SOSE implies 4.1), EVP dynamics, no-slip coasts, three-equation ice-ocean heat flux. The
+#      `sea_ice_simulation`, on the child's grid, defaults but for advection and coasts (below):
+#      slab ice + snow, ice salinity 4 g/kg (B-SOSE implies 4.1), EVP dynamics, three-equation
+#      ice-ocean heat flux. The
 #      nest's ocean coupling forwards to the child (NestedModels/nested_component.jl), so the ice
 #      sees the child ocean. B-SOSE's SIarea/SIheff are not wired into setup_bsose.jl, so the ice
 #      starts at zero on 1 June and forms over the first days from near-freezing coastal water;
@@ -46,6 +47,15 @@
 #      (it leaves, as it would); none enters from outside. The wizard also limits Δt on the ICE
 #      speed, and a run stops if the ice volume h·ℵ passes 50 m. 2Y_nested_seaice_full had none of these
 #      three: its ice piled against the east edge from day 110 and grew to 10⁶ m.
+#      The ice is advected by IncrementalRemapping, not WENO. ClimaSeaIce carries volume h·ℵ and ℵ
+#      separately and takes h = volume/ℵ; WENO reconstructs the two differently next to a thick
+#      cell, so outflow strips ℵ faster than volume, h inflates, and the ice strength
+#      (∝ h·exp(-20(1-ℵ))) collapses. 2Y_nested_seaice_fix2 died that way in a coastal corner at
+#      97.1E 65.1S: ℵ 0.71 → 0.14 in a day, h 54 m, then volume 7.7 → 30.9 m in two days.
+#      Remapping moves ℵ and volume across a face together, keeping h within the local range.
+#      The coasts are free-slip, MITgcm's default (SEAICE_no_slip = .FALSE.), not NumericalEarth's
+#      no-slip: that corner had land W and S, and no-slip held the ice still along both walls, so
+#      ice could leave only straight out N or E.
 #      The ocean-only runs (2Y_nested_test, 2Y_nested_bsosez) had none of this. Their coast went
 #      warm and salty every summer, with nothing melting into it: the missing sea-ice cycle.
 #
@@ -68,6 +78,7 @@ using Oceananigans
 using Oceananigans.Units
 using Oceananigans.Diagnostics: NaNChecker
 using Oceananigans.BoundaryConditions: fill_halo_regions!
+using NumericalEarth.SeaIces.ClimaSeaIce: IncrementalRemapping   # via NumericalEarth, not a direct dependency
 using Oceanostics.ProgressMessengers: TimedMessenger
 using NCDatasets      # loads Oceananigans' NetCDFWriter
 using Dates, Printf
@@ -216,7 +227,10 @@ radiation  = ERA5PrescribedRadiation(ARCH; dataset = era5_dataset, start_date = 
 
 # ── sea ice: see note 1 in the header ─────────────────────────────────────────────────────────
 # On the child's grid, so ice and ocean share cells and the exchange grid is the child's own.
-sea_ice = sea_ice_simulation(child.grid, ocean; advection = WENO(order = 5))
+# IncrementalRemapping needs the forward-Euler stepper (the sea_ice_simulation default), a halo of 2
+# and an ice Courant number below 1, which the wizard's ice CFL keeps.
+sea_ice = sea_ice_simulation(child.grid, ocean; advection = IncrementalRemapping(),
+                             lateral_boundary_condition = :free_slip)
 
 coupled_model = OceanSeaIceModel(ocean, sea_ice; atmosphere, radiation)
 
@@ -417,7 +431,7 @@ output_metadata = Dict("run_name" => RUN_NAME,
     "dataset" => "BSOSE",
     "boundaries" => "one-way nest in B-SOSE (NumericalEarth nested_ocean_simulation)",
     "atmosphere" => "ERA5 (NCAR ds633.0), $(era5_pressure)",
-    "sea_ice" => "ClimaSeaIce via sea_ice_simulation defaults, started ice-free",
+    "sea_ice" => "ClimaSeaIce via sea_ice_simulation defaults, IncrementalRemapping advection, free-slip coasts, started ice-free",
     "vertical_coordinate" => "static z, B-SOSE i156's 52 levels")
 
 ocean.output_writers[:surface] = NetCDFWriter(
