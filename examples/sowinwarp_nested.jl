@@ -35,16 +35,17 @@
 #
 # TWO THINGS TO DECIDE BEFORE READING ANY RESULT:
 #
-#   1. SEA ICE, STARTED FROM NONE. `OceanSeaIceModel` with ClimaSeaIce through NumericalEarth's
+#   1. SEA ICE, STARTED FROM B-SOSE. `OceanSeaIceModel` with ClimaSeaIce through NumericalEarth's
 #      `sea_ice_simulation`, on the child's grid, defaults but for advection and coasts (below):
 #      slab ice + snow, ice salinity 4 g/kg (B-SOSE implies 4.1), EVP dynamics, three-equation
 #      ice-ocean heat flux. The
 #      nest's ocean coupling forwards to the child (NestedModels/nested_component.jl), so the ice
-#      sees the child ocean. B-SOSE's SIarea/SIheff are not wired into setup_bsose.jl, so the ice
-#      starts at zero on 1 June and forms over the first days from near-freezing coastal water;
-#      read the first week of the coastal band with that in mind. The ice model's sides are walls,
-#      so ice is deleted in the 4-cell relaxation band along the open W, E and N sides every step
-#      (it leaves, as it would); none enters from outside. The wizard also limits Δt on the ICE
+#      sees the child ocean. The ice starts from B-SOSE's SIarea/SIheff on start_date (5-day files,
+#      read in this script, not through setup_bsose.jl), bare of snow. The ice model's sides are
+#      walls, so in the 4-cell relaxation band along the open W, E and N sides the ice is relaxed
+#      to B-SOSE's every step: ice leaves through the band and B-SOSE's ice enters from it.
+#      Up to fix3 the ice started at zero on 1 June and the band's ice was deleted, so all of it
+#      was frozen locally (ICE_INIT=none ICE_BOUNDARY=delete gives that back). The wizard also limits Δt on the ICE
 #      speed, and a run stops if the ice volume h·ℵ passes 50 m. 2Y_nested_seaice_full had none of these
 #      three: its ice piled against the east edge from day 110 and grew to 10⁶ m.
 #      The ice is advected by IncrementalRemapping, not WENO. ClimaSeaIce carries volume h·ℵ and ℵ
@@ -232,6 +233,141 @@ radiation  = ERA5PrescribedRadiation(ARCH; dataset = era5_dataset, start_date = 
 sea_ice = sea_ice_simulation(child.grid, ocean; advection = IncrementalRemapping(),
                              lateral_boundary_condition = :free_slip)
 
+# ── B-SOSE sea ice: the starting state and the open-side bands (note 1) ──────────────────────
+# SIarea is ℵ; SIheff is ice volume per unit area of CELL, i.e. h·ℵ, not h. Both come from the
+# 5-day files tools/ice_production.jl reads, <token>_bsoseI156_<year>_5day.nc in BSOSE_DIR, and
+# are regridded onto the child grid once, here, for the whole run. Snow is not in those files, so
+# the ice starts bare and the band ice carries no snow.
+const ICE_INIT     = get(ENV, "ICE_INIT", "bsose")       # "bsose", or "none" as up to fix3
+const ICE_BOUNDARY = get(ENV, "ICE_BOUNDARY", "bsose")   # "bsose", or "delete" as up to fix3
+ICE_INIT in ("bsose", "none") || error("ICE_INIT must be bsose or none, got $ICE_INIT")
+ICE_BOUNDARY in ("bsose", "delete") || error("ICE_BOUNDARY must be bsose or delete, got $ICE_BOUNDARY")
+const ICE_ℵ_MIN = 0.01   # less ice area than this counts as open water: h = volume/ℵ is noise there
+const ICE_FILL_CELLS = 6  # B-SOSE cells (~1 deg of longitude) searched for ocean to fill B-SOSE land
+
+bsose_ice_file(token, year) = joinpath(BDIR, "$(token)_bsoseI156_$(year)_5day.nc")
+
+"""
+    load_bsose_ice(first_date, last_date)
+
+B-SOSE ℵ and volume h·ℵ on the child grid, `(; dates, ℵ, V)` with `dates` the 5-day window
+CENTRES (a 5-day stamp is the END of its window; see tools/ice_production.jl) and `ℵ`, `V` of
+size (Nx, Ny, records). B-SOSE's land is first given the ice of its nearest B-SOSE ocean cell
+within ICE_FILL_CELLS, then the result is bilinear in longitude and latitude. Our coastline is
+not B-SOSE's (at 100E theirs lies ~1.5 degrees further north), and without the fill a child
+coastal cell over B-SOSE land would start with no ice at all. Child land, and ice of less than
+ICE_ℵ_MIN, become 0.
+"""
+function load_bsose_ice(first_date, last_date)
+    geometry = joinpath(BDIR, resolve_bsose_filename(BDIR, :surface_heat_flux, 156))
+    ds = NCDataset(geometry)
+    xc, yc = load_coord(ds, "XC", 1), load_coord(ds, "YC", 2)
+    iB = findall(x -> λ₁ - 1 <= x <= λ₂ + 1, xc)
+    jB = findall(y -> φ₁ - 1 <= y <= φ₂ + 1, yc)
+    iB, jB = minimum(iB):maximum(iB), minimum(jB):maximum(jB)
+    wetB = Float64.(coalesce.(ds["Depth"][iB, jB], 0.0)) .> 0
+    close(ds)
+    xs, ys = xc[iB], yc[jB]
+
+    # Each B-SOSE cell's source: itself if wet, else its nearest wet cell, else 0 (none in reach)
+    lin = LinearIndices(wetB)
+    source = zeros(Int, size(wetB))
+    for I in CartesianIndices(wetB)
+        best, distance = 0, Inf
+        for di in -ICE_FILL_CELLS:ICE_FILL_CELLS, dj in -ICE_FILL_CELLS:ICE_FILL_CELLS
+            J = I + CartesianIndex(di, dj)
+            (checkbounds(Bool, wetB, J) && wetB[J] && di^2 + dj^2 < distance) || continue
+            best, distance = lin[J], di^2 + dj^2
+        end
+        source[I] = best
+    end
+
+    # Child cell centres (the grid is uniform at 1/SCALING degree) and the 4-point stencil
+    λc = λ₁ .+ ((1:Nx) .- 0.5) ./ SCALING
+    φc = φ₁ .+ ((1:Ny) .- 0.5) ./ SCALING
+    bracket(s, x) = (a = clamp(searchsortedlast(s, x), 1, length(s) - 1);
+                     (a, clamp((x - s[a]) / (s[a+1] - s[a]), 0, 1)))
+    wet = Array(interior(bottom_height))[:, :, 1] .< 0
+    regrid(A) = [wet[i, j] ? stencil(A, bracket(xs, λc[i])..., bracket(ys, φc[j])...) : 0.0
+                 for i in 1:Nx, j in 1:Ny]
+    function stencil(A, a, wx, b, wy)
+        num = den = 0.0
+        for (di, w₁) in ((0, 1 - wx), (1, wx)), (dj, w₂) in ((0, 1 - wy), (1, wy))
+            s = source[a+di, b+dj]
+            s > 0 || continue
+            num += w₁ * w₂ * A[s]; den += w₁ * w₂
+        end
+        return den > 0 ? num / den : 0.0
+    end
+
+    unreached = count(wet .& (regrid(ones(size(wetB))) .== 0))
+    unreached > 0 && @warn "$unreached child ocean cells are over $ICE_FILL_CELLS B-SOSE cells from B-SOSE ocean: no B-SOSE ice there"
+
+    # The years the run needs, plus either neighbour that is on disk, so a run starting or ending
+    # within 2.5 days of New Year is still bracketed
+    years = [y for y in year(first_date)-1:year(last_date)+1
+             if year(first_date) <= y <= year(last_date) || isfile(bsose_ice_file("SIArea", y))]
+    dates, ℵs, Vs = DateTime[], Matrix{Float64}[], Matrix{Float64}[]
+    for y in years, (token, names, out) in (("SIArea", ("SIarea", "SIArea", "SIAREA"), ℵs), ("SIHeff", ("SIheff", "SIHeff", "SIHEFF"), Vs))
+        path = bsose_ice_file(token, y)
+        isfile(path) || error("$path not found: the B-SOSE 5-day $token files are needed for " *
+                              "ICE_INIT/ICE_BOUNDARY = bsose (or set both to none/delete)")
+        ds = NCDataset(path)
+        found = filter(n -> haskey(ds, n), names)
+        isempty(found) && error("no $(join(names, " or ")) in $path; it holds $(collect(keys(ds)))")
+        name = first(found)
+        A = Float64.(coalesce.(ds[name][iB, jB, :], 0.0))
+        token == "SIArea" && append!(dates, DateTime.(ds["time"][:]) .- Hour(60))   # stamp - 2.5 days
+        close(ds)
+        append!(out, [regrid(A[:, :, n]) for n in axes(A, 3)])
+    end
+    length(dates) == length(ℵs) == length(Vs) || error("SIArea and SIHeff hold different records")
+    issorted(dates) || error("B-SOSE ice records are out of order: $(first(dates)) .. $(last(dates))")
+    (first(dates) <= first_date && last(dates) >= last_date) ||
+        error("B-SOSE ice covers $(first(dates)) to $(last(dates)), not the run's $first_date to $last_date")
+
+    ℵ, V = stack(ℵs), stack(Vs)
+    for n in eachindex(ℵ)
+        open_water = !(ℵ[n] >= ICE_ℵ_MIN)
+        ℵ[n] = open_water ? 0.0 : min(ℵ[n], 1.0)
+        V[n] = open_water ? 0.0 : max(V[n], 0.0)
+    end
+    return (; dates, ℵ, V)
+end
+
+# ℵ and V at `date`, linear in time between the two window centres around it
+function bsose_ice_at(ice, date)
+    n = searchsortedlast(ice.dates, date)
+    1 <= n < length(ice.dates) || error("$date is outside the B-SOSE ice records")
+    w = (date - ice.dates[n]) / (ice.dates[n+1] - ice.dates[n])
+    return (1 - w) .* ice.ℵ[:, :, n] .+ w .* ice.ℵ[:, :, n+1],
+           (1 - w) .* ice.V[:, :, n] .+ w .* ice.V[:, :, n+1]
+end
+
+const BSOSE_ICE = (ICE_INIT == "bsose" || ICE_BOUNDARY == "bsose") ? load_bsose_ice(start_date, end_date) : nothing
+
+# Ice area and volume over the domain, to read against tools/plot_sea_ice.jl's series
+function ice_totals(ℵ, V)
+    A = [(6.371e6 * deg2rad(1 / SCALING))^2 * cosd(φ₁ + (j - 0.5) / SCALING) for i in 1:Nx, j in 1:Ny]
+    return sum(ℵ .* A) / 1e12, sum(V .* A) / 1e9   # 10⁶ km², km³
+end
+
+# Start from B-SOSE's ice on start_date, not from none. Starting ice-free on 1 June made the model
+# freeze a whole early winter's ice out of an ocean that B-SOSE had already balanced against that
+# ice, and fix3's interior surface salinity rose 34.04 → 34.20 in the first 50 days. A pickup
+# takes its ice from the checkpoint instead.
+if ICE_INIT == "bsose" && !PICKUP
+    ℵ₀, V₀ = bsose_ice_at(BSOSE_ICE, start_date)
+    h₀ = map((a, v) -> a >= ICE_ℵ_MIN ? v / a : 0.0, ℵ₀, V₀)
+    ℵ₀[h₀ .== 0] .= 0
+    set!(sea_ice.model.ice_concentration, reshape(ℵ₀, Nx, Ny, 1))
+    set!(sea_ice.model.ice_thickness, reshape(h₀, Nx, Ny, 1))
+    fill_halo_regions!(sea_ice.model.ice_concentration)
+    fill_halo_regions!(sea_ice.model.ice_thickness)
+    @info @sprintf("sea ice from B-SOSE on %s: area %.2f 10⁶ km², volume %.0f km³, h up to %.1f m",
+                   start_date, ice_totals(ℵ₀, V₀)..., maximum(h₀))
+end
+
 coupled_model = OceanSeaIceModel(ocean, sea_ice; atmosphere, radiation)
 
 # ── stepping and progress, as src/model.jl ────────────────────────────────────────────────────
@@ -273,14 +409,23 @@ simulation.callbacks[:nan_checker] =
                         erroring = true),
              IterationInterval(1))
 
-# ── ice leaves through the open sides ─────────────────────────────────────────────────────────
+# ── ice at the open sides ─────────────────────────────────────────────────────────────────────
 # The ocean's W, E and N sides are open, but the ice model's are walls: ice drifting west along
 # the coast piled against the west edge, ice carried east by the ACC against the east edge, and
 # the first runaway thickness in 2Y_nested_seaice_full started at the east edge (i = 360, day 110).
-# So the ice is removed in the band where the nest relaxes the ocean to B-SOSE (8/12 deg, 4 cells
-# here), every step: ice reaching an open side leaves the domain, as it would. Inside that band
-# the ocean is restored to B-SOSE on 6 hours, which absorbs the freshwater the deleted ice never
-# returns. No ice enters from outside either: B-SOSE's SIarea/SIheff are not wired in.
+# So the ice is taken in hand in the band where the nest relaxes the ocean to B-SOSE (8/12 deg,
+# 4 cells here), every step.
+#
+# ICE_BOUNDARY = bsose (the default): ℵ and volume h·ℵ are relaxed to B-SOSE's in that band, on
+# ICE_RELAXATION_HOURS (6, the nest's ocean relaxation). Ice piling against a side is drained
+# toward B-SOSE's, and ice drifts IN from the band where B-SOSE has it: the westward coastal drift
+# brings ice in across the east side, which deletion never could (fix3's East next band held half
+# the interior's ice). The relaxation edits the ice state directly, so it exchanges no heat, salt or
+# freshwater with the ocean, as ice arriving from or leaving for outside the domain would not.
+#
+# ICE_BOUNDARY = delete (up to fix3): the band's ice is set to zero. Ice leaves, none enters, and
+# ice frozen inside the band is deleted at once, its brine left behind (tools/check_edge_bands.jl:
+# fix3's bands salted 0.03-0.09 g/kg more each winter than the interior).
 const ICE_EDGE = 4
 const ICE_FIELDS = (sea_ice.model.ice_thickness, sea_ice.model.ice_concentration, sea_ice.model.snow_thickness)
 
@@ -293,7 +438,46 @@ function remove_edge_ice!(_)
     end
     return nothing
 end
-simulation.callbacks[:remove_edge_ice] = Callback(remove_edge_ice!, IterationInterval(1))
+
+const ICE_RELAXATION = parse(Float64, get(ENV, "ICE_RELAXATION_HOURS", "6")) * hours
+const ICE_TARGET_EVERY = 1hours   # B-SOSE's ice is 5-day means; refreshing hourly is plenty
+const ICE_BAND = on_architecture(ARCH, [i <= ICE_EDGE || i > Nx - ICE_EDGE || j > Ny - ICE_EDGE
+                                        for i in 1:Nx, j in 1:Ny])
+const ICE_TARGET_ℵ = on_architecture(ARCH, zeros(Nx, Ny))
+const ICE_TARGET_V = on_architecture(ARCH, zeros(Nx, Ny))
+const ICE_TARGET_TIME = Ref(-Inf)
+
+function refresh_ice_target!(t)
+    t - ICE_TARGET_TIME[] < ICE_TARGET_EVERY && return nothing
+    ℵ★, V★ = bsose_ice_at(BSOSE_ICE, start_date + Millisecond(round(Int, 1000t)))
+    copyto!(ICE_TARGET_ℵ, ℵ★)
+    copyto!(ICE_TARGET_V, V★)
+    ICE_TARGET_TIME[] = t
+    return nothing
+end
+
+@inline relaxed_area(ℵ, ℵ★, r) = (1 - r) * ℵ + r * ℵ★
+@inline function relaxed_thickness(h, ℵ, ℵ★, V★, r)
+    a = relaxed_area(ℵ, ℵ★, r)
+    return ifelse(a < ICE_ℵ_MIN, zero(h), ((1 - r) * h * ℵ + r * V★) / max(a, ICE_ℵ_MIN))
+end
+
+# One fused broadcast per field over the whole surface, changing only the band. h is updated
+# before ℵ because both use the old ℵ; snow goes where the ice does.
+function relax_edge_ice!(sim)
+    refresh_ice_target!(time(sim))
+    r = min(1.0, sim.Δt / ICE_RELAXATION)
+    h, ℵ, hs = (view(interior(f), :, :, 1) for f in ICE_FIELDS)
+    ℵ★, V★, band = ICE_TARGET_ℵ, ICE_TARGET_V, ICE_BAND
+    @. hs = ifelse(band & (relaxed_area(ℵ, ℵ★, r) < ICE_ℵ_MIN), zero(hs), hs)
+    @. h  = ifelse(band, relaxed_thickness(h, ℵ, ℵ★, V★, r), h)
+    @. ℵ  = ifelse(band, ifelse(relaxed_area(ℵ, ℵ★, r) < ICE_ℵ_MIN, zero(ℵ), relaxed_area(ℵ, ℵ★, r)), ℵ)
+    return nothing
+end
+
+simulation.callbacks[:edge_ice] = ICE_BOUNDARY == "bsose" ?
+    Callback(relax_edge_ice!, IterationInterval(1)) :
+    Callback(remove_edge_ice!, IterationInterval(1))
 
 # Ice can run away without ever going NaN (the NaN checker did not fire on 2Y_nested_seaice_full,
 # whose ice reached 10⁶ m). Watched as VOLUME per unit area, h·ℵ: h alone is the thickness of the
@@ -431,7 +615,10 @@ output_metadata = Dict("run_name" => RUN_NAME,
     "dataset" => "BSOSE",
     "boundaries" => "one-way nest in B-SOSE (NumericalEarth nested_ocean_simulation)",
     "atmosphere" => "ERA5 (NCAR ds633.0), $(era5_pressure)",
-    "sea_ice" => "ClimaSeaIce via sea_ice_simulation defaults, IncrementalRemapping advection, free-slip coasts, started ice-free",
+    "sea_ice" => "ClimaSeaIce via sea_ice_simulation defaults, IncrementalRemapping advection, free-slip coasts, " *
+                 (ICE_INIT == "bsose" ? "started from B-SOSE SIarea/SIheff" : "started ice-free") * ", " *
+                 (ICE_BOUNDARY == "bsose" ? "open-side bands relaxed to B-SOSE ice on $(ICE_RELAXATION / hours) h" :
+                                            "open-side bands ice deleted"),
     "vertical_coordinate" => "static z, B-SOSE i156's 52 levels")
 
 ocean.output_writers[:surface] = NetCDFWriter(

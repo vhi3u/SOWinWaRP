@@ -137,7 +137,7 @@ println()
 # ── figure 1: the groups over time ───────────────────────────────────────────────────────────
 mkpath(OUTDIR)
 fig = Figure(fontsize = 14)
-Label(fig[0, 1], @sprintf("%s: edge bands vs interior, %.0f-%.0fS (edge band = %d columns, ice deleted)",
+Label(fig[0, 1], @sprintf("%s: edge bands vs interior, %.0f-%.0fS (edge band = %d columns)",
                           RUN, -LAT_RANGE[2], -LAT_RANGE[1], EDGE); fontsize = 16, font = :bold)
 panels = [("surface S (g/kg)", t, S_series), ("surface T (°C)", t, T_series),
           ("ice h·ℵ (m)", ti, V_series), ("MLD (m), 30-day means", tm, H_series)]
