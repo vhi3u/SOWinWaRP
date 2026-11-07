@@ -179,7 +179,9 @@ function era5_year(y)
         lon, lat = g(ds["longitude"][:]), g(ds["latitude"][:])
         iE = [argmin(abs.(lon .- x)) for x in λB]
         jE = [argmin(abs.(lat .- y)) for y in φB]
-        (; ds, name, iE, jE, times = DateTime.(ds["time"][:]))
+        # tools/download_era5_ncar.jl names the time axis valid_time, as the CDS does
+        tname = first(filter(n -> haskey(ds, n), ("valid_time", "time")))
+        (; ds, name, iE, jE, times = DateTime.(ds[tname][:]))
     end
 end
 
