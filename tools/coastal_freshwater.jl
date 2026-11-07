@@ -205,6 +205,7 @@ end
 # ── the terms, month by month ────────────────────────────────────────────────────────────────
 nb, nm = length(BANDS), length(months)
 FWb, ICEb, Pb, RESb = (fill(NaN, nb, nm) for _ in 1:4)
+REFb = fill(NaN, nm)                       # the residual over the offshore reference band, monthly
 RES_sum = zeros(length(λB), length(φB)); RES_time = zeros(length(λB), length(φB))
 println("B-SOSE: $(length(iB)) x $(length(jB)) cells over $(LON[1])-$(LON[2])E, $(-LAT[2])-$(-LAT[1])S; " *
         "S_ICE = $S_ICE g/kg; $(nm) months from $(Dates.format(first(months), "yyyy-mm"))")
@@ -216,6 +217,7 @@ for (n, m) in enumerate(months)
     for A in (FW, ICE, P, RES)
         A[.!wetB] .= NaN
     end
+    REFb[n] = band_mean(RES, distB, areaB, REF_KM)
     for (b, band) in enumerate(BANDS)
         FWb[b, n], ICEb[b, n] = band_mean(FW, distB, areaB, band), band_mean(ICE, distB, areaB, band)
         Pb[b, n], RESb[b, n]  = band_mean(P, distB, areaB, band), band_mean(RES, distB, areaB, band)
@@ -405,13 +407,18 @@ end
 ylims!(ax3, LAT[1], -55)
 
 if model !== nothing
-    ax4 = Axis(fig[3, 1:2]; title = "Model - B-SOSE surface S by distance from the coast (solid), and the ΔS the residual would cause over $(Int(MLD_REF)) m (dashed)",
+    # monthly residual over the offshore reference band
+    RESb_ref = REFb
+    ax4 = Axis(fig[3, 1:2]; title = "Model - B-SOSE surface S by distance from the coast (solid), and the ΔS the coastal excess would cause over $(Int(MLD_REF)) m (dashed)",
                xlabel = "days since $(Dates.format(first(months), "yyyy-mm-dd"))", ylabel = "ΔS (g/kg)")
     colors = cgrad(:viridis, nb; categorical = true)
     for b in 1:nb
         lines!(ax4, xs, model.ΔSb[b, :]; color = colors[b], linewidth = 2,
                label = @sprintf("%.0f-%.0f km", BANDS[b]...))
-        implied = S_REF .* cumsum(RESb[b, :] .* w) ./ (ρ₀ * MLD_REF)
+        # the coastal EXCESS, as in the field for the model: the residual less its offshore value, which
+        # is B-SOSE's evaporation and precipitation adjustment and something our model has its own of
+        excess_b = max.(RESb[b, :] .- RESb_ref, 0.0)
+        implied = S_REF .* cumsum(excess_b .* w) ./ (ρ₀ * MLD_REF)
         lines!(ax4, xs, implied; color = colors[b], linestyle = :dash)
     end
     hlines!(ax4, [0]; color = :grey60)
