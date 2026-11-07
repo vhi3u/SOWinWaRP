@@ -34,6 +34,15 @@
 # over MLD_REF metres: S_REF * cumulative(residual) / (ρ₀ MLD_REF), positive = we end up saltier. If the coastal bias grows at
 # roughly that rate and the offshore bins do not, the missing freshwater accounts for it.
 #
+# THE FIELD FOR THE MODEL. It also writes FIELD_FILE (coastal_freshwater_bsose.nc), the freshwater
+# examples/sowinwarp_nested.jl adds when COASTAL_FRESHWATER=1: the time-mean residual minus its
+# offshore value (REF_KM, 300-600 km), within DIST_MAX km of the coast, never negative, on the
+# nest's own grid. Subtracting the offshore value removes what the residual holds everywhere,
+# B-SOSE's precipitation adjustment and its evaporation (our model computes its own), and keeps the
+# coastal excess: the melt and runoff. Without ERA5 P the offshore value also absorbs P - E, which
+# is lower at the coast, so the field is then a slight underestimate. Regridded like the B-SOSE
+# ice in the nested script: B-SOSE land takes its nearest ocean value, then bilinear.
+#
 # LOGIN-NODE SAFE: NCDatasets and CairoMakie only, subset reads.
 #
 # Reads, from BSOSE_DIR: oceFWflx_, surfSflx_ and (with MODEL_RUN) Salt_bsoseI156_2013to2024_monthly.nc;
@@ -51,6 +60,9 @@
 #     MODEL_RUN    a nested run to test against       (default: none)
 #     DIR          where <MODEL_RUN>_surface.nc is    (default ".")
 #     OUTDIR       figures                            (default plots)
+#     FIELD_FILE   the field for the model            (default coastal_freshwater_bsose.nc; "" to skip)
+#     REF_KM       offshore reference band, km        (default "300,600")
+#     DIST_MAX     outer edge of the field, km        (default 300)
 # ==============================================================================
 
 using NCDatasets, CairoMakie, Dates, Printf, Statistics
@@ -70,6 +82,13 @@ const BANDS      = [(EDGES[k], EDGES[k+1]) for k in 1:length(EDGES)-1]
 const MODEL_RUN  = get(ENV, "MODEL_RUN", "")
 const MODEL_DIR  = get(ENV, "DIR", ".")
 const OUTDIR     = get(ENV, "OUTDIR", "plots")
+const FIELD_FILE = get(ENV, "FIELD_FILE", "coastal_freshwater_bsose.nc")
+const REF_KM     = Tuple(parse.(Float64, split(get(ENV, "REF_KM", "300,600"), ",")))
+const DIST_MAX   = parse(Float64, get(ENV, "DIST_MAX", "300"))
+
+# The nest's grid (examples/sowinwarp_nested.jl): the field is written on it, and the nested
+# script checks the coordinates match before using it.
+const CHILD_LON, CHILD_LAT, CHILD_SCALING = (90.0, 150.0), (-70.0, -45.0), 6
 
 # Same search path as `default_bsose_directory` in src/setup_bsose.jl, repeated so this file
 # loads without the project's heavy dependencies.
@@ -242,6 +261,65 @@ let w = [month_seconds(m) for m in months]
         end
         println()
     end
+end
+
+# ── the field for the model ──────────────────────────────────────────────────────────────────
+if !isempty(FIELD_FILE)
+    R = RES_sum ./ RES_time                                     # kg m⁻² s⁻¹, time mean, NaN on land
+    R_ref = band_mean(R, distB, areaB, REF_KM)
+    excess = [wetB[I] && isfinite(distB[I]) && distB[I] < DIST_MAX && isfinite(R[I]) ? max(R[I] - R_ref, 0.0) : 0.0
+              for I in CartesianIndices(R)]
+
+    # B-SOSE land takes its nearest B-SOSE ocean value (within 6 cells), then bilinear onto the nest
+    reach = 6
+    source = zeros(Int, size(wetB)); lin = LinearIndices(wetB)
+    for I in CartesianIndices(wetB)
+        best, dist2 = 0, Inf
+        for di in -reach:reach, dj in -reach:reach
+            J = I + CartesianIndex(di, dj)
+            (checkbounds(Bool, wetB, J) && wetB[J] && di^2 + dj^2 < dist2) || continue
+            best, dist2 = lin[J], di^2 + dj^2
+        end
+        source[I] = best
+    end
+    Nx = round(Int, CHILD_SCALING * (CHILD_LON[2] - CHILD_LON[1]))
+    Ny = round(Int, CHILD_SCALING * (CHILD_LAT[2] - CHILD_LAT[1]))
+    λc = CHILD_LON[1] .+ ((1:Nx) .- 0.5) ./ CHILD_SCALING
+    φc = CHILD_LAT[1] .+ ((1:Ny) .- 0.5) ./ CHILD_SCALING
+    bracket(v, x) = (a = clamp(searchsortedlast(v, x), 1, length(v) - 1); (a, clamp((x - v[a]) / (v[a+1] - v[a]), 0, 1)))
+    function onto_child(i, j)
+        a, wx = bracket(λB, λc[i]); b, wy = bracket(φB, φc[j])
+        num = den = 0.0
+        for (di, w₁) in ((0, 1 - wx), (1, wx)), (dj, w₂) in ((0, 1 - wy), (1, wy))
+            src = source[a+di, b+dj]
+            src > 0 || continue
+            num += w₁ * w₂ * excess[src]; den += w₁ * w₂
+        end
+        return den > 0 ? num / den : 0.0
+    end
+    F = [onto_child(i, j) for i in 1:Nx, j in 1:Ny]
+
+    total_gt = sum(excess .* areaB) * YEAR_SECONDS / 1e12
+    NCDataset(FIELD_FILE, "c") do out
+        defDim(out, "lon", Nx); defDim(out, "lat", Ny)
+        defVar(out, "lon", λc, ("lon",); attrib = ["units" => "degrees_east"])
+        defVar(out, "lat", φc, ("lat",); attrib = ["units" => "degrees_north"])
+        defVar(out, "freshwater_flux", F, ("lon", "lat");
+               attrib = ["units" => "kg m-2 s-1", "positive" => "into the ocean",
+                         "long_name" => "B-SOSE coastal freshwater excess our model lacks"])
+        out.attrib["method"] = "time mean of oceFWflx - SFLUX/S_ICE - ERA5 P, minus its mean over $(REF_KM) km from the coast, " *
+                               "within $(DIST_MAX) km, floored at 0"
+        out.attrib["S_ICE"] = S_ICE
+        out.attrib["era5_precipitation_subtracted"] = string(HAVE_P)
+        out.attrib["period"] = "$(Dates.format(START_DATE, "yyyy-mm")) to $(Dates.format(END_DATE - Month(1), "yyyy-mm"))"
+        out.attrib["offshore_reference_m_per_year"] = to_m_per_year(R_ref)
+        out.attrib["total_Gt_per_year"] = total_gt
+    end
+    println()
+    @printf("Field for the model: %s. Offshore reference %.2f m/yr removed; within %.0f km of the coast;\n",
+            FIELD_FILE, to_m_per_year(R_ref), DIST_MAX)
+    @printf("  %.0f Gt/yr over 90-150E (on B-SOSE's cells), up to %.1f m/yr in a cell%s\n", total_gt,
+            to_m_per_year(maximum(F)), HAVE_P ? "" : "; NO ERA5 P subtracted, rerun where ERA5 is")
 end
 
 # ── the model's own coastal bias, in the same bins ───────────────────────────────────────────

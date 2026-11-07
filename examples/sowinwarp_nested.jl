@@ -79,6 +79,7 @@ using Oceananigans
 using Oceananigans.Units
 using Oceananigans.Diagnostics: NaNChecker
 using Oceananigans.BoundaryConditions: fill_halo_regions!
+using Oceananigans.Operators: Δzᶜᶜᶜ
 using NumericalEarth.SeaIces.ClimaSeaIce: IncrementalRemapping   # via NumericalEarth, not a direct dependency
 using Oceanostics.ProgressMessengers: TimedMessenger
 using NCDatasets      # loads Oceananigans' NetCDFWriter
@@ -184,10 +185,60 @@ dataset = BSOSEMonthly(dir = BDIR, iteration = 156)
 parent_records = length(NumericalEarth.DataWrangling.bracketing_dates(dataset, :temperature, (start_date, end_date)))
 @info "B-SOSE parent: $parent_records monthly records held in memory"
 
+# ── coastal freshwater (COASTAL_FRESHWATER=1) ────────────────────────────────────────────────
+# Our only surface freshwater is ERA5 precipitation: no ice-shelf melt, iceberg melt or runoff.
+# B-SOSE prescribes Antarctic melt and calving (Hammond & Jones 2016, per the 2024 GMD evaluation of
+# MITgcm reanalyses), and every nested run has a salty strip along the coast that the sea-ice
+# changes of fix4 barely touched. tools/coastal_freshwater.jl measures what B-SOSE's coast gets
+# that ours does not, oceFWflx - SFLUX/S_ICE - ERA5 P, minus its offshore value, and writes it on
+# this grid to COASTAL_FRESHWATER_FILE. Run that first. Raw oceFWflx is NOT used: it holds B-SOSE's
+# own sea-ice freezing and melting, which our ice model already does.
+#
+# Applied as a virtual salt flux in the top cell, -S F / (ρ₀ Δz), the way the coupler applies the
+# rest of the freshwater, and constant in time like B-SOSE's prescribed melt. A caller's `forcing`
+# is ADDED to the nest's boundary relaxation (NestedModels/nested_ocean_model.jl), so this does not
+# displace it. The flux is concentrated: up to ~44 m/yr at the Shackleton front (96-97E 65.1-65.3S)
+# and at 103.25E 65.25S, i.e. ~1 g/kg per day in an unmixed 4.2 m top cell.
+const COASTAL_FRESHWATER      = get(ENV, "COASTAL_FRESHWATER", "0") == "1"
+const COASTAL_FRESHWATER_FILE = get(ENV, "COASTAL_FRESHWATER_FILE", "coastal_freshwater_bsose.nc")
+const COASTAL_ρ₀ = 1026.0
+
+@inline function coastal_freshwater_dilution(i, j, k, grid, clock, fields, p)
+    @inbounds S = fields.S[i, j, k]
+    @inbounds F = p.F[i, j]
+    return ifelse(k == grid.Nz, -S * F / (p.ρ₀ * Δzᶜᶜᶜ(i, j, k, grid)), zero(S))
+end
+
+function coastal_freshwater_forcing()
+    COASTAL_FRESHWATER || return NamedTuple()
+    isfile(COASTAL_FRESHWATER_FILE) ||
+        error("$COASTAL_FRESHWATER_FILE not found: run tools/coastal_freshwater.jl first (or set COASTAL_FRESHWATER_FILE)")
+    ds = NCDataset(COASTAL_FRESHWATER_FILE)
+    lon, lat = Float64.(ds["lon"][:]), Float64.(ds["lat"][:])
+    F = Float64.(coalesce.(ds["freshwater_flux"][:, :], 0.0))
+    attributes = Dict(ds.attrib)
+    close(ds)
+    λc = λ₁ .+ ((1:Nx) .- 0.5) ./ SCALING
+    φc = φ₁ .+ ((1:Ny) .- 0.5) ./ SCALING
+    (size(F) == (Nx, Ny) && maximum(abs, lon .- λc) < 1e-6 && maximum(abs, lat .- φc) < 1e-6) ||
+        error("$COASTAL_FRESHWATER_FILE is not on this grid ($(Nx)x$(Ny), $(λ₁)-$(λ₂)E, $(φ₁)-$(φ₂)S)")
+    land = Array(interior(bottom_height))[:, :, 1] .>= 0
+    F[land] .= 0
+    area = [(6.371e6 * deg2rad(1 / SCALING))^2 * cosd(φ) for _ in λc, φ in φc]
+    @info @sprintf("coastal freshwater from %s: %.0f Gt/yr, up to %.1f m/yr in a cell (%s)",
+                   COASTAL_FRESHWATER_FILE, sum(F .* area) * 365.25 * 86400 / 1e12,
+                   maximum(F) * 365.25 * 86400 / 1000, get(attributes, "method", "no method attribute"))
+    get(attributes, "era5_precipitation_subtracted", "true") == "true" ||
+        @warn "$COASTAL_FRESHWATER_FILE was made without ERA5 precipitation subtracted"
+    return (; S = Forcing(coastal_freshwater_dilution; discrete_form = true,
+                          parameters = (; F = on_architecture(ARCH, F), ρ₀ = COASTAL_ρ₀)))
+end
+
 ocean = nested_ocean_simulation(grid, dataset;
                                 dates = (start_date, end_date),
                                 dir = BDIR,
-                                parent_time_indices_in_memory = parent_records)
+                                parent_time_indices_in_memory = parent_records,
+                                forcing = coastal_freshwater_forcing())
 
 child = ocean.model.child
 
@@ -619,6 +670,7 @@ output_metadata = Dict("run_name" => RUN_NAME,
                  (ICE_INIT == "bsose" ? "started from B-SOSE SIarea/SIheff" : "started ice-free") * ", " *
                  (ICE_BOUNDARY == "bsose" ? "open-side bands relaxed to B-SOSE ice on $(ICE_RELAXATION / hours) h" :
                                             "open-side bands ice deleted"),
+    "coastal_freshwater" => COASTAL_FRESHWATER ? "B-SOSE coastal excess from $(COASTAL_FRESHWATER_FILE)" : "none",
     "vertical_coordinate" => "static z, B-SOSE i156's 52 levels")
 
 ocean.output_writers[:surface] = NetCDFWriter(
