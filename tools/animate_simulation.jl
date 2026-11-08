@@ -346,7 +346,11 @@ function animate_midlon(midlon_file, output, output_focus; framerate, clim_q, fo
     println("\nLoading mid-longitude fields from: ", midlon_file)
     ds = Dataset(midlon_file)
     lat = Float64.(ds["φ_aca"][:])
-    z = Float64.(ds["z_aac"][:])
+    # z-star runs store the fixed reference coordinate as `r_aac` and have no `z_aac`; reading it
+    # as z is accurate to |eta| at the surface and exact at the seafloor (tools/mixing_energetics.jl).
+    zkey = findfirst(k -> haskey(ds, k), ["z_aac", "r_aac"])
+    zkey === nothing && error("no z_aac or r_aac in $midlon_file; keys: $(sort(collect(keys(ds))))")
+    z = Float64.(ds[["z_aac", "r_aac"][zkey]][:])
     times = Float64.(ds["time"][:])
     mid_lon = haskey(ds, "λ_caa") ? ds["λ_caa"][1] : 120.0
     Nt, Ny, Nz = length(times), length(lat), length(z)

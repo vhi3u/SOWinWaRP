@@ -292,7 +292,7 @@ are the surface-to-deep companions the column integrals take.
 function model_section(path)
     ds = Dataset(path)
     lat = coordinate(ds, "φ_aca")
-    z = coordinate(ds, "z_aac")
+    z = coordinate(ds, "z_aac", "r_aac")   # `r_aac` under z-star; see tools/mixing_energetics.jl
     times = Float64.(ds["time"][:])
     lon = haskey(ds, "λ_caa") ? Float64(ds["λ_caa"][1]) : NaN
     lon_face = haskey(ds, "λ_faa") ? Float64(ds["λ_faa"][1]) : NaN
