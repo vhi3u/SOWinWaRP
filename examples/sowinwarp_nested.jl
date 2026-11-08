@@ -45,7 +45,7 @@
 #      walls, so in the 4-cell relaxation band along the open W, E and N sides the ice is relaxed
 #      to B-SOSE's every step: ice leaves through the band and B-SOSE's ice enters from it.
 #      Up to fix3 the ice started at zero on 1 June and the band's ice was deleted, so all of it
-#      was frozen locally (ICE_INIT=none ICE_BOUNDARY=delete gives that back). The wizard also limits Δt on the ICE
+#      was frozen locally (ICE_INIT = "none", ICE_BOUNDARY = "delete" in the switches give that back). The wizard also limits Δt on the ICE
 #      speed, and a run stops if the ice volume h·ℵ passes 50 m. 2Y_nested_seaice_full had none of these
 #      three: its ice piled against the east edge from day 110 and grew to 10⁶ m.
 #      The ice is advected by IncrementalRemapping, not WENO. ClimaSeaIce carries volume h·ℵ and ℵ
@@ -94,6 +94,26 @@ ARCH isa GPU && !CUDA.functional() &&
     (CUDA.functional(true); error("CUDA is not functional on this node. Check the GPU allocation, or set ARCH=CPU."))
 ARCH isa GPU && @info "Running on GPU: $(CUDA.name(CUDA.device()))"
 const BDIR  = get(ENV, "BSOSE_DIR", default_bsose_directory())
+
+# ── experiment switches: set HERE, not on the sbatch line ─────────────────────────────────────
+# What the run does to the physics is chosen in the code. The environment only says which run this
+# is and where things are (RUN_NAME, END_DATE, SMOKE, PICKUP, ARCH, BSOSE_DIR, ERA5_DIR,
+# CHECKPOINT_DAYS). An environment switch that is not set falls back silently, and fix5's first
+# submission ran without its freshwater that way. The values are logged at startup and stamped on
+# every output file.
+const COASTAL_FRESHWATER      = true                            # B-SOSE's coastal freshwater; see "coastal freshwater"
+const COASTAL_FRESHWATER_FILE = "coastal_freshwater_bsose.nc"   # written by tools/coastal_freshwater.jl
+const ICE_INIT                = "bsose"   # "bsose": start from B-SOSE's ice; "none": ice-free (up to fix3)
+const ICE_BOUNDARY            = "bsose"   # "bsose": relax the open-side bands to B-SOSE's ice; "delete" (up to fix3)
+const ICE_RELAXATION_HOURS    = 6         # the bands' relaxation time, with ICE_BOUNDARY = "bsose"
+
+ICE_INIT in ("bsose", "none") || error("ICE_INIT must be \"bsose\" or \"none\", got $ICE_INIT")
+ICE_BOUNDARY in ("bsose", "delete") || error("ICE_BOUNDARY must be \"bsose\" or \"delete\", got $ICE_BOUNDARY")
+for name in ("COASTAL_FRESHWATER", "COASTAL_FRESHWATER_FILE", "ICE_INIT", "ICE_BOUNDARY", "ICE_RELAXATION_HOURS")
+    haskey(ENV, name) && @warn "$name is set in the environment, which this script no longer reads: set it in the switches block of examples/sowinwarp_nested.jl"
+end
+@info "switches: COASTAL_FRESHWATER = $COASTAL_FRESHWATER ($COASTAL_FRESHWATER_FILE), ICE_INIT = $ICE_INIT, " *
+      "ICE_BOUNDARY = $ICE_BOUNDARY, ICE_RELAXATION_HOURS = $ICE_RELAXATION_HOURS"
 
 # ── domain: the production SOWinWaRP box at 1/6 deg ───────────────────────────────────────────
 const λ₁, λ₂ = 90.0, 150.0
@@ -185,7 +205,7 @@ dataset = BSOSEMonthly(dir = BDIR, iteration = 156)
 parent_records = length(NumericalEarth.DataWrangling.bracketing_dates(dataset, :temperature, (start_date, end_date)))
 @info "B-SOSE parent: $parent_records monthly records held in memory"
 
-# ── coastal freshwater (COASTAL_FRESHWATER=1) ────────────────────────────────────────────────
+# ── coastal freshwater (COASTAL_FRESHWATER, in the switches) ────────────────────────────────────────────────
 # Our only surface freshwater is ERA5 precipitation: no ice-shelf melt, iceberg melt or runoff.
 # B-SOSE prescribes Antarctic melt and calving (Hammond & Jones 2016, per the 2024 GMD evaluation of
 # MITgcm reanalyses), and every nested run has a salty strip along the coast that the sea-ice
@@ -199,8 +219,6 @@ parent_records = length(NumericalEarth.DataWrangling.bracketing_dates(dataset, :
 # is ADDED to the nest's boundary relaxation (NestedModels/nested_ocean_model.jl), so this does not
 # displace it. The flux is concentrated: up to ~44 m/yr at the Shackleton front (96-97E 65.1-65.3S)
 # and at 103.25E 65.25S, i.e. ~1 g/kg per day in an unmixed 4.2 m top cell.
-const COASTAL_FRESHWATER      = get(ENV, "COASTAL_FRESHWATER", "0") == "1"
-const COASTAL_FRESHWATER_FILE = get(ENV, "COASTAL_FRESHWATER_FILE", "coastal_freshwater_bsose.nc")
 const COASTAL_ρ₀ = 1026.0
 
 @inline function coastal_freshwater_dilution(i, j, k, grid, clock, fields, p)
@@ -212,7 +230,7 @@ end
 function coastal_freshwater_forcing()
     COASTAL_FRESHWATER || return NamedTuple()
     isfile(COASTAL_FRESHWATER_FILE) ||
-        error("$COASTAL_FRESHWATER_FILE not found: run tools/coastal_freshwater.jl first (or set COASTAL_FRESHWATER_FILE)")
+        error("$COASTAL_FRESHWATER_FILE not found: run tools/coastal_freshwater.jl first, or set COASTAL_FRESHWATER = false in the switches")
     ds = NCDataset(COASTAL_FRESHWATER_FILE)
     lon, lat = Float64.(ds["lon"][:]), Float64.(ds["lat"][:])
     F = Float64.(coalesce.(ds["freshwater_flux"][:, :], 0.0))
@@ -289,10 +307,6 @@ sea_ice = sea_ice_simulation(child.grid, ocean; advection = IncrementalRemapping
 # 5-day files tools/ice_production.jl reads, <token>_bsoseI156_<year>_5day.nc in BSOSE_DIR, and
 # are regridded onto the child grid once, here, for the whole run. Snow is not in those files, so
 # the ice starts bare and the band ice carries no snow.
-const ICE_INIT     = get(ENV, "ICE_INIT", "bsose")       # "bsose", or "none" as up to fix3
-const ICE_BOUNDARY = get(ENV, "ICE_BOUNDARY", "bsose")   # "bsose", or "delete" as up to fix3
-ICE_INIT in ("bsose", "none") || error("ICE_INIT must be bsose or none, got $ICE_INIT")
-ICE_BOUNDARY in ("bsose", "delete") || error("ICE_BOUNDARY must be bsose or delete, got $ICE_BOUNDARY")
 const ICE_ℵ_MIN = 0.01   # less ice area than this counts as open water: h = volume/ℵ is noise there
 const ICE_FILL_CELLS = 6  # B-SOSE cells (~1 deg of longitude) searched for ocean to fill B-SOSE land
 
@@ -362,7 +376,7 @@ function load_bsose_ice(first_date, last_date)
     for y in years, (token, names, out) in (("SIArea", ("SIarea", "SIArea", "SIAREA"), ℵs), ("SIHeff", ("SIheff", "SIHeff", "SIHEFF"), Vs))
         path = bsose_ice_file(token, y)
         isfile(path) || error("$path not found: the B-SOSE 5-day $token files are needed for " *
-                              "ICE_INIT/ICE_BOUNDARY = bsose (or set both to none/delete)")
+                              "ICE_INIT/ICE_BOUNDARY = \"bsose\" (or set them to \"none\"/\"delete\" in the switches)")
         ds = NCDataset(path)
         found = filter(n -> haskey(ds, n), names)
         isempty(found) && error("no $(join(names, " or ")) in $path; it holds $(collect(keys(ds)))")
@@ -490,7 +504,7 @@ function remove_edge_ice!(_)
     return nothing
 end
 
-const ICE_RELAXATION = parse(Float64, get(ENV, "ICE_RELAXATION_HOURS", "6")) * hours
+const ICE_RELAXATION = ICE_RELAXATION_HOURS * hours
 const ICE_TARGET_EVERY = 1hours   # B-SOSE's ice is 5-day means; refreshing hourly is plenty
 const ICE_BAND = on_architecture(ARCH, [i <= ICE_EDGE || i > Nx - ICE_EDGE || j > Ny - ICE_EDGE
                                         for i in 1:Nx, j in 1:Ny])

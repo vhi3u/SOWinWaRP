@@ -35,7 +35,7 @@
 # roughly that rate and the offshore bins do not, the missing freshwater accounts for it.
 #
 # THE FIELD FOR THE MODEL. It also writes FIELD_FILE (coastal_freshwater_bsose.nc), the freshwater
-# examples/sowinwarp_nested.jl adds when COASTAL_FRESHWATER=1: the time-mean residual minus its
+# examples/sowinwarp_nested.jl adds when COASTAL_FRESHWATER = true: the time-mean residual minus its
 # offshore value (REF_KM, 300-600 km), within DIST_MAX km of the coast, never negative, on the
 # nest's own grid. Subtracting the offshore value removes what the residual holds everywhere,
 # B-SOSE's precipitation adjustment and its evaporation (our model computes its own), and keeps the
