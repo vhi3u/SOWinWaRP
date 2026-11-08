@@ -248,8 +248,8 @@ length(kbot_model) == Ny ||
 # The top cell is ocean where the model's own mask says so. Oceananigans writes land as 0, not
 # NaN, so `isfinite` would mask nothing.
 surface_wet = if haskey(ds, "inactive_nodes_ccc")
-    m = ds["inactive_nodes_ccc"]
-    BitMatrix((ndims(m) == 3 ? m[:, :, end] : m[:, :]) .== 0)
+    inactive = ds["inactive_nodes_ccc"]
+    BitMatrix((ndims(inactive) == 3 ? inactive[:, :, end] : inactive[:, :]) .== 0)
 elseif haskey(ds, "bottom_height")
     BitMatrix(Float64.(coalesce.(ds["bottom_height"][:, :], 0.0)) .< 0)
 else

@@ -9,7 +9,7 @@
 # END_DATE can be any time up to 2016-12-31T22:00 (the ERA5 converted so far covers 2014-2016).
 # OUTPUT follows src/model.jl, so `./run_animate_simulation RUN_NAME` works on it unchanged:
 # RUN_NAME_surface.nc, _midlon.nc, _free_surface.nc and _eke.nc in the working directory, plus
-# _sea_ice.nc (h, ℵ, snow, ice u/v daily).
+# _sea_ice.nc (h, ℵ, snow, ice u/v daily) and _surface_fluxes.nc (what the coupler gives the ocean, daily means).
 # RUN_NAME defaults to nested_smoke or nested_<start>_<end>, so runs do not overwrite each other.
 # A checkpoint every 365 days and at the end; PICKUP=1 continues RUN_NAME from the latest one.
 #
@@ -721,6 +721,60 @@ ocean.output_writers[:free_surface] = NetCDFWriter(
     overwrite_files=!PICKUP
 )
 
+# ── what the coupler hands the ocean at its surface, daily means ──────────────────────────────
+# tools/mixing_energetics.jl's `supplied` is B-SOSE's own forcing; this run is forced by ERA5 bulk
+# formulae and the ice instead, so without these there is no way to say whether OUR surface removes
+# more buoyancy than B-SOSE's (fix5: the 60-55S column is 15% harder to mix than B-SOSE's, yet its
+# mixed layer is 25-70 m deeper). Read off NumericalEarth's net ocean fluxes, the fields the ocean's
+# top boundary conditions take, all kinematic and positive OUT of the ocean (Oceananigans' sign):
+#
+#   heat_flux        Jᵀ, °C m/s: turbulent + longwave + the shortwave absorbed AT the surface, over
+#                    open water and under ice. Penetrating shortwave enters through a separate
+#                    forcing and is not in it; `shortwave` below is the whole transmitted beam.
+#   ice_salt_flux    Jˢ, g/kg m/s: the sea-ice salt flux ONLY.
+#   freshwater_flux  Jʷ, m/s, + INTO the ocean: rain, snow, evaporation and ice melt/freeze. The
+#                    salinity condition adds S_top·Jʷ live, so the salt flux the ocean sees is
+#                    Jˢ + S_top·Jʷ, with S_top from RUN_surface.nc.
+#   shortwave        W/m², NEGATIVE downward: shortwave transmitted into the ocean, (1 - ℵ)-weighted.
+#
+# The coastal freshwater (COASTAL_FRESHWATER) is a Forcing, not part of these; its field is the
+# constant COASTAL_FRESHWATER_FILE. Daily MEANS, not snapshots: a midnight snapshot of a flux with
+# a diurnal shortwave cycle is not a daily flux. Missing fields are warned about and skipped, so a
+# NumericalEarth that names them differently loses this file, not the run.
+function surface_flux_outputs()
+    candidates = (
+        (:heat_flux,       () -> coupled_model.interfaces.net_fluxes.ocean.T),
+        (:ice_salt_flux,   () -> coupled_model.interfaces.net_fluxes.ocean.S),
+        (:freshwater_flux, () -> coupled_model.interfaces.net_fluxes.ocean.η),
+        (:shortwave,       () -> coupled_model.radiation.interface_fluxes.ocean.downwelling_shortwave))
+    found = Pair{Symbol,Any}[]
+    for (name, get_field) in candidates
+        f = try get_field() catch err; err end
+        if !(f isa Oceananigans.Fields.AbstractField)
+            @warn "surface fluxes: no $name ($(f isa Exception ? sprint(showerror, f) : typeof(f))); not written"
+        elseif size(f, 1) != Nx || size(f, 2) != Ny
+            @warn "surface fluxes: $name is $(size(f)), not on the child's $(Nx)x$(Ny) grid; not written"
+        else
+            push!(found, name => f)
+        end
+    end
+    @info "surface fluxes: writing $(isempty(found) ? "nothing" : join(first.(found), ", ")) as daily means"
+    return NamedTuple(found)
+end
+
+surface_fluxes = surface_flux_outputs()
+isempty(surface_fluxes) || (ocean.output_writers[:surface_fluxes] = NetCDFWriter(
+    child,
+    surface_fluxes,
+    filename="$(RUN_NAME)_surface_fluxes.nc",
+    schedule=AveragedTimeInterval(output_interval, window=output_interval),
+    global_attributes=merge(output_metadata, Dict(
+        "flux_convention" => "kinematic, positive OUT of the ocean, except freshwater_flux (+ into the ocean) and shortwave (W/m2, negative down)",
+        "salt_flux_seen_by_ocean" => "ice_salt_flux + S_top * freshwater_flux, S_top from the surface file",
+        "averaging_window_seconds" => Float64(output_interval))),
+    overwrite_files=!PICKUP
+))
+
 # Co-located velocities, squared after interpolating (see src/model.jl's EKE block). T and S
 # ride along: this is the only full-depth output.
 u_cc = @at (Center, Center, Center) u
@@ -763,7 +817,7 @@ sea_ice.output_writers[:sea_ice] = NetCDFWriter(
     overwrite_files=!PICKUP
 )
 
-@info "output: $(RUN_NAME)_{surface,midlon,free_surface,eke,sea_ice}.nc in $(pwd())"
+@info "output: $(RUN_NAME)_{surface,midlon,free_surface,surface_fluxes,eke,sea_ice}.nc in $(pwd())"
 
 # ── checkpoints ───────────────────────────────────────────────────────────────────────────────
 # Oceananigans' Checkpointer on the coupled simulation: the ocean child (the nest's parent is data,
