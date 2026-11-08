@@ -1,7 +1,7 @@
 # ==============================================================================
 # compare_bsose.jl -- model against the B-SOSE parent it is nudged toward.
 #
-#     julia --project=. tools/compare_bsose.jl 8M_bsose_fwf
+#     julia --project=. tools/compare_bsose.jl 2Y_nested_seaice_fix5_fw
 #     julia --project=. tools/compare_bsose.jl 8M_bsose_fwf 8M S6
 #     DAYS=first,mid,last julia --project=. tools/compare_bsose.jl 8M_bsose_fwf
 #
@@ -9,35 +9,44 @@
 # "an 8-month window at 1/6 deg". Both are optional -- the season preset is inferred from the run
 # length and the resolution from the output file itself.
 #
-# FOUR QUESTIONS, in order of how cheaply they can be wrong:
+# Works on src/model.jl runs and examples/sowinwarp_nested.jl runs alike: the vertical levels and
+# the sea floor are read off the run's own output (tools/model_grid.jl, shared with
+# compare_mld.jl), the start date off its `start_date` attribute, and the section column off the
+# section writer's `indices`. Before 2026-11-08 this script rebuilt src/model.jl's 53-level grid
+# for every run, which put a nested run's T and S on the wrong depths.
 #
-#   1. IS THE SPONGE ACTUALLY NUDGING? The test is NOT a domain-mean bias -- it is bias as a
-#      function of distance from the boundary. The sponge restores T, S, u, v over the outer
-#      SPONGE_WIDTH degrees (3 deg = 18 cells) at SPONGE_TIMESCALE (1 day). So the bias should be
-#      near zero inside 18 cells and grow inward. A KNEE AT 18 CELLS is the signature that it
-#      works; a flat profile means it is not doing anything, whatever its settings say.
+# FIVE QUESTIONS, in order of how cheaply they can be wrong:
+#
+#   1. IS THE BOUNDARY RELAXATION ACTUALLY NUDGING? The test is NOT a domain-mean bias -- it is
+#      bias as a function of distance from the boundary. src/model.jl's sponge restores T, S, u, v
+#      over the outer 3 deg (18 cells at 1/6 deg); the nest's relaxation band is ~8/12 deg (4
+#      cells). So the bias should be near zero inside the band and grow inward. A KNEE AT THE
+#      BAND EDGE is the signature that it works; a flat profile means it is not doing anything,
+#      whatever its settings say.
 #
 #   2. DID THE SHORTWAVE SPLIT FIX THE MIXED LAYER? The recorded failure was a 3.1 m model mixed
 #      layer where B-SOSE had 21.8 m, with summer SST +7 to +9 C too warm, caused by depositing
 #      100% of TFLUX in the top cell (section 3.3 of Model Architecture.md). MLD and SST together
-#      are the test of PENETRATING_SHORTWAVE, and this is the first run with it on.
+#      are the test of PENETRATING_SHORTWAVE.
 #
 #   3. IS WINTER WATER THERE? WW is a SUBSURFACE TEMPERATURE MINIMUM, the remnant of the winter
 #      mixed layer, typically 50-200 m. So the diagnostic is not a temperature bias but whether
 #      a genuine Tmin exists below the mixed layer, at what depth, and with what value -- against
-#      B-SOSE's. This is the science target, and it is the reason the vertical grid keeps 8 m
-#      spacing through that band.
+#      B-SOSE's. This is the science target.
 #
 #   4. IS THE DOMAIN DRIFTING? Surface T and S means against B-SOSE over time.
 #
-# WHAT THIS RUN CAN AND CANNOT SHOW. `src/model.jl` writes the SURFACE (`indices=(:,:,Nz)`) and
+#   5. WHERE IN THE WATER COLUMN IS IT DRIFTING? Section 4 along the section, every month, by
+#      depth band and by latitude band, with a per-year drift that has the seasonal cycle removed.
+#
+# WHAT THIS RUN CAN AND CANNOT SHOW. Both models write the SURFACE (`indices=(:,:,Nz)`) and
 # ONE LONGITUDE SECTION (`indices=(mid_lon_idx,:,:)`, mid_lon_idx = Nx/2 = 180, about 120 E).
-# There is no 3-D output, so:
+# Neither writes daily 3-D T and S, so:
 #   * questions 1 and 4 are answered over the whole surface;
-#   * questions 2 and 3 are answered ALONG THE SECTION ONLY.
+#   * questions 2, 3 and 5 are answered ALONG THE SECTION ONLY.
 # For WW that is not much of a loss -- a meridional transect at 120 E crosses the shelf, the
-# slope and the ACC, which is where the layer's structure lives. A domain-wide MLD map would need
-# a 3-D T/S output added to model.jl.
+# slope and the ACC, which is where the layer's structure lives. For a domain-wide MLD map, use
+# compare_mld.jl on the 30-day-mean `_eke.nc`.
 #
 # CONVENTIONS, and a caveat that is NOT bookkeeping. The model runs TEOS10, so its tracers are
 # CONSERVATIVE temperature and ABSOLUTE salinity. B-SOSE ships MITgcm `Theta` (POTENTIAL
@@ -60,6 +69,10 @@
 #     OUTDIR  where figures go                        (tools/bsose_comparison)
 #     MLD_DT  density threshold, kg/m3                (default 0.03, de Boyer Montegut)
 #     Z_TOP   depth for the vertical-structure section (default 200 m)
+#     START   first day of the run       (default: the file's start_date attribute)
+#     SPONGE_DEG  relaxation band width, deg  (default: 8/12 for a nested run, 3 otherwise)
+#     MIN_DAYS    days of output a month needs to enter the section drift (default 15)
+#     DRIFT_CHUNK B-SOSE months loaded at once for the section drift      (default 6)
 # ==============================================================================
 
 using Oceananigans, Oceananigans.Units, Oceananigans.Grids
@@ -70,15 +83,15 @@ using Oceananigans, Oceananigans.Units, Oceananigans.Grids
 using Oceananigans.Units: Time
 using NumericalEarth, NumericalEarth.ECCO
 using NCDatasets, CairoMakie, Printf, Statistics, Dates
-using SeawaterPolynomials
-using SeawaterPolynomials.TEOS10: TEOS10EquationOfState
 
 include(joinpath(@__DIR__, "..", "src", "setup_bsose.jl"))
+include(joinpath(@__DIR__, "bsose_masks.jl"))   # bsose_depth
+include(joinpath(@__DIR__, "mld.jl"))           # mld and MLD_DT, shared with compare_mld.jl
+include(joinpath(@__DIR__, "model_grid.jl"))    # the run's levels and sea floor, from its output
 
 const RUN    = length(ARGS) > 0 ? ARGS[1] : get(ENV, "RUN_NAME", "8M_bsose_v2")
 const DIR    = get(ENV, "DIR", ".")
 const OUTDIR = get(ENV, "OUTDIR", joinpath(@__DIR__, "bsose_comparison"))
-const MLD_DT = parse(Float64, get(ENV, "MLD_DT", "0.03"))
 
 # Depth band searched for the Winter Water core. WW is the remnant of the winter mixed layer and
 # lives at roughly 50-200 m; the first version of this script searched from the mixed-layer base
@@ -135,23 +148,12 @@ function resolve_months(run_days)
 end
 mkpath(OUTDIR)
 
-const EOS = TEOS10EquationOfState()
-
-# The sponge is 3 DEGREES wide in model.jl (SPONGE_WIDTH); the 18 cells it works out to are a
-# consequence of the resolution, not a property of the model. Deriving the cells from the degrees
-# is what lets this script follow SCALING instead of silently annotating a 1/12 deg run with a
-# 1/6 deg band.
-const SPONGE_DEG = 3.0
-
 surf_file = joinpath(DIR, "$(RUN)_surface.nc")
 sect_file = joinpath(DIR, "$(RUN)_midlon.nc")
+eke_file  = joinpath(DIR, "$(RUN)_eke.nc")
 isfile(surf_file) || error("no $surf_file")
 
-# ------------------------------------------------------------------ the model's own grid
-# Rebuilt rather than read, because the distance-to-boundary and z metrics have to match what the
-# run used. Same hard-coded production grid as inspect_bathymetry.jl, and the same reasoning.
 const λ₁, λ₂, φ₁, φ₂ = 90.0, 150.0, -70.0, -45.0
-const Z_EXTENT, DZ_SURFACE, DZ_BOTTOM, Z_CONST = 5800, 8, 400, 250
 
 # ── Horizontal resolution ─────────────────────────────────────────────────────────────────────
 #
@@ -166,7 +168,7 @@ const Z_EXTENT, DZ_SURFACE, DZ_BOTTOM, Z_CONST = 5800, 8, 400, 250
 # against the file -- so the check after the grid is built is a real guard, not a formality.
 ds = Dataset(surf_file)
 
-"""Horizontal scaling for the rebuilt grid, and where it came from."""
+"""Horizontal scaling for the grid, and where it came from."""
 function resolve_scaling(nx_file)
     raw = strip(length(ARGS) > 2 ? ARGS[3] : get(ENV, "SCALING", ""))
     if !isempty(raw)
@@ -185,29 +187,9 @@ function resolve_scaling(nx_file)
 end
 
 const SCALING, scaling_src = resolve_scaling(size(ds["T"], 1))
-const SPONGE_CELLS = round(Int, SPONGE_DEG * SCALING)
-@info @sprintf("horizontal resolution 1/%d deg [%s]; sponge %.1f deg = %d cells",
-               SCALING, scaling_src, SPONGE_DEG, SPONGE_CELLS)
+Nx, Ny = Int(SCALING * (λ₂ - λ₁)), Int(SCALING * (φ₂ - φ₁))
 
-z = ReferenceToStretchedDiscretization(; extent = Z_EXTENT, constant_spacing = DZ_SURFACE,
-                                       maximum_spacing = DZ_BOTTOM,
-                                       constant_spacing_extent = Z_CONST,
-                                       stretching = PowerLawStretching(1.12))
-Nx, Ny, Nz = Int(SCALING * (λ₂ - λ₁)), Int(SCALING * (φ₂ - φ₁)), length(z)
-@info "model grid $(Nx)x$(Ny)x$(Nz) (Nz from DZ_SURFACE=$DZ_SURFACE, DZ_BOTTOM=$DZ_BOTTOM, const=$Z_CONST)"
-
-grid = LatitudeLongitudeGrid(CPU(); size = (Nx, Ny, Nz), longitude = (λ₁, λ₂),
-                             latitude = (φ₁, φ₂), z, halo = (7, 7, 7))
-bottom = regrid_bathymetry(grid; height_above_water = 1, minimum_depth = 10,
-                           interpolation_passes = 5)
-fix_boundary_topography!(bottom, grid; minimum_boundary_depth = 100)
-grid = ImmersedBoundaryGrid(grid, GridFittedBottom(bottom))
-
-zc  = Array(znodes(grid, Center()))
-φc  = Array(φnodes(grid, Center()))
-MID = div(Nx, 2)
-
-# The rebuilt grid has to match the file it is about to be compared against. If it does not, every
+# The grid has to match the file it is about to be compared against. If it does not, every
 # mask, every distance-to-boundary and every heatmap below is shaped wrong, and some of that goes
 # wrong QUIETLY -- a (360,150) mask against a (720,300) field errors, but a transposed or
 # off-by-a-few one may not.
@@ -218,6 +200,70 @@ let (nxf, nyf) = size(ds["T"])[1:2]
         "or fix the domain constants above.")
 end
 
+# ── The sponge band ───────────────────────────────────────────────────────────────────────────
+#
+# Its width in DEGREES; the cells follow from the resolution. src/model.jl restores over 3 deg
+# (SPONGE_WIDTH); the nest's own relaxation band (examples/sowinwarp_nested.jl, NumericalEarth's
+# ocean_boundary_relaxation) is ~8/12 deg. Which applies is read off the file's `boundaries`
+# attribute, which sowinwarp_nested.jl stamps "one-way nest in B-SOSE ...". SPONGE_DEG overrides.
+const NESTED = haskey(ds.attrib, "boundaries") && occursin("nest", lowercase(string(ds.attrib["boundaries"])))
+const SPONGE_DEG = haskey(ENV, "SPONGE_DEG") ? parse(Float64, ENV["SPONGE_DEG"]) : NESTED ? 8 / 12 : 3.0
+const SPONGE_CELLS = round(Int, SPONGE_DEG * SCALING)
+@info @sprintf("horizontal resolution 1/%d deg [%s]; %s band %.2f deg = %d cells%s",
+               SCALING, scaling_src, NESTED ? "nest relaxation" : "sponge", SPONGE_DEG, SPONGE_CELLS,
+               haskey(ENV, "SPONGE_DEG") ? " (SPONGE_DEG)" : "")
+
+# ── Vertical levels and sea floor, READ OFF THE OUTPUT (tools/model_grid.jl) ───────────────────
+#
+# This script used to rebuild src/model.jl's grid (53 stretched levels, GridFittedBottom) for
+# every run. A nested run has B-SOSE's 52 levels, partial cells and the pocket fill, and only the
+# horizontal size was checked, so its T and S were read on the wrong depths. Now the levels come
+# from the section file (or the full-depth EKE file without one), the section's floor from the
+# same file, and the surface land mask from the surface file. B-SOSE is regridded onto the RUN's
+# levels, so both sides are compared at the same depths (exactly B-SOSE's own for a nested run).
+geom_file = isfile(sect_file) ? sect_file : isfile(eke_file) ? eke_file :
+            error("need $(RUN)_midlon.nc or $(RUN)_eke.nc for the vertical levels; neither is in $DIR")
+levels, floor_ = let g = Dataset(geom_file)
+    lv = file_levels(g)
+    fl = lv === nothing ? nothing : file_kbot(g, lv[1], lv[2])
+    close(g)
+    lv, fl
+end
+(levels === nothing || floor_ === nothing) &&
+    error("$geom_file carries no vertical levels (z_aac/z_aaf or r_aac/r_aaf) or no sea floor " *
+          "(inactive_nodes_ccc or bottom_height). compare_bsose.jl from before 2026-11-08 rebuilt " *
+          "src/model.jl's grid instead, and is the version for output that old.")
+zc, zf, zname = levels
+const Nz = length(zc)
+kbot_file, floor_source = floor_
+
+const MID = section_column(sect_file, Nx)
+# `kbot_model[j]` is the DEEPEST WET index of section column j, or `nothing` for a dry column.
+# Everything below it is bathymetry and must be excluded from the density search, the Winter
+# Water search and the heatmap alike. A section file's floor is one column wide.
+kbot_model = size(kbot_file, 1) == 1 ? vec(kbot_file) : kbot_file[MID, :]
+length(kbot_model) == Ny ||
+    error("the sea floor in $(basename(geom_file)) is $(length(kbot_model)) rows, not $Ny")
+
+# The top cell is ocean where the model's own mask says so. Oceananigans writes land as 0, not
+# NaN, so `isfinite` would mask nothing.
+surface_wet = if haskey(ds, "inactive_nodes_ccc")
+    m = ds["inactive_nodes_ccc"]
+    BitMatrix((ndims(m) == 3 ? m[:, :, end] : m[:, :]) .== 0)
+elseif haskey(ds, "bottom_height")
+    BitMatrix(Float64.(coalesce.(ds["bottom_height"][:, :], 0.0)) .< 0)
+else
+    error("$surf_file has neither inactive_nodes_ccc nor bottom_height: no land mask")
+end
+size(surface_wet) == (Nx, Ny) || error("the land mask in $surf_file is $(size(surface_wet)), not ($Nx, $Ny)")
+
+grid = LatitudeLongitudeGrid(CPU(); size = (Nx, Ny, Nz), longitude = (λ₁, λ₂),
+                             latitude = (φ₁, φ₂), z = zf, halo = (7, 7, 7))
+φc = Array(φnodes(grid, Center()))
+const SECT_LON = Array(λnodes(grid, Center()))[MID]
+@info "grid $(Nx)x$(Ny)x$(Nz): levels from $(basename(geom_file)) ($zname, top centre " *
+      "$(round(-zc[end], digits = 1)) m), section floor from $floor_source, section column $MID"
+
 # ------------------------------------------------------------------ the B-SOSE parent
 model_times = Float64.(ds["time"][:])
 nt = length(model_times)
@@ -225,7 +271,15 @@ run_days = maximum(model_times) / 86400
 MONTHS, months_src = resolve_months(run_days)
 @info "surface maps for month(s) $(join(MONTHS, ", ")) [$months_src]"
 
-start_date = DateTime("2014-06-01")
+start_date = if haskey(ENV, "START")
+    DateTime(ENV["START"])
+elseif haskey(ds.attrib, "start_date")
+    DateTime(string(ds.attrib["start_date"]))
+else
+    @warn "$surf_file has no start_date attribute: assuming 2014-06-01 (set START to override)"
+    DateTime("2014-06-01")
+end
+@info "run starts $start_date"
 dataset = BSOSEMonthly(iteration = 156)
 available = all_dates(dataset, :temperature)
 run_end = start_date + Second(round(Int, maximum(model_times)))
@@ -239,88 +293,51 @@ region = bsose_region(grid)
 
 slab(d, var, t) = (v = d[var]; A = ndims(v) == 4 ? v[:, :, 1, t] : v[:, :, t];
                    Float64.(coalesce.(A, NaN)))
-wet3(i, j, k) = !immersed_cell(i, j, k, grid)
 
-# ── Each grid's own sea floor along the section ───────────────────────────────────────────────
+# ── B-SOSE's own sea floor along the section ──────────────────────────────────────────────────
 #
-# Two masks, not one. Our ETOPO bathymetry and B-SOSE's are not the same field, and drawing
-# B-SOSE through OUR mask is what made the 2Y section figure show a filled, dark "B-SOSE T"
-# panel for three degrees of latitude where B-SOSE is land: at 119.92E its southernmost wet
-# column is 66.97S in 100 m of water, and everything south of 67.0S is continent. What was on
-# the screen there was the inpainting pipeline, not the state estimate, and no NaN survived for
+# Two masks, not one. Our bathymetry and B-SOSE's are not the same field, and drawing B-SOSE
+# through OUR mask is what made the 2Y section figure show a filled, dark "B-SOSE T" panel for
+# three degrees of latitude where B-SOSE is land: at 119.92E its southernmost wet column is
+# 66.97S in 100 m of water, and everything south of 67.0S is continent. What was on the screen
+# there was the inpainting pipeline, not the state estimate, and no NaN survived for
 # `nan_color` to catch.
-#
-# `kb*[j]` is the DEEPEST WET index of column j, or `nothing` for a dry column. Everything below
-# it is bathymetry and must be excluded from the density search, the Winter Water search and the
-# heatmap alike.
-kbot_model = [findfirst(k -> wet3(MID, j, k), 1:Nz) for j in 1:Ny]
-
-"""B-SOSE's own sea-floor depth (m, positive) at each of `lats`, on the meridian `lon`."""
-function bsose_section_depth(dataset, lon, lats)
-    file = joinpath(dataset.dir,
-                    resolve_bsose_filename(dataset.dir, :surface_salt_flux, dataset.iteration))
-    d = Dataset(file)
-    try
-        xc = Float64.(coalesce.(d["XC"][:], NaN))
-        yc = Float64.(coalesce.(d["YC"][:], NaN))
-        i = argmin(abs.(xc .- lon))
-        D = Float64.(coalesce.(d["Depth"][i, :], NaN))
-        return [(j = argmin(abs.(yc .- φ)); isfinite(D[j]) ? max(D[j], 0.0) : 0.0) for φ in lats]
-    finally
-        close(d)
-    end
-end
-
-const SECT_LON = λ₁ + (MID - 0.5) / SCALING
-parent_depth = bsose_section_depth(dataset, SECT_LON, φc)
+parent_depth = bsose_depth(dataset, [SECT_LON], φc)[1, :]
 kbot_parent = [d <= 0 ? nothing : findfirst(k -> -zc[k] <= d, 1:Nz) for d in parent_depth]
 
 @info @sprintf("section %.2fE: %d of %d columns wet in the model, %d in B-SOSE",
                SECT_LON, count(!isnothing, kbot_model), Ny, count(!isnothing, kbot_parent))
 
-"""Potential density anomaly at 0 dbar, same equation of state for model and parent."""
-ρθ(T, S) = (isfinite(T) && isfinite(S)) ?
-           SeawaterPolynomials.ρ′(T, S, 0.0, EOS) : NaN
+# ── Averaging along the section, shared by sections 3b and 5 ──────────────────────────────────
+#
+# Per CELL, over cells wet in BOTH grids. Our bathymetry and B-SOSE's disagree, so at a given
+# depth a column can be water in one and rock in the other. Averaging each side over its own mask
+# and then differencing the averages compares two different populations of cells and charges the
+# difference to the model. The count of cells is returned so a band that has almost none cannot
+# be read as a measurement.
+#
+# Weighted by cos(latitude): at 1/6 deg a cell at 70S is 0.48 of the width of one at 45S, and an
+# unweighted mean over this section would overcount the Antarctic margin by a factor of 2.
+wetboth(j, k) = kbot_model[j] !== nothing && kbot_parent[j] !== nothing &&
+                k >= kbot_model[j] && k >= kbot_parent[j]
 
-"""
-Mixed layer depth by the de Boyer Montegut density threshold: the shallowest depth at which
-potential density exceeds its 10 m value by `MLD_DT` kg/m3. `T`, `S` are columns ordered
-bottom-to-top as Oceananigans stores them; `zs` is the matching cell-centre depth (negative).
-`kbot` is the DEEPEST WET index of this column — the search stops there.
-
-Returns `NaN` when no crossing exists between 10 m and the sea floor. That is a real result
-("this column is unstratified"), not a failure, and the callers count it.
-
-> `kbot` is not optional bookkeeping, it is the whole correctness of this function.
->
-> This used to search to `k = 1` and, finding nothing, return `-zs[1]` — the deepest cell centre
-> of the GRID, about 5.6 km, with no relation to the water depth. It relied on hitting a NaN
-> below the sea floor to stop, and there is none: `fill_bathymetry_gaps!` in `setup_bsose.jl`
-> deliberately propagates the deepest valid water mass DOWNWARD into every immersed cell, so T
-> and S below the floor are finite and constant. The detector walked straight through the
-> bathymetry and fell out the bottom.
->
-> The result was a ~5 km spike on the Antarctic margin of the 2Y_bsose_dirichlet section plot
-> that read as a 5 km mixed layer and was nothing of the kind — and, worse, `mean_or(mm)` below
-> averaged it in. One such column out of ~145 adds ~38 m to the reported mean, which is why the
-> "189 m model vs 186 m B-SOSE" figure quoted from this table was not trustworthy.
-"""
-function mld(T, S, zs, kbot = 1; Δρ = MLD_DT)
-    k10 = findlast(z -> z <= -10, zs)          # deepest cell at or above 10 m
-    k10 === nothing && (k10 = length(zs))
-    k10 <= kbot && return NaN                   # column too shallow to have a 10 m reference
-    ref = ρθ(T[k10], S[k10])
-    isfinite(ref) || return NaN
-    for k in (k10 - 1):-1:kbot                  # Oceananigans orders z bottom-to-top, so a
-                                                # SMALLER index is DEEPER
-        ρ = ρθ(T[k], S[k])
-        isfinite(ρ) || return NaN
-        if ρ - ref >= Δρ
-            return -zs[k]
-        end
+"""cos(lat)-weighted mean of the (Ny, Nz) section `D` over cells wet in both grids; also the cell count."""
+function binmean(D, js, ks)
+    num = den = 0.0
+    cells = 0
+    for j in js, k in ks
+        (wetboth(j, k) && isfinite(D[j, k])) || continue
+        w = cosd(φc[j])
+        num += w * D[j, k]
+        den += w
+        cells += 1
     end
-    return NaN                                  # unstratified through the whole water column
+    return (den == 0 ? NaN : num / den), cells
 end
+
+const LAT_BANDS = [(-70.0, -65.0), (-65.0, -60.0), (-60.0, -55.0), (-55.0, -50.0), (-50.0, -45.0)]
+jsof(lo, hi) = [j for j in 1:Ny if lo <= φc[j] < hi]
+ksof(lo, hi) = [k for k in 1:Nz if lo < -zc[k] <= hi]
 
 """
 Subsurface temperature minimum -- the Winter Water core -- as (value, depth), or `nothing`.
@@ -430,7 +447,6 @@ pos = Dict(n => k for (k, n) in enumerate(sel))    # bc_dates index -> position 
 resident(var) = FieldTimeSeries(Metadata(var; dataset, dates = sel_dates, region), grid;
                                 time_indices_in_memory = length(sel_dates))
 Tb, Sb, ub, vb = resident(:temperature), resident(:salinity), resident(:u_velocity), resident(:v_velocity)
-offset = model_clock_offset(Metadata(:temperature; dataset, dates = sel_dates, region), start_date)
 
 """
 Distance-to-nearest-boundary and a wet mask SHAPED TO THE FIELD, not to the tracer grid.
@@ -444,7 +460,7 @@ field's own extent per axis, so index 1 and index `extent` both come out 0 -- th
 function field_metrics(sz)
     nx, ny = sz
     dist = [min(i - 1, nx - i, j - 1, ny - j) for i in 1:nx, j in 1:ny]
-    wet  = [wet3(clamp(i, 1, Nx), clamp(j, 1, Ny), Nz) for i in 1:nx, j in 1:ny]
+    wet  = [surface_wet[clamp(i, 1, Nx), clamp(j, 1, Ny)] for i in 1:nx, j in 1:ny]
     return dist, wet
 end
 
@@ -551,7 +567,7 @@ end
 if isfile(sect_file)
     dsec = Dataset(sect_file)
     println("="^96)
-    println("2 & 3. MIXED LAYER and WINTER WATER along the $(round(λ₁ + (MID - 0.5)/SCALING, digits=1))E section")
+    println("2 & 3. MIXED LAYER and WINTER WATER along the $(round(SECT_LON, digits=1))E section")
     println("   MLD: de Boyer Montegut, Δρ = $MLD_DT kg/m3 from 10 m, SAME equation of state both sides.")
     println("   The recorded failure to beat: model 3.1 m where B-SOSE had 21.8 m (section 3.3).")
     println("="^96)
@@ -607,7 +623,7 @@ if isfile(sect_file)
         Sps = Array(interior(Sb[pos[sel[k]]]))[MID, :, :]
 
         fig = Figure(size = (1250, 820))
-        Label(fig[0, 1:2], "$(RUN) — day $(t-1) at $(round(λ₁ + (MID-0.5)/SCALING, digits=1))°E: model vs B-SOSE",
+        Label(fig[0, 1:2], "$(RUN) — day $(t-1) at $(round(SECT_LON, digits=1))°E: model vs B-SOSE",
               fontsize = 19, font = :bold)
 
         ax1 = Axis(fig[1, 1:2], title = "mixed layer depth", xlabel = "latitude",
@@ -690,15 +706,8 @@ if isfile(sect_file)
 
     let
         depth_bins = [(0.0, 25.0), (25.0, 50.0), (50.0, 100.0), (100.0, 150.0), (150.0, Z_TOP)]
-        lat_bands  = [(-70.0, -65.0), (-65.0, -60.0), (-60.0, -55.0), (-55.0, -50.0), (-50.0, -45.0)]
-
-        # wet in BOTH grids at this cell
-        wetboth(j, k) = kbot_model[j] !== nothing && kbot_parent[j] !== nothing &&
-                        k >= kbot_model[j] && k >= kbot_parent[j]
-
-        jsof(lo, hi) = [j for j in 1:Ny if lo <= φc[j] < hi]
-        ksof(lo, hi) = [k for k in 1:Nz if lo < -zc[k] <= hi]
-        kupper = ksof(0.0, Z_TOP)
+        lat_bands  = LAT_BANDS
+        kupper = ksof(0.0, Z_TOP)    # wetboth, binmean, jsof and ksof are shared with section 5
 
         # v LIVES ON φ_afa FACES, so a single-longitude slice of it is (Ny+1, Nz) while every
         # other field here is (Ny, Nz) -- it has one more row than there are latitude bands to
@@ -711,20 +720,6 @@ if isfile(sect_file)
         """One table cell, formatted. `@sprintf` needs a literal, hence the branch."""
         cell(v, prec) = isnan(v) ? lpad("---", 9) :
                         prec == 3 ? @sprintf("%9.3f", v) : @sprintf("%9.4f", v)
-
-        """cos(lat)-weighted mean of `D` over cells wet in both grids; also the cell count."""
-        function binmean(D, js, ks)
-            num = den = 0.0
-            cells = 0
-            for j in js, k in ks
-                (wetboth(j, k) && isfinite(D[j, k])) || continue
-                w = cosd(φc[j])
-                num += w * D[j, k]
-                den += w
-                cells += 1
-            end
-            return (den == 0 ? NaN : num / den), cells
-        end
 
         # ---- one panel per MONTH, built the same way section 1 builds the surface maps ----
         #
@@ -872,7 +867,7 @@ println("="^96)
 @printf("\n%-9s | %10s %10s | %10s %10s | %9s %9s\n",
         "month", "T model", "T parent", "S model", "S parent", "ΔT", "ΔS")
 println("-"^80)
-let m = [wet3(i, j, Nz) for i in 1:Nx, j in 1:Ny]
+let m = surface_wet
     mo(A) = (f = filter(isfinite, A[m]); isempty(f) ? NaN : mean(f))
     for n in sel
         label = Dates.format(bsose_window_center(bc_dates[n]), "yyyy-mm")
@@ -892,12 +887,209 @@ let m = [wet3(i, j, Nz) for i in 1:Nx, j in 1:Ny]
 end
 close(ds)
 
+# =============================================================== 5. drift along the section
+#
+# Section 4 asks whether the SURFACE drifts. This asks where in the water column a drift lives,
+# along the midlon section, for EVERY month of the run, not just the MONTHS preset: a drift is a
+# trend through all of them. Each month is the same comparison as everywhere else in this script,
+# the monthly mean of the daily section minus B-SOSE's monthly record at the section's column,
+# averaged by binmean over cells wet in both bathymetries.
+#
+# Memory. Every month resident at full 3-D would be the 3.4 GB the OOM reaper killed once (see
+# section 1's loader). B-SOSE is instead loaded DRIFT_CHUNK months at a time, and only the
+# section column of each is kept, so the cost does not grow with the run length.
+#
+# Reading it. A difference that keeps growing month on month in one depth band, whatever the
+# season, is drift; one that flips sign with the season is the surface forcing or the ice; one
+# that appears at every depth at once is the water arriving through the boundaries. With 24 or
+# more whole months it also prints the last 12 months minus the first 12, per year: the seasonal
+# cycle cancels in that difference, so it is the drift alone.
+const DRIFT_BANDS = [(0.0, 50.0), (50.0, 200.0), (200.0, 500.0), (500.0, 1500.0), (1500.0, Inf)]
+const DRIFT_CHUNK = parse(Int, get(ENV, "DRIFT_CHUNK", "6"))
+const MIN_DAYS    = parse(Int, get(ENV, "MIN_DAYS", "15"))
+
+if isfile(sect_file)
+    let
+        dsec = Dataset(sect_file)
+        st   = Float64.(dsec["time"][:])
+        Tall = Float64.(coalesce.(dsec["T"][1, :, :, :], NaN))   # (Ny, Nz, time)
+        Sall = Float64.(coalesce.(dsec["S"][1, :, :, :], NaN))
+        close(dsec)
+        size(Tall, 2) == Nz || error("$(RUN)_midlon.nc has $(size(Tall, 2)) levels, the grid $Nz")
+
+        sgroups = month_groups(st, bc_dates, start_date)
+        label(n) = Dates.format(bsose_window_center(bc_dates[n]), "yyyy-mm")
+        keep  = [n for n in eachindex(bc_dates) if length(sgroups[n]) >= MIN_DAYS]
+        short = [n for n in eachindex(bc_dates) if 0 < length(sgroups[n]) < MIN_DAYS]
+        isempty(short) || @info "section drift skips partial month(s) " *
+                                join(["$(label(n)) ($(length(sgroups[n])) d)" for n in short], ", ")
+
+        if isempty(keep)
+            @warn "no month has $MIN_DAYS or more section outputs: skipping the section drift"
+        else
+            meanover(A, g) = dropdims(sum(A[:, :, g], dims = 3), dims = 3) ./ length(g)
+            dT, dS = Dict{Int,Matrix{Float64}}(), Dict{Int,Matrix{Float64}}()
+            @info @sprintf("section drift: %d B-SOSE months, loaded %d at a time, column %d kept",
+                           length(keep), DRIFT_CHUNK, MID)
+            for chunk in Iterators.partition(keep, DRIFT_CHUNK)
+                c = collect(chunk)
+                load(var) = FieldTimeSeries(Metadata(var; dataset, dates = bc_dates[c], region), grid;
+                                            time_indices_in_memory = length(c))
+                Tc, Sc = load(:temperature), load(:salinity)
+                for (k, n) in enumerate(c)
+                    dT[n] = meanover(Tall, sgroups[n]) .- Array(interior(Tc[k]))[MID, :, :]
+                    dS[n] = meanover(Sall, sgroups[n]) .- Array(interior(Sc[k]))[MID, :, :]
+                end
+                Tc = Sc = nothing
+                GC.gc()
+            end
+
+            band_label(lo, hi) = isinf(hi) ? @sprintf("%.0f-floor", lo) : @sprintf("%.0f-%.0f", lo, hi)
+            fmtcell(v, prec) = isnan(v) ? lpad("---", 11) :
+                               prec == 3 ? @sprintf("%11.3f", v) : @sprintf("%11.4f", v)
+            bandks = [ksof(lo, hi) for (lo, hi) in DRIFT_BANDS]
+            VARS = (("ΔT", dT, "°C", 3), ("ΔS", dS, "g/kg", 4))
+
+            println()
+            println("="^100)
+            @printf("5. SECTION DRIFT along the %.1fE section, every month with %d+ days of output\n", SECT_LON, MIN_DAYS)
+            println("   Monthly mean model minus monthly B-SOSE, signed, cos(lat)-weighted over cells wet in")
+            println("   BOTH bathymetries. Growing in one band whatever the season = drift; flipping sign with")
+            println("   the season = forcing or ice; at every depth at once = the boundaries.")
+            println("="^100)
+
+            for (name, D, unit, prec) in VARS
+                @printf("\n%s (%s), by depth (m)\n%-9s |", name, unit, "month")
+                for b in DRIFT_BANDS; @printf("%11s", band_label(b...)); end
+                @printf("%11s\n", "all")
+                println("-"^(11 + 11 * (length(DRIFT_BANDS) + 1)))
+                for n in keep
+                    @printf("%-9s |", label(n))
+                    for ks in bandks; print(fmtcell(binmean(D[n], 1:Ny, ks)[1], prec)); end
+                    println(fmtcell(binmean(D[n], 1:Ny, 1:Nz)[1], prec))
+                end
+                @printf("%-9s |", "cells")
+                for ks in bandks; @printf("%11d", binmean(D[first(keep)], 1:Ny, ks)[2]); end
+                @printf("%11d\n", binmean(D[first(keep)], 1:Ny, 1:Nz)[2])
+            end
+
+            # The seasonal cycle cancels in (last 12 months - first 12), provided each block holds all
+            # twelve calendar months once
+            if length(keep) >= 24
+                first12, last12 = keep[1:12], keep[(end - 11):end]
+                whole(ns) = length(unique(month.(bsose_window_center.(bc_dates[ns])))) == 12
+                years_in(ns) = mean(Dates.value.(bsose_window_center.(bc_dates[ns]) .- start_date)) / (86400e3 * 365.25)
+                gap = years_in(last12) - years_in(first12)
+                (whole(first12) && whole(last12)) ||
+                    @warn "the first or last 12 kept months do not cover all 12 calendar months: the per-year drift below still carries part of the seasonal cycle"
+                @printf("\nDRIFT PER YEAR, seasonal cycle removed: (mean of %s..%s) - (mean of %s..%s), / %.2f yr\n",
+                        label(first(last12)), label(last(last12)), label(first(first12)), label(last(first12)), gap)
+                @printf("%-9s |", "")
+                for b in DRIFT_BANDS; @printf("%11s", band_label(b...)); end
+                @printf("%11s\n", "all")
+                for (name, D, unit, prec) in VARS
+                    @printf("%-9s |", "$name/yr")
+                    for ks in vcat(bandks, [1:Nz])
+                        a = mean(binmean(D[n], 1:Ny, ks)[1] for n in first12)
+                        b = mean(binmean(D[n], 1:Ny, ks)[1] for n in last12)
+                        print(fmtcell((b - a) / gap, prec))
+                    end
+                    println("   ($unit/yr)")
+                end
+            else
+                println("\n(fewer than 24 whole months: no drift estimate with the seasonal cycle removed)")
+            end
+
+            # The same, split by latitude, in two layers: the shelf and the ACC drift differently
+            for (name, D, unit, prec) in VARS, (zlo, zhi) in ((0.0, 200.0), (200.0, Inf))
+                ks = ksof(zlo, zhi)
+                @printf("\n%s (%s), %s m, by latitude\n%-9s |", name, unit, band_label(zlo, zhi), "month")
+                for (a, b) in LAT_BANDS; @printf("%11s", @sprintf("%.0f-%.0fS", -a, -b)); end
+                println()
+                println("-"^(11 + 11 * length(LAT_BANDS)))
+                for n in keep
+                    @printf("%-9s |", label(n))
+                    for (a, b) in LAT_BANDS
+                        v, nc = binmean(D[n], jsof(a, b), ks)
+                        print(nc == 0 ? lpad("---", 11) : fmtcell(v, prec))
+                    end
+                    println()
+                end
+            end
+
+            # ---- figure: depth against month, the latitude-mean difference (a Hovmöller) ----
+            #
+            # Each panel its own colour range: the upper ocean's differences are an order larger than
+            # the deep ocean's, and one shared range would leave the full-depth panel blank.
+            nm = length(keep)
+            xs = collect(1:nm)
+            step = max(1, cld(nm, 12))
+            ticks = (xs[1:step:end], [label(keep[i]) for i in 1:step:nm])
+            fig = Figure(size = (1500, 900))
+            Label(fig[0, 1:4], "$(RUN) — section drift at $(round(SECT_LON, digits = 1))°E: " *
+                  "latitude-mean, monthly mean model − monthly B-SOSE", fontsize = 19, font = :bold)
+            for (row, (name, D, unit, _)) in enumerate(VARS)
+                P = [binmean(D[n], 1:Ny, k:k)[1] for n in keep, k in 1:Nz]    # (month, level)
+                for (col, (zmax, ttl)) in enumerate(((500.0, "upper 500 m"), (Inf, "full depth")))
+                    inrange = [k for k in 1:Nz if -zc[k] <= zmax]
+                    fin = filter(isfinite, vec(P[:, inrange]))
+                    lim = isempty(fin) ? 1.0 : max(quantile(abs.(fin), 0.99), 1e-9)
+                    ax = Axis(fig[row, 2col - 1], title = "$name ($unit), $ttl", ylabel = "z (m)",
+                              xticks = ticks, xticklabelrotation = π / 4)
+                    hm = heatmap!(ax, xs, zc, P, colormap = :balance, colorrange = (-lim, lim),
+                                  nan_color = :gray85)
+                    isinf(zmax) ? ylims!(ax, zf[1], 0) : ylims!(ax, -zmax, 0)
+                    Colorbar(fig[row, 2col], hm, label = unit)
+                end
+            end
+            Label(fig[3, 1:4], "cos(lat)-weighted mean along the section at each level, over cells wet in both " *
+                  "bathymetries. Grey: no such cell. Months with fewer than $MIN_DAYS days of output are left out.",
+                  fontsize = 11)
+            f = joinpath(OUTDIR, "$(RUN)_section_drift.png")
+            save(f, fig); @info "wrote $f"
+
+            # ---- figure: full-depth latitude-depth differences for the MONTHS months ----
+            #
+            # 3b shows the upper Z_TOP m; this is the whole column, which is where a slow deep drift
+            # shows up. One colour range per row, shared across months, as 3b does.
+            fd = [n for n in keep if month(bsose_window_center(bc_dates[n])) in MONTHS]
+            if !isempty(fd)
+                masked(D) = [wetboth(j, k) ? D[j, k] : NaN for j in 1:Ny, k in 1:Nz]
+                ncol = length(fd)
+                fig = Figure(size = (430 * ncol + 120, 900))
+                Label(fig[0, 1:(ncol + 1)], "$(RUN) — monthly mean model − monthly B-SOSE, full depth at " *
+                      "$(round(SECT_LON, digits = 1))°E", fontsize = 19, font = :bold)
+                for (row, (name, D, unit, _)) in enumerate(VARS)
+                    Ms = [masked(D[n]) for n in fd]
+                    fin = filter(isfinite, vcat(vec.(Ms)...))
+                    lim = isempty(fin) ? 1.0 : max(quantile(abs.(fin), 0.99), 1e-9)
+                    local hm
+                    for (c, n) in enumerate(fd)
+                        ax = Axis(fig[row, c], title = "$(label(n))  $name ($unit)", xlabel = "latitude",
+                                  ylabel = c == 1 ? "z (m)" : "")
+                        hm = heatmap!(ax, φc, zc, Ms[c], colormap = :balance, colorrange = (-lim, lim),
+                                      nan_color = :gray85)
+                        ylims!(ax, zf[1], 0)
+                    end
+                    Colorbar(fig[row, ncol + 1], hm, label = unit)
+                end
+                Label(fig[3, 1:(ncol + 1)], "Grey is where the two bathymetries disagree. One colour range per row, " *
+                      "shared across months.", fontsize = 11)
+                f = joinpath(OUTDIR, "$(RUN)_section_fulldepth.png")
+                save(f, fig); @info "wrote $f"
+            end
+        end
+    end
+else
+    @warn "no $sect_file -- skipping the section drift. It needs the midlon section."
+end
+
 println("""
 
 Reading this:
-  * Section 1 is the only test of the sponge. A knee near $SPONGE_CELLS cells means it is working.
-    No knee -- the same error at 2 cells as at 60 -- means it is not, and nothing downstream of
-    the boundary conditions can be interpreted.
+  * Section 1 is the only test of the $(NESTED ? "nest's relaxation band" : "sponge"). A knee near $SPONGE_CELLS cells means it
+    is working. No knee -- the same error at 2 cells as at 60 -- means it is not, and nothing
+    downstream of the boundary conditions can be interpreted.
   * Section 2: if the model MLD is a few metres where B-SOSE is tens, PENETRATING_SHORTWAVE is
     not doing its job and the warm-bias failure of section 3.3 has returned. That is the single
     most important number in this report for the science.
@@ -905,17 +1097,22 @@ Reading this:
     preserving the temperature minimum. Check the Tmin DEPTH as well as its value -- too deep is
     as wrong as too warm, and it is the vertical grid's job to resolve it.
   * Section 3b separates WHERE the bias is from HOW BIG it is. Surface-trapped and seasonally
-    reversing is the signature of missing sea ice, not of the boundaries; uniform over the upper
-    200 m means the water mass itself is wrong, which is a boundary or initialisation question.
-    Read it against the mixed-layer lines: a bias below the mixed layer cannot be this season's
-    surface forcing.
+    reversing is the signature of the surface forcing or the ice, not of the boundaries; uniform
+    over the upper 200 m means the water mass itself is wrong, which is a boundary or
+    initialisation question. Read it against the mixed-layer lines: a bias below the mixed layer
+    cannot be this season's surface forcing.
   * Section 4: a steady drift in the domain mean with no boundary imbalance points at surface
     forcing, not at the boundaries.
+  * Section 5 is section 4 through the water column, along the section. Read the per-year line
+    first: it is the drift with the seasonal cycle removed. Then the latitude tables, to see
+    whether it is the shelf (70-65S) or the open ocean, and the drift figure, to see whether it
+    starts at the surface and works down (surface forcing, brine) or appears at depth.
 
 Caveats that are not this script's fault:
-  * NO SEA ICE. B-SOSE's TFLUX includes the effect of an ice cover this model does not have, and
-    a June-February run at 70-45S is ice-covered over much of its southern half in winter. Expect
-    the largest surface discrepancies there, and do not read them as a boundary problem.
+  * SEA ICE. Nested runs from 2Y_nested_seaice_* on have ClimaSeaIce; src/model.jl runs and the
+    ocean-only nests had none, and for those B-SOSE's TFLUX includes the effect of an ice cover
+    the model does not have. Either way, expect the largest surface differences in the seasonal
+    ice zone, and do not read them as a boundary problem.
   * TEOS10 vs MITgcm conventions -- see the header. Threshold MLD is robust to it; absolute
     densities and few-hundredths-of-a-degree Tmin differences are not.
 """)
