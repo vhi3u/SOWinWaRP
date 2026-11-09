@@ -5,8 +5,8 @@
 #   ./create_job.sh glorys_ncar cpu 12 none 32G tools/convert_glorys_ncar.jl
 #   sbatch slurm_glorys_ncar.sh
 #
-# Split across jobs that run at once with START/END (a window of the run; the files are per day, so windows
-# never write the same file):
+# Split across jobs that run at once with START/END (a window of the run, START included and END not, so
+# adjacent windows never cut the same day):
 #
 #   START=2014-05-31 END=2015-01-01 sbatch slurm_glorys_ncar_1.sh
 #   START=2015-01-01 END=2015-09-01 sbatch slurm_glorys_ncar_2.sh
@@ -76,7 +76,7 @@ ocean_names = (:temperature, :salinity, :u_velocity, :v_velocity, :free_surface)
 cuts = Dict{Date, Vector{Tuple{String, Any, String}}}()
 add!(m) = for d in m
     day = Date(d.dates)
-    window[1] <= day <= window[2] || continue
+    window[1] <= day < window[2] || continue   # END is exclusive, so adjacent windows share no day
     entry = (dataset_variable_name(d), d.region, joinpath(d.dir, d.filename))
     list = get!(cuts, day, Tuple{String, Any, String}[])
     entry in list || push!(list, entry)

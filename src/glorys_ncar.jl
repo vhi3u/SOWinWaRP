@@ -28,7 +28,7 @@ end
 
 Write variable `name` (NCAR's own name: thetao, so, uo, vo, zos, siconc, sithick, ...) of the open NCAR
 file `src`, over `region` (a BoundingBox, or `nothing` for the globe) plus NCAR_MARGIN, to `path`. Values
-stay packed as NCAR stores them, with every attribute. Written to `path.part` and renamed, so a file at
+stay packed as NCAR stores them, with every attribute. Written to `path.part<pid>` and renamed, so a file at
 `path` is always complete, even with several jobs cutting at once.
 """
 function cut_ncar_glorys(src, name, region, path)
@@ -42,7 +42,7 @@ function cut_ncar_glorys(src, name, region, path)
     dims = dimnames(v)
     index = Tuple(d == "longitude" ? i : d == "latitude" ? j : Colon() for d in dims)
 
-    part = path * ".part"
+    part = path * ".part" * string(getpid())   # per process: two jobs cutting one file never share a .part
     isfile(part) && rm(part)
     NCDataset(part, "c") do out
         for d in dims
