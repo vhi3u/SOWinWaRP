@@ -19,9 +19,20 @@
 # h·ℵ (volume per area), not h, is the measure of how much ice there is: h is the thickness of
 # the ice-covered part, so it can be enormous where ℵ is tiny (fix1's 22 m at ℵ = 0.000).
 # Daily records only: a jump between two records is the net of a day, not one time step.
+#
+# B-SOSE ALONGSIDE (BSOSE_DIR set and its 5-day ice files there): B-SOSE's SIarea and SIheff are
+# drawn in black over the domain area and volume (summed over the same lon-lat box) and over the
+# CELL panels (B-SOSE's nearest column), and the winter open-water fraction at the cell is
+# printed for both, year by year. That is the polynya test: a coast B-SOSE opens in winter and the
+# model keeps closed is a coast where the model makes no new ice and so rejects no brine.
+# SIheff is MITgcm's effective thickness, already volume per area, so it compares with h·ℵ; B-SOSE's
+# h is SIheff / SIarea. 5-day means against daily records: B-SOSE will look smoother.
+#
+#     BSOSE_DIR=/storage/scratch1/1/vnguyen480/SOWinWaRP/data CELL=145,-66.5 \
+#         julia --project=. tools/plot_sea_ice.jl 2Y_nested_seaice_fix5_flux
 # ==============================================================================================
 
-using NCDatasets, CairoMakie, Dates, Printf
+using NCDatasets, CairoMakie, Dates, Printf, Statistics
 
 RUN    = isempty(ARGS) ? get(ENV, "RUN", "") : ARGS[1]
 isempty(RUN) && error("give the run name: julia --project=. tools/plot_sea_ice.jl <RUN>")
@@ -76,6 +87,82 @@ end
 cell = where_is(ic, jc)
 cell_h, cell_ℵ, cell_V = h[ic, jc, :], ℵ[ic, jc, :], V[ic, jc, :]
 
+# ── B-SOSE alongside (optional) ──────────────────────────────────────────────────────────────
+# The 5-day files are one per year, each stamp at the END of the 5 days it averages. Geometry
+# (XC, YC, rA, Depth) from the monthly surfTflx file, as tools/ice_production.jl reads it.
+const BSOSE_DIR = get(ENV, "BSOSE_DIR", "")
+bsose_ice_file(token, y) = joinpath(BSOSE_DIR, "$(token)_bsoseI156_$(y)_5day.nc")
+
+B = let
+    if isempty(BSOSE_DIR) || isnothing(start)
+        isempty(BSOSE_DIR) || @warn "no start_date in $path: B-SOSE cannot be placed on the run's day axis"
+        nothing
+    else
+        years = year(start):year(start + Second(round(Int, last(t) * 86400)))
+        missing_files = [f for y in years for f in (bsose_ice_file("SIArea", y), bsose_ice_file("SIHeff", y)) if !isfile(f)]
+        geom = joinpath(BSOSE_DIR, "surfTflx_bsoseI156_2013to2024_monthly.nc")
+        if !isempty(missing_files) || !isfile(geom)
+            @warn "B-SOSE ice not drawn: missing $(join(basename.([missing_files; isfile(geom) ? String[] : [geom]]), ", "))"
+            nothing
+        else
+            gds = NCDataset(geom)
+            xc, yc = g(gds["XC"][:]), g(gds["YC"][:])
+            dλ, dφ = (λ[end] - λ[1]) / (Nx - 1), (φ[end] - φ[1]) / (Ny - 1)
+            I = findall(x -> λ[1] - dλ / 2 <= x <= λ[end] + dλ / 2, xc)
+            J = findall(y -> φ[1] - dφ / 2 <= y <= φ[end] + dφ / 2, yc)
+            IR, JR = minimum(I):maximum(I), minimum(J):maximum(J)
+            bwet = g(gds["Depth"][IR, JR]) .> 0
+            rA = haskey(gds, "rA") ? g(gds["rA"][IR, JR]) :
+                 [(6.371e6 * deg2rad(xc[2] - xc[1]))^2 * cosd(y) for _ in IR, y in yc[JR]]
+            close(gds)
+            ib, jb = argmin(abs.(xc[IR] .- λ[ic])), argmin(abs.(yc[JR] .- φ[jc]))
+            days, barea, bvol, bcellA, bcellH = Float64[], Float64[], Float64[], Float64[], Float64[]
+            for y in years
+                a = NCDataset(bsose_ice_file("SIArea", y)); hf = NCDataset(bsose_ice_file("SIHeff", y))
+                av = first(k for k in ("SIarea", "SIArea", "SIAREA") if haskey(a, k))
+                hv = first(k for k in ("SIheff", "SIHeff", "SIHEFF") if haskey(hf, k))
+                A3 = g(a[av][IR, JR, :]); H3 = g(hf[hv][IR, JR, :])
+                stamps = [DateTime(s) for s in a["time"][:]]
+                close(a); close(hf)
+                for n in eachindex(stamps)
+                    c = stamps[n] - Hour(60)                         # the 5-day window's centre
+                    d = Dates.value(c - start) / 86_400_000
+                    -2.5 <= d <= last(t) + 2.5 || continue
+                    An, Hn = view(A3, :, :, n), view(H3, :, :, n)
+                    push!(days, d)
+                    push!(barea, sum(ifelse(bwet[k] && isfinite(An[k]), An[k] * rA[k], 0.0) for k in eachindex(An)) / 1e12)
+                    push!(bvol,  sum(ifelse(bwet[k] && isfinite(Hn[k]), Hn[k] * rA[k], 0.0) for k in eachindex(Hn)) / 1e9)
+                    push!(bcellA, An[ib, jb]); push!(bcellH, Hn[ib, jb])
+                end
+            end
+            @info @sprintf("B-SOSE ice: %d 5-day records; cell %.2fE %.2fS (nearest to the model's %s)",
+                           length(days), xc[IR][ib], -yc[JR][jb], cell)
+            (; days, area = barea, volume = bvol, cellℵ = bcellA, cellV = bcellH,
+               cellh = [a > 0.01 ? v / a : NaN for (a, v) in zip(bcellA, bcellH)],
+               where = @sprintf("%.2fE %.2fS", xc[IR][ib], -yc[JR][jb]))
+        end
+    end
+end
+
+# Winter open water at the cell: the polynya test. Jun-Sep, mean of (1 - ℵ) and the share of
+# records with ℵ < 0.85, model daily against B-SOSE 5-day.
+if B !== nothing
+    month_of(d) = month(start + Second(round(Int, d * 86400)))
+    year_of(d)  = year(start + Second(round(Int, d * 86400)))
+    println(@sprintf("Winter (Jun-Sep) open water at %s, model daily vs B-SOSE 5-day at %s:", cell, B.where))
+    println("  year |  mean 1-ℵ  model / B-SOSE |  records with ℵ < 0.85  model / B-SOSE |  mean h·ℵ (m)  model / B-SOSE")
+    for y in sort(unique(year_of.(t)))
+        km = [n for n in eachindex(t) if year_of(t[n]) == y && month_of(t[n]) in 6:9]
+        kb = [n for n in eachindex(B.days) if year_of(B.days[n]) == y && month_of(B.days[n]) in 6:9]
+        (isempty(km) || isempty(kb)) && continue
+        println(@sprintf("  %4d |      %5.3f / %5.3f       |            %5.1f%% / %5.1f%%           |      %5.2f / %5.2f",
+                         y, mean(1 .- cell_ℵ[km]), mean(1 .- B.cellℵ[kb]),
+                         100 * count(<(0.85), cell_ℵ[km]) / length(km), 100 * count(<(0.85), B.cellℵ[kb]) / length(kb),
+                         mean(cell_V[km]), mean(B.cellV[kb])))
+    end
+    println()
+end
+
 # ── jumps ────────────────────────────────────────────────────────────────────────────────────
 println()
 println(@sprintf("%s: %d daily records, days %.0f-%.0f; largest h·ℵ %.1f m on %s at %s",
@@ -99,10 +186,13 @@ const SERIES_WIDTH, SERIES_HEIGHT = 850, 190
 Label(fig[0, 1], "$RUN sea ice" * (isnothing(start) ? "" : ", day 0 = $(Date(start))"); fontsize = 16, font = :bold)
 
 ax1 = Axis(fig[1, 1]; width = SERIES_WIDTH, height = SERIES_HEIGHT, ylabel = "area (10⁶ km²)", title = "Domain ice area, Σ ℵ·A")
-lines!(ax1, t, area; color = :royalblue)
+lines!(ax1, t, area; color = :royalblue, label = "model")
+B === nothing || (lines!(ax1, B.days, B.area; color = :black, linestyle = :dash, label = "B-SOSE, 5-day");
+                  axislegend(ax1; position = :rt, framevisible = false))
 
 ax2 = Axis(fig[2, 1]; width = SERIES_WIDTH, height = SERIES_HEIGHT, ylabel = "volume (km³)", title = "Domain ice volume, Σ h·ℵ·A")
 lines!(ax2, t, volume; color = :royalblue)
+B === nothing || lines!(ax2, B.days, B.volume; color = :black, linestyle = :dash)
 
 ax3 = Axis(fig[3, 1]; width = SERIES_WIDTH, height = SERIES_HEIGHT, ylabel = "m", yscale = log10, title = "Largest anywhere in the domain")
 lines!(ax3, t, positive(maxV); color = :firebrick, linewidth = 2, label = "max h·ℵ")
@@ -113,10 +203,16 @@ axislegend(ax3; position = :lt, framevisible = false)
 ax4 = Axis(fig[4, 1]; width = SERIES_WIDTH, height = SERIES_HEIGHT, ylabel = "m", title = "At $cell (i = $ic, j = $jc)")
 lines!(ax4, t, cell_V; color = :firebrick, linewidth = 2, label = "h·ℵ")
 lines!(ax4, t, cell_h; color = :grey40, label = "h")
+if B !== nothing
+    lines!(ax4, B.days, B.cellV; color = :black, linewidth = 2, label = "B-SOSE SIheff (= h·ℵ)")
+    lines!(ax4, B.days, B.cellh; color = :black, linestyle = :dot, label = "B-SOSE h")
+end
 axislegend(ax4; position = :lt, framevisible = false)
 
 ax5 = Axis(fig[5, 1]; width = SERIES_WIDTH, height = SERIES_HEIGHT, ylabel = "ℵ", xlabel = "days since start", title = "Concentration at $cell")
-lines!(ax5, t, cell_ℵ; color = :seagreen)
+lines!(ax5, t, cell_ℵ; color = :seagreen, label = "model")
+B === nothing || (lines!(ax5, B.days, B.cellℵ; color = :black, linewidth = 2, label = "B-SOSE SIarea at $(B.where)");
+                  axislegend(ax5; position = :lb, framevisible = false))
 ylims!(ax5, -0.02, 1.02)
 
 linkxaxes!(ax1, ax2, ax3, ax4, ax5)
