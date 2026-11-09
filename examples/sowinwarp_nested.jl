@@ -108,16 +108,18 @@ const ICE_BOUNDARY            = "bsose"   # "bsose": relax the open-side bands t
 const ICE_RELAXATION_HOURS    = 6         # the bands' relaxation time, with ICE_BOUNDARY = "bsose"
 const PENETRATING_SHORTWAVE   = true      # shortwave through the column (TwoColorRadiation); false: all in the top cell (up to fix5_flux)
 const ICE_GROUNDING           = false     # Lemieux (2015) landfast basal stress where depth < 30 m; true up to fix6 (see "sea ice")
+const BATHYMETRY              = "bsose"   # "bsose": B-SOSE i156's own Depth (grid.nc); "etopo": ETOPO2022 (up to fix7). See "bathymetry"
 
 ICE_INIT in ("bsose", "none") || error("ICE_INIT must be \"bsose\" or \"none\", got $ICE_INIT")
 ICE_BOUNDARY in ("bsose", "delete") || error("ICE_BOUNDARY must be \"bsose\" or \"delete\", got $ICE_BOUNDARY")
+BATHYMETRY in ("bsose", "etopo") || error("BATHYMETRY must be \"bsose\" or \"etopo\", got $BATHYMETRY")
 for name in ("COASTAL_FRESHWATER", "COASTAL_FRESHWATER_FILE", "ICE_INIT", "ICE_BOUNDARY", "ICE_RELAXATION_HOURS",
-             "PENETRATING_SHORTWAVE", "ICE_GROUNDING")
+             "PENETRATING_SHORTWAVE", "ICE_GROUNDING", "BATHYMETRY")
     haskey(ENV, name) && @warn "$name is set in the environment, which this script no longer reads: set it in the switches block of examples/sowinwarp_nested.jl"
 end
 @info "switches: COASTAL_FRESHWATER = $COASTAL_FRESHWATER ($COASTAL_FRESHWATER_FILE), ICE_INIT = $ICE_INIT, " *
       "ICE_BOUNDARY = $ICE_BOUNDARY, ICE_RELAXATION_HOURS = $ICE_RELAXATION_HOURS, " *
-      "PENETRATING_SHORTWAVE = $PENETRATING_SHORTWAVE, ICE_GROUNDING = $ICE_GROUNDING"
+      "PENETRATING_SHORTWAVE = $PENETRATING_SHORTWAVE, ICE_GROUNDING = $ICE_GROUNDING, BATHYMETRY = $BATHYMETRY"
 
 # ── penetrating shortwave (PENETRATING_SHORTWAVE, in the switches) ────────────────────────────
 # The coupler finds the ocean's TwoColorRadiation with `get_radiative_forcing(ocean)`
@@ -181,6 +183,88 @@ bottom_height = regrid_bathymetry(underlying_grid;
                                   minimum_depth = 10,
                                   interpolation_passes = 5,
                                   major_basins = 1)
+
+# ── bathymetry (BATHYMETRY, in the switches) ──────────────────────────────────────────────────
+# "bsose" replaces ETOPO2022 with the seafloor B-SOSE itself ran on: `Depth` in BSOSE_DIR/grid.nc
+# (iteration 156, partial cells included). XC/YC are read; XG/YG in that file are corrupt and are
+# not, and RAC is missing over land, so each B-SOSE cell is weighted by its own latitude span
+# (half-way to its neighbours' centres) times cos(lat), which within one column is its area. B-SOSE's longitudes are the nest's own centres, so each nest column takes exactly one
+# B-SOSE column; its latitude is Mercator-like (0.057 deg at 70S to 0.117 deg at 45S), so each nest
+# cell gathers the 1-3 B-SOSE cells whose centres fall inside it. The cell is ocean when at least half
+# of that area is wet, at the area-weighted mean depth of the wet part. The same minimum depth (10 m),
+# connectivity (one basin, as major_basins = 1) and dead-end filling as ETOPO's then apply.
+# Why: fix7 piled ice at 97.1-97.4E 65.1-65.2S, a pocket ETOPO makes 10-100 m deep where B-SOSE has
+# ~380 m of open water, and B-SOSE's ice there is ~2 m and often open.
+const BSOSE_MINIMUM_DEPTH = 10.0
+
+function bsose_bottom_height(path)
+    isfile(path) || error("$path not found: BATHYMETRY = \"bsose\" needs B-SOSE's grid.nc in BSOSE_DIR")
+    ds = NCDataset(path)
+    X = Float64.(ds["XC"][:, 1])
+    Y = Float64.(ds["YC"][1, :])
+    D = Float64.(coalesce.(ds["Depth"][:, :], 0.0))
+    close(ds)
+
+    edges = vcat(1.5Y[1] - 0.5Y[2], (Y[1:end-1] .+ Y[2:end]) ./ 2, 1.5Y[end] - 0.5Y[end-1])
+    A = diff(edges) .* cosd.(Y)
+
+    inside = findall(x -> λ₁ < x < λ₂, X)
+    length(inside) == Nx ||
+        error("$path has $(length(inside)) longitudes in $(λ₁)-$(λ₂)E, the nest $Nx: the columns do not line up")
+
+    area = zeros(Nx, Ny); wet = zeros(Nx, Ny); volume = zeros(Nx, Ny)
+    for jb in eachindex(Y), ib in inside
+        i = floor(Int, (X[ib] - λ₁) * SCALING) + 1
+        j = floor(Int, (Y[jb] - φ₁) * SCALING) + 1
+        1 <= j <= Ny || continue
+        area[i, j] += A[jb]
+        if D[ib, jb] > 0
+            wet[i, j]    += A[jb]
+            volume[i, j] += A[jb] * D[ib, jb]
+        end
+    end
+    any(iszero, area) && error("$(count(iszero, area)) nest cells hold no B-SOSE cell centre")
+
+    z = [wet[i, j] >= 0.5 * area[i, j] ? -max(volume[i, j] / wet[i, j], BSOSE_MINIMUM_DEPTH) : 0.0
+         for i in 1:Nx, j in 1:Ny]
+
+    # One basin: keep the ocean reachable from the open sides (W, E, N); anything else is a lake
+    reached = falses(Nx, Ny)
+    queue = [(i, j) for i in 1:Nx, j in 1:Ny if (i == 1 || i == Nx || j == Ny) && z[i, j] < 0]
+    foreach(c -> reached[c...] = true, queue)
+    while !isempty(queue)
+        i, j = pop!(queue)
+        for (a, b) in ((i-1, j), (i+1, j), (i, j-1), (i, j+1))
+            if 1 <= a <= Nx && 1 <= b <= Ny && !reached[a, b] && z[a, b] < 0
+                reached[a, b] = true
+                push!(queue, (a, b))
+            end
+        end
+    end
+    lakes = count(z .< 0 .&& .!reached)
+    z[.!reached] .= 0.0
+
+    return z, lakes
+end
+
+if BATHYMETRY == "bsose"
+    etopo = Array(interior(bottom_height))[:, :, 1]
+    z_bsose, lakes = bsose_bottom_height(joinpath(BDIR, "grid.nc"))
+    set!(bottom_height, reshape(z_bsose, Nx, Ny, 1))
+    fill_halo_regions!(bottom_height)
+
+    wet_e, wet_b = etopo .< 0, z_bsose .< 0
+    both = wet_e .& wet_b
+    depth_at(z, λ, φ) = z[floor(Int, (λ - λ₁) * SCALING) + 1, floor(Int, (φ - φ₁) * SCALING) + 1]
+    @info @sprintf("bathymetry: B-SOSE i156 Depth -- %d wet cells (ETOPO2022 %d); %d wet only in B-SOSE, %d only in ETOPO; " *
+                   "%d lake cells removed", count(wet_b), count(wet_e), count(wet_b .& .!wet_e), count(wet_e .& .!wet_b), lakes)
+    @info @sprintf("bathymetry: where both are wet, depth differs by >50%% in %d of %d cells; cells <= 30 m deep: B-SOSE %d, ETOPO %d",
+                   count(abs.(z_bsose[both] .- etopo[both]) .> 0.5 .* abs.(etopo[both])), count(both),
+                   count(wet_b .& (z_bsose .>= -30)), count(wet_e .& (etopo .>= -30)))
+    @info @sprintf("bathymetry: the 97E corner -- 97.4E 65.2S: B-SOSE %.0f m, ETOPO %.0f m; 97.1E 65.1S: B-SOSE %.0f m, ETOPO %.0f m",
+                   abs(depth_at(z_bsose, 97.4, -65.2)), abs(depth_at(etopo, 97.4, -65.2)),
+                   abs(depth_at(z_bsose, 97.1, -65.1)), abs(depth_at(etopo, 97.1, -65.1)))
+end
 
 # Fill dead-end pockets: an ocean column with land on 3 or 4 of its 4 sides becomes land, repeated
 # until none is left, so one-cell inlets close from their dead end outward. 2Y_nested_seaice_fix1
@@ -732,6 +816,7 @@ output_metadata = Dict("run_name" => RUN_NAME,
                                             "open-side bands ice deleted"),
     "coastal_freshwater" => COASTAL_FRESHWATER ? "B-SOSE coastal excess from $(COASTAL_FRESHWATER_FILE)" : "none",
     "ice_grounding" => ICE_GROUNDING ? "LandfastBasalStress (NumericalEarth default)" : "off (basal_stress = nothing)",
+    "bathymetry" => BATHYMETRY == "bsose" ? "B-SOSE i156 Depth (grid.nc), area-aggregated" : "ETOPO2022",
     "penetrating_shortwave" => PENETRATING_SHORTWAVE ? "yes: TwoColorRadiation fed by the coupler" :
                                                        "no: all shortwave in the top cell's heat flux",
     "vertical_coordinate" => "static z, B-SOSE i156's 52 levels")
