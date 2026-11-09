@@ -107,16 +107,17 @@ const ICE_INIT                = "bsose"   # "bsose": start from B-SOSE's ice; "n
 const ICE_BOUNDARY            = "bsose"   # "bsose": relax the open-side bands to B-SOSE's ice; "delete" (up to fix3)
 const ICE_RELAXATION_HOURS    = 6         # the bands' relaxation time, with ICE_BOUNDARY = "bsose"
 const PENETRATING_SHORTWAVE   = true      # shortwave through the column (TwoColorRadiation); false: all in the top cell (up to fix5_flux)
+const ICE_GROUNDING           = false     # Lemieux (2015) landfast basal stress where depth < 30 m; true up to fix6 (see "sea ice")
 
 ICE_INIT in ("bsose", "none") || error("ICE_INIT must be \"bsose\" or \"none\", got $ICE_INIT")
 ICE_BOUNDARY in ("bsose", "delete") || error("ICE_BOUNDARY must be \"bsose\" or \"delete\", got $ICE_BOUNDARY")
 for name in ("COASTAL_FRESHWATER", "COASTAL_FRESHWATER_FILE", "ICE_INIT", "ICE_BOUNDARY", "ICE_RELAXATION_HOURS",
-             "PENETRATING_SHORTWAVE")
+             "PENETRATING_SHORTWAVE", "ICE_GROUNDING")
     haskey(ENV, name) && @warn "$name is set in the environment, which this script no longer reads: set it in the switches block of examples/sowinwarp_nested.jl"
 end
 @info "switches: COASTAL_FRESHWATER = $COASTAL_FRESHWATER ($COASTAL_FRESHWATER_FILE), ICE_INIT = $ICE_INIT, " *
       "ICE_BOUNDARY = $ICE_BOUNDARY, ICE_RELAXATION_HOURS = $ICE_RELAXATION_HOURS, " *
-      "PENETRATING_SHORTWAVE = $PENETRATING_SHORTWAVE"
+      "PENETRATING_SHORTWAVE = $PENETRATING_SHORTWAVE, ICE_GROUNDING = $ICE_GROUNDING"
 
 # ── penetrating shortwave (PENETRATING_SHORTWAVE, in the switches) ────────────────────────────
 # The coupler finds the ocean's TwoColorRadiation with `get_radiative_forcing(ocean)`
@@ -319,8 +320,22 @@ radiation  = ERA5PrescribedRadiation(ARCH; dataset = era5_dataset, start_date = 
 # On the child's grid, so ice and ocean share cells and the exchange grid is the child's own.
 # IncrementalRemapping needs the forward-Euler stepper (the sea_ice_simulation default), a halo of 2
 # and an ice Courant number below 1, which the wizard's ice CFL keeps.
+#
+# GROUNDING (ICE_GROUNDING). NumericalEarth's `sea_ice_dynamics` turns on ClimaSeaIce's
+# LandfastBasalStress (Lemieux et al. 2015: ice thicker than depth*ℵ/8 is held by the sea floor,
+# wherever the water is under 30 m), although ClimaSeaIce's own default is none. MITgcm has the same
+# scheme off by default. In our grid it acts in shallow pockets, and at 97.4E 65.2S, a 10.4 m cell
+# walled by land on two sides, it held every floe over ~1.3 m: up to fix6 the pile there reached 47 m
+# (B-SOSE: ~2 m, often open). ICE_GROUNDING = false builds the same dynamics with `basal_stress =
+# nothing`. The coast condition is applied by sea_ice_simulation itself, not by the dynamics, so it
+# stays free-slip.
+ice_dynamics = ICE_GROUNDING ? NumericalEarth.SeaIces.sea_ice_dynamics(child.grid, ocean) :
+                               NumericalEarth.SeaIces.sea_ice_dynamics(child.grid, ocean; basal_stress = nothing)
 sea_ice = sea_ice_simulation(child.grid, ocean; advection = IncrementalRemapping(),
-                             lateral_boundary_condition = :free_slip)
+                             lateral_boundary_condition = :free_slip,
+                             dynamics = ice_dynamics)
+@info "sea-ice grounding: $(ICE_GROUNDING ? "ON (LandfastBasalStress)" : "OFF")" *
+      " -- basal_stress is $(nameof(typeof(sea_ice.model.dynamics.basal_stress)))"
 
 # ── B-SOSE sea ice: the starting state and the open-side bands (note 1) ──────────────────────
 # SIarea is ℵ; SIheff is ice volume per unit area of CELL, i.e. h·ℵ, not h. Both come from the
@@ -716,6 +731,7 @@ output_metadata = Dict("run_name" => RUN_NAME,
                  (ICE_BOUNDARY == "bsose" ? "open-side bands relaxed to B-SOSE ice on $(ICE_RELAXATION / hours) h" :
                                             "open-side bands ice deleted"),
     "coastal_freshwater" => COASTAL_FRESHWATER ? "B-SOSE coastal excess from $(COASTAL_FRESHWATER_FILE)" : "none",
+    "ice_grounding" => ICE_GROUNDING ? "LandfastBasalStress (NumericalEarth default)" : "off (basal_stress = nothing)",
     "penetrating_shortwave" => PENETRATING_SHORTWAVE ? "yes: TwoColorRadiation fed by the coupler" :
                                                        "no: all shortwave in the top cell's heat flux",
     "vertical_coordinate" => "static z, B-SOSE i156's 52 levels")
