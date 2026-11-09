@@ -1,10 +1,11 @@
 # ==============================================================================
 # compare_winter_water.jl -- Antarctic Winter Water in B-SOSE and in a model run, detected the
-#                            way Spira et al. (2024) detect it in observations.
+#                            way Spira et al. (2024) detect it in observations, and placed
+#                            against the ACC fronts.
 #
 #     MODEL_RUN=2Y_nested_seaice_fix5 TRIM_SPONGE=0.67 julia --project=. tools/compare_winter_water.jl
-#     YEARS=2015 julia --project=. tools/compare_winter_water.jl            # B-SOSE alone
-#     MODEL_RUN=... MAP_MONTHS=2,9 julia --project=. tools/compare_winter_water.jl
+#     julia --project=. tools/compare_winter_water.jl                      # B-SOSE alone, 2014-2016
+#     CIRCUMPOLAR=1 julia -t 8 --project=. tools/compare_winter_water.jl   # all the way round
 #
 # The detection is tools/winter_water.jl, one column at a time: mixed-layer WW (WW_ML) or
 # subsurface WW (WW_SS, a >= 20 m temperature inversion below the mixed layer), with no WW where
@@ -19,29 +20,55 @@
 # makes about the mixed layer); the daily section figure below is there to show how far apart
 # they are along 120E.
 #
-# PRINTS, for each latitude band and month, B-SOSE against the model, cos(lat)-weighted over
-# ocean columns outside the boundary band (TRIM_SPONGE; 0.67 for a nested run):
+# THE DOMAIN. By default the nest's box, 90-150E / 70-45S, with the boundary band (TRIM_SPONGE)
+# left out of both datasets' statistics. Only the model has a band -- B-SOSE has no boundary
+# there -- but the tables compare the same columns; the maps and the section draw every column.
+# CIRCUMPOLAR=1 is B-SOSE alone over every longitude from 80S to 35S,
+# shelves included, with no trim; it adds a table by sector (south of the PF only) and draws the
+# maps in a south-polar stereographic projection. It reads ~2160 x 300 columns a month, so give it
+# threads (julia -t N): the detection loop is threaded over longitude.
+#
+# THE FRONTS (tools/fronts.jl). The CTOH weekly PF, SAF and NSAF (the -0.3, -0.1 and 0 m ADT
+# contours), the median over each B-SOSE month's weeks, split every column into a zone: south of
+# the PF, PF-SAF, SAF-NSAF, north of the NSAF. The model is zoned by the SAME observed fronts --
+# it has no altimetry of its own -- so a model whose fronts have moved has its water counted in
+# the observed zone, not its own.
+#
+# PRINTS, cos(lat)-weighted over the ocean columns analysed, for each month, B-SOSE against the
+# model, by latitude band, by front zone and (CIRCUMPOLAR) by sector:
 #     ML%, SS%     share of columns with mixed-layer / subsurface WW
 #     Tcore        mean core temperature of the columns with WW, °C
 #     core, thick  mean core depth and layer thickness, m
-# and, per month, the share of columns removed as too warm, too deep, or inverted.
+# then the share of columns removed as too warm, too deep, or inverted, and the mean latitude of
+# each front over the domain.
 #
 # WRITES (OUTDIR, default plots/):
-#     ww_<tag>_series.png         the table above as time series, one column per latitude band
-#     ww_<tag>_map_<yyyy-mm>.png  WW type, core temperature and thickness, B-SOSE over model, for
-#                                 each month in MAP_MONTHS (calendar months, default 2 and 9)
+#     ww_<tag>_series.png         the band table as time series, one column per latitude band
+#     ww_<tag>_zones.png          the same by front zone
+#     ww_<tag>_sectors.png        (CIRCUMPOLAR) the same by sector, south of the PF
+#     ww_<tag>_map_<yyyy-mm>.png  WW type, core temperature and thickness with the month's fronts,
+#                                 B-SOSE over model, for each month in MAP_MONTHS (default 2 and 9)
 #     ww_<tag>_section.png        core temperature and depth along the RUN_midlon.nc meridian:
-#                                 B-SOSE monthly against the model DAILY
+#                                 B-SOSE monthly against the model DAILY, fronts overlaid
+#   and with ANIMATE=1 (ANIMATION_DIR, default animations/):
+#     ww_<tag>_maps.mp4           every month's WW type, core temperature, core depth and
+#                                 thickness, B-SOSE over model, with the month's CTOH PF
 #
 # ENV
 #     BSOSE_DIR    B-SOSE monthly files and grid.nc         (default: data)
+#     FRONTS_DIR   the CTOH front files                     (default: BSOSE_DIR)
 #     MODEL_RUN    run to compare; without it, B-SOSE alone (default: none)
 #     MODEL_DIR    where RUN_eke.nc / RUN_midlon.nc are     (default: .)
-#     YEARS        years to analyse without a model run     (default: 2015)
+#     YEARS        years to analyse without a model run, "2014-2016" or "2014,2016" (default: 2014-2016)
+#     CIRCUMPOLAR  1 for B-SOSE all the way round            (default: 0)
 #     MAP_MONTHS   calendar months to map                   (default: 2,9)
+#     MAP_STRIDE   plot every n-th column on the polar maps (default: 2)
 #     TRIM_SPONGE  boundary band to exclude, deg            (default: 3.0 via tools/sponge.jl)
 #     ZREAD        depth read from both datasets, m         (default: 700)
 #     OUTDIR       figures                                  (default: plots)
+#     ANIMATE      1 to also record the monthly maps         (default: 0)
+#     ANIMATION_DIR   where the animation goes              (default: animations)
+#     FRAMERATE    animation frames (months) per second     (default: 2)
 #   and WW_INVERSION, WW_TMAX, WW_ZMAX, WW_SEARCH, MLD_DT from tools/winter_water.jl
 # ==============================================================================
 
@@ -51,19 +78,33 @@ include(joinpath(@__DIR__, "mld.jl"))
 include(joinpath(@__DIR__, "winter_water.jl"))
 include(joinpath(@__DIR__, "model_grid.jl"))
 include(joinpath(@__DIR__, "sponge.jl"))
+include(joinpath(@__DIR__, "fronts.jl"))
 
-const BDIR       = get(ENV, "BSOSE_DIR", "data")
-const MODEL_RUN  = get(ENV, "MODEL_RUN", "")
-const MODEL_DIR  = get(ENV, "MODEL_DIR", ".")
-const ZREAD      = parse(Float64, get(ENV, "ZREAD", "700"))
-const MAP_MONTHS = parse.(Int, split(get(ENV, "MAP_MONTHS", "2,9"), ","))
-const OUTDIR     = get(ENV, "OUTDIR", "plots")
+const BDIR        = get(ENV, "BSOSE_DIR", "data")
+const MODEL_RUN   = get(ENV, "MODEL_RUN", "")
+const MODEL_DIR   = get(ENV, "MODEL_DIR", ".")
+const ZREAD       = parse(Float64, get(ENV, "ZREAD", "700"))
+const MAP_MONTHS  = parse.(Int, split(get(ENV, "MAP_MONTHS", "2,9"), ","))
+const MAP_STRIDE  = parse(Int, get(ENV, "MAP_STRIDE", "2"))
+const OUTDIR      = get(ENV, "OUTDIR", "plots")
+const CIRCUMPOLAR = get(ENV, "CIRCUMPOLAR", "0") == "1"
+const ANIMATE     = get(ENV, "ANIMATE", "0") == "1"
+const ANIM_DIR    = get(ENV, "ANIMATION_DIR", "animations")
+const FRAMERATE   = parse(Int, get(ENV, "FRAMERATE", "2"))
 mkpath(OUTDIR)
+CIRCUMPOLAR && !isempty(MODEL_RUN) && error("CIRCUMPOLAR=1 is B-SOSE alone: unset MODEL_RUN")
 
-const LON   = (90.0, 150.0)
-const LAT   = (-70.0, -45.0)
-const BANDS = [(-70.0, -65.0), (-65.0, -60.0), (-60.0, -55.0), (-55.0, -50.0), (-50.0, -45.0)]
-const KEEP  = sponge_trimmer(LON, LAT)
+const LON   = CIRCUMPOLAR ? (0.0, 360.0) : (90.0, 150.0)
+const LAT   = CIRCUMPOLAR ? (-80.0, -35.0) : (-70.0, -45.0)
+const BANDS = CIRCUMPOLAR ?
+    [(-80.0, -70.0), (-70.0, -65.0), (-65.0, -60.0), (-60.0, -55.0), (-55.0, -50.0), (-50.0, -45.0), (-45.0, -35.0)] :
+    [(-70.0, -65.0), (-65.0, -60.0), (-60.0, -55.0), (-55.0, -50.0), (-50.0, -45.0)]
+const KEEP  = CIRCUMPOLAR ? ((λ, φ) -> true) : sponge_trimmer(LON, LAT)
+
+# Sectors (CIRCUMPOLAR), degrees east; the Weddell one wraps through 0
+const SECTORS = [("Weddell", 300.0, 20.0), ("Indian", 20.0, 90.0), ("Australian", 90.0, 160.0),
+                 ("Ross", 160.0, 230.0), ("Amundsen-Bell.", 230.0, 300.0)]
+in_sector(λ, (_, a, b)) = (x = mod(λ, 360); a < b ? a <= x < b : (x >= a || x < b))
 
 bfile(token) = joinpath(BDIR, "$(token)_bsoseI156_2013to2024_monthly.nc")
 
@@ -87,6 +128,10 @@ function window_center(stamp)
     start = stop - Month(1)
     return start + Millisecond(Dates.value(Millisecond(stop - start)) ÷ 2)
 end
+
+# "2014-2016,2018" -> [2014, 2015, 2016, 2018]
+parse_years(s) = reduce(vcat, [occursin('-', p) ? collect(range(parse.(Int, split(p, '-'))...)) : [parse(Int, p)]
+                               for p in split(s, ",")])
 
 # ── B-SOSE: geometry ──────────────────────────────────────────────────────────────────────────
 # Depth and the horizontal grid from the surface heat flux file, the levels from grid.nc (RC and
@@ -113,8 +158,8 @@ const B = let
     (; lon = xc[IR], lat = yc[JR], IR, JR, z, dz, NZ, kb, stamps,
        centres = window_center.(stamps))
 end
-@info @sprintf("B-SOSE: %dx%d columns over %.1f-%.1fE, %d levels to %.0f m",
-               length(B.lon), length(B.lat), B.lon[1], B.lon[end], B.NZ, -B.z[end])
+@info @sprintf("B-SOSE: %dx%d columns over %.1f-%.1fE, %.1f-%.1fN, %d levels to %.0f m",
+               length(B.lon), length(B.lat), B.lon[1], B.lon[end], B.lat[1], B.lat[end], B.NZ, -B.z[end])
 
 """B-SOSE T and S (surface-first) for monthly record `k`."""
 function bsose_month(k)
@@ -164,7 +209,7 @@ end
 # ── which months ──────────────────────────────────────────────────────────────────────────────
 # With a model: every B-SOSE month with a model 30-day mean centred within 20 days of it.
 month_pairs = if M === nothing
-    years = parse.(Int, split(get(ENV, "YEARS", "2015"), ","))
+    years = parse_years(get(ENV, "YEARS", "2014-2016"))
     [(k, 0) for k in eachindex(B.stamps) if year(B.centres[k]) in years]
 else
     p = Tuple{Int,Int}[]
@@ -177,33 +222,43 @@ end
 isempty(month_pairs) && error("no B-SOSE month to analyse (model records too far from every B-SOSE month?)")
 labels = [Dates.format(B.centres[k], "yyyy-mm") for (k, _) in month_pairs]
 @info "months: $(first(labels)) to $(last(labels)) ($(length(month_pairs)))" *
-      (M === nothing ? "" : ", model 30-day means from $(basename(M.path))")
+      (M === nothing ? "" : ", model 30-day means from $(basename(M.path))") *
+      ", $(Threads.nthreads()) thread(s)"
+
+# The fronts, for the whole period at once
+const FR = let t = [B.centres[k] for (k, _) in month_pairs]
+    load_fronts(; from = DateTime(firstdayofmonth(minimum(t))), to = DateTime(firstdayofmonth(maximum(t))) + Month(1))
+end
+@info "fronts: $(length(FR.PF.weeks)) CTOH weeks, $(FR.PF.weeks[1]) to $(FR.PF.weeks[end]), from $FRONTS_DIR"
 
 # ── detection over a whole record ─────────────────────────────────────────────────────────────
-# kind: -1 not analysed (land or boundary band), 0 no WW, 1 WW_ML, 2 WW_SS
+# kind: -1 land, 0 no WW, 1 WW_ML, 2 WW_SS; keep: outside the boundary band, so in the statistics
 function detect(T, S, z, dz, kb, lon, lat)
     nx, ny = size(kb)
     kind   = fill(Int8(-1), nx, ny)
     reason = fill(:land, nx, ny)
+    keep   = [KEEP(lon[i], lat[j]) for i in 1:nx, j in 1:ny]
     Tc, core, thick = fill(NaN, nx, ny), fill(NaN, nx, ny), fill(NaN, nx, ny)
-    for i in 1:nx, j in 1:ny
-        (kb[i, j] >= 2 && KEEP(lon[i], lat[j])) || continue
-        w = winter_water(view(T, i, j, :), view(S, i, j, :), z, dz, kb[i, j])
-        reason[i, j] = w.reason
-        kind[i, j] = w.kind === :ML ? 1 : w.kind === :SS ? 2 : 0
-        if kind[i, j] > 0
-            Tc[i, j], core[i, j], thick[i, j] = w.T, w.core, w.thickness
+    Threads.@threads for i in 1:nx
+        for j in 1:ny
+            kb[i, j] >= 2 || continue
+            w = winter_water(view(T, i, j, :), view(S, i, j, :), z, dz, kb[i, j])
+            reason[i, j] = w.reason
+            kind[i, j] = w.kind === :ML ? 1 : w.kind === :SS ? 2 : 0
+            if kind[i, j] > 0
+                Tc[i, j], core[i, j], thick[i, j] = w.T, w.core, w.thickness
+            end
         end
     end
-    return (; kind, reason, T = Tc, core, thick)
+    return (; kind, reason, keep, T = Tc, core, thick)
 end
 
-"""cos(lat)-weighted band statistics of one detected record."""
-function band_stats(F, lat, lo, hi)
+"""cos(lat)-weighted statistics of one detected record over the columns where `member(i, j)`."""
+function group_stats(F, lat, member)
     wall = wml = wss = 0.0
     sT = sc = sh = ww = 0.0
     for i in axes(F.kind, 1), j in axes(F.kind, 2)
-        (lo <= lat[j] < hi && F.kind[i, j] >= 0) || continue
+        (F.kind[i, j] >= 0 && F.keep[i, j] && member(i, j)) || continue
         w = cosd(lat[j])
         wall += w
         F.kind[i, j] == 1 && (wml += w)
@@ -217,51 +272,85 @@ function band_stats(F, lat, lo, hi)
             T = ww > 0 ? sT / ww : NaN, core = ww > 0 ? sc / ww : NaN, thick = ww > 0 ? sh / ww : NaN)
 end
 
-removed_pct(F, r) = (n = count(>=(0), F.kind); n == 0 ? NaN : 100 * count(==(r), F.reason[F.kind .>= 0]) / n)
+removed_pct(F, r) = (a = (F.kind .>= 0) .& F.keep; n = count(a); n == 0 ? NaN : 100 * count(==(r), F.reason[a]) / n)
+
+"""Every table's numbers for one record: by band, by front zone, by sector, and the removals."""
+function summarize(F, lon, lat, fr)
+    zone = [front_zone(lat[j], fr.PF[i], fr.SAF[i], fr.NSAF[i]) for i in eachindex(lon), j in eachindex(lat)]
+    bands = [group_stats(F, lat, (i, j) -> lo <= lat[j] < hi) for (lo, hi) in BANDS]
+    zones = [group_stats(F, lat, (i, j) -> zone[i, j] == z) for z in eachindex(ZONE_NAMES)]
+    sectors = CIRCUMPOLAR ? [group_stats(F, lat, (i, j) -> zone[i, j] == 1 && in_sector(lon[i], s)) for s in SECTORS] :
+                            nothing
+    removed = (warm = removed_pct(F, :warm), deep = removed_pct(F, :deep), inverted = removed_pct(F, :inverted))
+    return (; bands, zones, sectors, removed)
+end
 
 # ── run ───────────────────────────────────────────────────────────────────────────────────────
+# Only the summaries are kept for every month; the full fields only for the months mapped (every
+# month with ANIMATE), which is what keeps CIRCUMPOLAR inside a login node's memory.
 const SECT_FILE = isempty(MODEL_RUN) ? "" : joinpath(MODEL_DIR, "$(MODEL_RUN)_midlon.nc")
 const MID = (M === nothing || !isfile(SECT_FILE)) ? 0 : section_column(SECT_FILE, length(M.lon))
 const BSECT_I = MID == 0 ? 0 : argmin(abs.(B.lon .- M.lon[MID]))
 
 results = map(month_pairs) do (k, n)
+    t = B.centres[k]
+    mapped = ANIMATE || month(t) in MAP_MONTHS
+    frb = fronts_for_month(FR, B.lon, t)
     Tb, Sb = bsose_month(k)
     Fb = detect(Tb, Sb, B.z, B.dz, B.kb, B.lon, B.lat)
+    sb = summarize(Fb, B.lon, B.lat, frb)
     bsect = BSECT_I == 0 ? nothing :
             [winter_water(view(Tb, BSECT_I, j, :), view(Sb, BSECT_I, j, :), B.z, B.dz, B.kb[BSECT_I, j])
              for j in eachindex(B.lat)]
-    Fm = nothing
+    Fm = sm = frm = nothing
     if M !== nothing
+        frm = fronts_for_month(FR, M.lon, t)                 # the B-SOSE month's observed fronts
         Tm, Sm = model_month(n)
         Fm = detect(Tm, Sm, M.z, M.dz, M.kb, M.lon, M.lat)
+        sm = summarize(Fm, M.lon, M.lat, frm)
     end
-    @info "  $(Dates.format(B.centres[k], "yyyy-mm")) done"
-    (; k, n, Fb, Fm, bsect)
+    @info "  $(Dates.format(t, "yyyy-mm")) done"
+    (; k, n, sb, sm, frb, frm, bsect, Fb = mapped ? Fb : nothing, Fm = mapped ? Fm : nothing)
 end
 
 # ── tables ────────────────────────────────────────────────────────────────────────────────────
+fmt(v, d) = isnan(v) ? lpad("--", 7) : d == 0 ? @sprintf("%7.0f", v) : d == 1 ? @sprintf("%7.1f", v) : @sprintf("%7.2f", v)
+fmtstats(s) = fmt(s.ml, 0) * fmt(s.ss, 0) * fmt(s.T, 2) * fmt(s.core, 0) * fmt(s.thick, 0)
+
+function print_table(title, pick)
+    @printf("\n  %s\n", title)
+    @printf("  %-8s |%s", "month", "    ML%    SS%  Tcore   core  thick")
+    M === nothing || print(" |    ML%    SS%  Tcore   core  thick")
+    println()
+    for (r, lab) in zip(results, labels)
+        @printf("  %-8s |%s", lab, fmtstats(pick(r.sb)))
+        r.sm === nothing || @printf(" |%s", fmtstats(pick(r.sm)))
+        println()
+    end
+end
+
 println()
 println("="^118)
 @printf("WINTER WATER after Spira et al. (2024): inversion >= %.0f m, core < %.1f °C, core and lower boundary <= %.0f m, MLD Δρ = %.2f\n",
         WW_INVERSION, WW_TMAX, WW_ZMAX, MLD_DT)
 println("  ML% / SS% = share of ocean columns with mixed-layer / subsurface WW; Tcore, core, thick over the columns with WW.")
-println("  cos(lat)-weighted, outside the $(SPONGE_TRIM)-deg boundary band. B-SOSE monthly means" *
+println("  cos(lat)-weighted" * (CIRCUMPOLAR ? ", circumpolar, " : ", outside the $(SPONGE_TRIM)-deg boundary band, ") *
+        @sprintf("%.0f-%.0fS. B-SOSE monthly means", -LAT[1], -LAT[2]) *
         (M === nothing ? "." : " against the model's 30-day means ($(MODEL_RUN))."))
 println("="^118)
-fmt(v, d) = isnan(v) ? lpad("--", 7) : d == 0 ? @sprintf("%7.0f", v) : d == 1 ? @sprintf("%7.1f", v) : @sprintf("%7.2f", v)
-for (lo, hi) in BANDS
-    @printf("\n  %.0fS-%.0fS\n", -lo, -hi)
-    @printf("  %-8s |%s", "month", "    ML%    SS%  Tcore   core  thick")
-    M === nothing || print(" |    ML%    SS%  Tcore   core  thick")
-    println()
-    for (r, lab) in zip(results, labels)
-        b = band_stats(r.Fb, B.lat, lo, hi)
-        @printf("  %-8s |%s%s%s%s%s", lab, fmt(b.ml, 0), fmt(b.ss, 0), fmt(b.T, 2), fmt(b.core, 0), fmt(b.thick, 0))
-        if r.Fm !== nothing
-            m = band_stats(r.Fm, M.lat, lo, hi)
-            @printf(" |%s%s%s%s%s", fmt(m.ml, 0), fmt(m.ss, 0), fmt(m.T, 2), fmt(m.core, 0), fmt(m.thick, 0))
-        end
-        println()
+
+println("\n  BY LATITUDE BAND")
+for (b, (lo, hi)) in enumerate(BANDS)
+    print_table(@sprintf("%.0fS-%.0fS", -lo, -hi), s -> s.bands[b])
+end
+println("\n  BY FRONT ZONE (CTOH PF -0.3 m, SAF -0.1 m, NSAF 0 m ADT; the model zoned by the observed fronts)")
+for (z, name) in enumerate(ZONE_NAMES)
+    print_table(name, s -> s.zones[z])
+end
+if CIRCUMPOLAR
+    println("\n  BY SECTOR, SOUTH OF THE PF")
+    for (c, (name, a, b)) in enumerate(SECTORS)
+        print_table(@sprintf("%s (%.0f-%.0fE)", name, a, b), s -> s.sectors[c])
     end
 end
 M === nothing || println("\n  left block B-SOSE, right block $(MODEL_RUN)")
@@ -271,66 +360,161 @@ println("\n  Columns REMOVED (% of ocean columns): too warm (core >= $(WW_TMAX) 
 M === nothing || @printf(" | %22s", "model warm deep inv")
 println()
 for (r, lab) in zip(results, labels)
-    @printf("  %-8s | %8.1f %6.1f %6.1f", lab, removed_pct(r.Fb, :warm), removed_pct(r.Fb, :deep), removed_pct(r.Fb, :inverted))
-    r.Fm === nothing || @printf(" | %8.1f %6.1f %6.1f", removed_pct(r.Fm, :warm), removed_pct(r.Fm, :deep), removed_pct(r.Fm, :inverted))
+    @printf("  %-8s | %8.1f %6.1f %6.1f", lab, r.sb.removed.warm, r.sb.removed.deep, r.sb.removed.inverted)
+    r.sm === nothing || @printf(" | %8.1f %6.1f %6.1f", r.sm.removed.warm, r.sm.removed.deep, r.sm.removed.inverted)
     println()
 end
 
-tag = isempty(MODEL_RUN) ? "bsose_" * join(unique(year.(B.centres[[r.k for r in results]])), "-") : MODEL_RUN
+println("\n  FRONTS: mean latitude over the domain's longitudes (CTOH, monthly median of weekly positions)")
+@printf("  %-8s | %7s %7s %7s\n", "month", "PF", "SAF", "NSAF")
+for (r, lab) in zip(results, labels)
+    @printf("  %-8s | %7.2f %7.2f %7.2f\n", lab, mean(r.frb.PF), mean(r.frb.SAF), mean(r.frb.NSAF))
+end
 
-# ── figure: time series by band ───────────────────────────────────────────────────────────────
-let
+yrs = unique(year.(B.centres[[r.k for r in results]]))
+tag = !isempty(MODEL_RUN) ? MODEL_RUN :
+      "bsose_" * (CIRCUMPOLAR ? "circumpolar_" : "") * (length(yrs) == 1 ? "$(yrs[1])" : "$(first(yrs))-$(last(yrs))")
+
+# ── figures: time series by band, by zone, by sector ──────────────────────────────────────────
+function series_figure(titles, pick, name, note)
     x = collect(1:length(results))
     step = max(1, cld(length(x), 8))
     ticks = (x[1:step:end], labels[1:step:end])
-    fig = Figure(size = (330 * length(BANDS) + 80, 950))
-    Label(fig[0, 1:length(BANDS)], "Winter Water after Spira et al. (2024) — black B-SOSE" *
+    nc = length(titles)
+    fig = Figure(size = (330 * nc + 80, 950))
+    Label(fig[0, 1:nc], "Winter Water after Spira et al. (2024) — black B-SOSE" *
           (M === nothing ? "" : ", red $(MODEL_RUN)"), fontsize = 18, font = :bold)
     rows = (("WW columns (%)", s -> s.ml + s.ss), ("core T (°C)", s -> s.T),
             ("core depth (m)", s -> s.core), ("thickness (m)", s -> s.thick))
-    for (c, (lo, hi)) in enumerate(BANDS), (rr, (ylab, stat)) in enumerate(rows)
-        ax = Axis(fig[rr, c]; title = rr == 1 ? @sprintf("%.0fS-%.0fS", -lo, -hi) : "",
+    for c in 1:nc, (rr, (ylab, stat)) in enumerate(rows)
+        ax = Axis(fig[rr, c]; title = rr == 1 ? titles[c] : "",
                   ylabel = c == 1 ? ylab : "", xticks = ticks, xticklabelrotation = π / 4,
                   xticklabelsvisible = rr == length(rows), yreversed = rr == 3)
-        sb = [band_stats(r.Fb, B.lat, lo, hi) for r in results]
+        sb = [pick(r.sb, c) for r in results]
         lines!(ax, x, [stat(s) for s in sb], color = :black)
         rr == 1 && lines!(ax, x, [s.ss for s in sb], color = :black, linestyle = :dash)
         if M !== nothing
-            sm = [band_stats(r.Fm, M.lat, lo, hi) for r in results]
+            sm = [pick(r.sm, c) for r in results]
             lines!(ax, x, [stat(s) for s in sm], color = :firebrick)
             rr == 1 && lines!(ax, x, [s.ss for s in sm], color = :firebrick, linestyle = :dash)
         end
     end
-    Label(fig[length(rows) + 1, 1:length(BANDS)],
+    Label(fig[length(rows) + 1, 1:nc],
           "Top row: solid = all WW (mixed-layer + subsurface), dashed = subsurface only. Core T, depth and thickness " *
-          "are means over the columns with WW. Monthly means against 30-day means.", fontsize = 11)
-    f = joinpath(OUTDIR, "ww_$(tag)_series.png")
+          "are means over the columns with WW. " * note, fontsize = 11)
+    f = joinpath(OUTDIR, "ww_$(tag)_$(name).png")
     save(f, fig); @info "wrote $f"
 end
 
+series_figure([@sprintf("%.0fS-%.0fS", -lo, -hi) for (lo, hi) in BANDS], (s, c) -> s.bands[c], "series",
+              "Monthly means" * (M === nothing ? "." : " against 30-day means."))
+series_figure(collect(ZONE_NAMES), (s, c) -> s.zones[c], "zones",
+              "Zones from the CTOH weekly fronts (PF -0.3 m, SAF -0.1 m, NSAF 0 m ADT), monthly medians.")
+CIRCUMPOLAR && series_figure([s[1] for s in SECTORS], (s, c) -> s.sectors[c], "sectors",
+                             "South of the CTOH Polar Front only.")
+
 # ── figures: maps for MAP_MONTHS ──────────────────────────────────────────────────────────────
+const FRONT_STYLE = ((:PF, :solid, "PF"), (:SAF, :dash, "SAF"), (:NSAF, :dot, "NSAF"))
+
+# South-polar stereographic, Greenwich up and 90E to the right
+polar_xy(λ, φ) = (ρ = tand((90 + φ) / 2); (ρ * sind(λ), ρ * cosd(λ)))
+
+as_obs(x) = x isa Observable ? x : Observable(x)
+
+# `A` and `fr` may be Observables, which is how the animation redraws the same panel each month
+function map_panel!(ax, lon, lat, A, fr; fronts = FRONT_STYLE, kw...)
+    A, fr = as_obs(A), as_obs(fr)
+    if CIRCUMPOLAR
+        I = [collect(1:MAP_STRIDE:length(lon)); 1]               # close the seam at 0E
+        J = collect(1:MAP_STRIDE:length(lat))
+        X = [polar_xy(lon[i], lat[j])[1] for i in I, j in J]
+        Y = [polar_xy(lon[i], lat[j])[2] for i in I, j in J]
+        hm = surface!(ax, X, Y, zeros(size(X)); color = lift(a -> a[I, J], A), shading = NoShading, kw...)
+        for φ in -80:10:-40
+            xy = polar_xy.(0:2:360, φ)
+            lines!(ax, first.(xy), last.(xy), color = (:gray40, 0.5), linewidth = 0.5)
+        end
+        for (key, ls, _) in fronts
+            xy = lift(f -> polar_xy.([lon; lon[1]], [f[key]; f[key][1]]), fr)
+            lines!(ax, lift(v -> first.(v), xy), lift(v -> last.(v), xy), color = :crimson, linestyle = ls, linewidth = 1.2)
+        end
+        hidedecorations!(ax); hidespines!(ax)
+    else
+        hm = heatmap!(ax, lon, lat, A; kw...)
+        for (key, ls, _) in fronts
+            lines!(ax, lon, lift(f -> f[key], fr), color = :crimson, linestyle = ls, linewidth = 1.5)
+        end
+        ylims!(ax, lat[1], lat[end])
+    end
+    return hm
+end
+
+kind_map(F) = [F.kind[i, j] < 0 ? NaN : Float64(F.kind[i, j]) for i in axes(F.kind, 1), j in axes(F.kind, 2)]
+const KIND_CMAP = cgrad([:gray97, :skyblue, :navy], 3, categorical = true)
+const KIND_TICKS = ([0, 1, 2], ["none", "ML", "subsurface"])
+
 for (r, lab) in zip(results, labels)
     month(B.centres[r.k]) in MAP_MONTHS || continue
-    sets = M === nothing ? (("B-SOSE", r.Fb, B.lon, B.lat),) :
-                           (("B-SOSE", r.Fb, B.lon, B.lat), (MODEL_RUN, r.Fm, M.lon, M.lat))
-    fig = Figure(size = (1500, 330 * length(sets) + 90))
+    sets = M === nothing ? (("B-SOSE", r.Fb, B.lon, B.lat, r.frb),) :
+                           (("B-SOSE", r.Fb, B.lon, B.lat, r.frb), (MODEL_RUN, r.Fm, M.lon, M.lat, r.frm))
+    fig = CIRCUMPOLAR ? Figure(size = (1800, 640)) : Figure(size = (1500, 330 * length(sets) + 90))
     Label(fig[0, 1:6], "Winter Water, $lab (Spira et al. 2024 detection)", fontsize = 18, font = :bold)
-    for (row, (name, F, lon, lat)) in enumerate(sets)
-        kindmap = [F.kind[i, j] < 0 ? NaN : Float64(F.kind[i, j]) for i in axes(F.kind, 1), j in axes(F.kind, 2)]
-        panels = (("type: none / ML / subsurface", kindmap, cgrad([:gray97, :skyblue, :navy], 3, categorical = true), (-0.5, 2.5), ""),
+    for (row, (name, F, lon, lat, fr)) in enumerate(sets)
+        panels = (("type: none / ML / subsurface", kind_map(F), KIND_CMAP, (-0.5, 2.5), ""),
                   ("core T", F.T, :thermal, (-2.0, WW_TMAX), "°C"),
                   ("thickness", F.thick, :dense, (0.0, WW_ZMAX), "m"))
         for (c, (title, A, cmap, lims, unit)) in enumerate(panels)
-            ax = Axis(fig[row, 2c - 1]; title = "$name — $title", ylabel = c == 1 ? "latitude" : "",
-                      xlabel = row == length(sets) ? "longitude" : "")
-            hm = heatmap!(ax, lon, lat, A; colormap = cmap, colorrange = lims, nan_color = :gray75)
-            c == 1 ? Colorbar(fig[row, 2c], hm, ticks = ([0, 1, 2], ["none", "ML", "subsurface"])) :
+            ax = CIRCUMPOLAR ? Axis(fig[row, 2c - 1]; title = "$name — $title", aspect = DataAspect()) :
+                               Axis(fig[row, 2c - 1]; title = "$name — $title", ylabel = c == 1 ? "latitude" : "",
+                                    xlabel = row == length(sets) ? "longitude" : "")
+            hm = map_panel!(ax, lon, lat, A, fr; colormap = cmap, colorrange = lims, nan_color = :gray75)
+            c == 1 ? Colorbar(fig[row, 2c], hm, ticks = KIND_TICKS) :
                      Colorbar(fig[row, 2c], hm, label = unit)
         end
     end
-    Label(fig[length(sets) + 1, 1:6], "Dark grey: land, the boundary band, or (core T, thickness) no WW.", fontsize = 11)
+    Label(fig[length(sets) + 1, 1:6], "Dark grey: land, or (core T, thickness) no WW. " *
+          "Red: CTOH fronts for the month — solid PF, dashed SAF, dotted NSAF." *
+          (CIRCUMPOLAR ? " Grey circles every 10° from 80S to 40S; Greenwich up, 90E right." : ""), fontsize = 11)
     f = joinpath(OUTDIR, "ww_$(tag)_map_$(lab).png")
     save(f, fig); @info "wrote $f"
+end
+
+# ── animation: the maps for every month (ANIMATE=1) ───────────────────────────────────────────
+# The PNGs' panels plus core depth, which is where ML WW turning into subsurface WW shows: the
+# core drops from half the mixed layer to the temperature minimum beneath it. The PF only.
+if ANIMATE
+    nt = length(results)
+    t_idx = Observable(1)
+    sets = M === nothing ? (("B-SOSE", r -> r.Fb, B.lon, B.lat, r -> r.frb),) :
+                           (("B-SOSE", r -> r.Fb, B.lon, B.lat, r -> r.frb), (MODEL_RUN, r -> r.Fm, M.lon, M.lat, r -> r.frm))
+    fig = CIRCUMPOLAR ? Figure(size = (2300, 640)) : Figure(size = (1950, 330 * length(sets) + 90))
+    Label(fig[0, 1:8], lift(i -> @sprintf("Winter Water, %s (%d / %d) — Spira et al. 2024 detection", labels[i], i, nt), t_idx),
+          fontsize = 18, font = :bold)
+    for (row, (name, field, lon, lat, front)) in enumerate(sets)
+        F = lift(i -> field(results[i]), t_idx)
+        fr = lift(i -> front(results[i]), t_idx)
+        panels = (("type", lift(kind_map, F), KIND_CMAP, (-0.5, 2.5), ""),
+                  ("core T", lift(f -> f.T, F), :thermal, (-2.0, WW_TMAX), "°C"),
+                  ("core depth", lift(f -> f.core, F), Reverse(:deep), (0.0, WW_ZMAX), "m"),
+                  ("thickness", lift(f -> f.thick, F), :dense, (0.0, WW_ZMAX), "m"))
+        for (c, (title, A, cmap, lims, unit)) in enumerate(panels)
+            ax = CIRCUMPOLAR ? Axis(fig[row, 2c - 1]; title = "$name — $title", aspect = DataAspect()) :
+                               Axis(fig[row, 2c - 1]; title = "$name — $title", ylabel = c == 1 ? "latitude" : "",
+                                    xlabel = row == length(sets) ? "longitude" : "")
+            hm = map_panel!(ax, lon, lat, A, fr; fronts = FRONT_STYLE[1:1], colormap = cmap, colorrange = lims,
+                            nan_color = :gray75)
+            c == 1 ? Colorbar(fig[row, 2c], hm, ticks = KIND_TICKS) : Colorbar(fig[row, 2c], hm, label = unit)
+        end
+    end
+    Label(fig[length(sets) + 1, 1:8], "Dark grey: land, or (core T, depth, thickness) no WW. " *
+          "Red: the CTOH Polar Front (-0.3 m ADT) for the month, the observed one on both rows." *
+          (CIRCUMPOLAR ? " Grey circles every 10° from 80S to 40S; Greenwich up, 90E right." : ""), fontsize = 11)
+    mkpath(ANIM_DIR)
+    f = joinpath(ANIM_DIR, "ww_$(tag)_maps.mp4")
+    record(fig, f, 1:nt; framerate = FRAMERATE) do i
+        t_idx[] = i
+    end
+    @info "wrote $f ($nt frames at $FRAMERATE fps)"
 end
 
 # ── figure: along the section, B-SOSE monthly against the model daily ─────────────────────────
@@ -356,7 +540,7 @@ if MID > 0
             T = reverse(Float64.(coalesce.(ds["T"][1, :, :, n], NaN)), dims = 2)
             S = reverse(Float64.(coalesce.(ds["S"][1, :, :, n], NaN)), dims = 2)
             for j in eachindex(lat)
-                (kb[j] >= 2 && KEEP(M.lon[MID], lat[j])) || continue
+                kb[j] >= 2 || continue
                 w = winter_water(view(T, j, 1:NZ), view(S, j, 1:NZ), z[1:NZ], dz[1:NZ], kb[j])
                 w.kind === :none || (CT[n, j] = w.T; CD[n, j] = w.core)
             end
@@ -374,11 +558,17 @@ if MID > 0
             heatmap!(axb, bdays, B.lat, A_b; colormap = cmap, colorrange = lims, nan_color = :gray85)
             axm = Axis(fig[row, 2]; title = "model $title", xlabel = row == 2 ? "days since $(Date(M.start))" : "")
             hm = heatmap!(axm, days, lat, A_m; colormap = cmap, colorrange = lims, nan_color = :gray85)
+            for (key, ls, _) in FRONT_STYLE
+                lines!(axb, bdays, [r.frb[key][BSECT_I] for r in results], color = :crimson, linestyle = ls)
+                lines!(axm, bdays, [r.frm[key][MID] for r in results], color = :crimson, linestyle = ls)
+            end
             linkaxes!(axb, axm)
+            ylims!(axb, lat[1], lat[end])
             Colorbar(fig[row, 3], hm, label = unit)
         end
-        Label(fig[3, 1:3], "Grey: no WW (none detected, removed, land or boundary band). B-SOSE at its nearest " *
-              "column, $(round(B.lon[BSECT_I], digits = 2))E.", fontsize = 11)
+        Label(fig[3, 1:3], "Grey: no WW (none detected, removed, or land). B-SOSE at its nearest " *
+              "column, $(round(B.lon[BSECT_I], digits = 2))E. Red: CTOH monthly fronts at the section — " *
+              "solid PF, dashed SAF, dotted NSAF.", fontsize = 11)
         f = joinpath(OUTDIR, "ww_$(tag)_section.png")
         save(f, fig); @info "wrote $f"
     end
