@@ -13,8 +13,14 @@
 #
 # WHAT THE RUN WRITES (NumericalEarth's net ocean fluxes, the run's TwoColorRadiation):
 #     heat_flux        J_T, kinematic (K m/s), positive OUT: turbulent + longwave + the ice-ocean
-#                      interface heat. NO shortwave -- with TwoColorRadiation all of it is put
-#                      through the column, so J_T is the analogue of B-SOSE's TFLUX - oceQsw.
+#                      interface heat, and -- in runs WITHOUT penetrating shortwave -- the shortwave.
+#                      Up to 2Y_nested_seaice_fix5_flux the coupler never found the nest's
+#                      TwoColorRadiation (no get_radiative_forcing method for a NestedModel; see
+#                      "penetrating shortwave" in examples/sowinwarp_nested.jl), so ALL the
+#                      shortwave went into J_T. The file's `shortwave_in_heat_flux` attribute says
+#                      which (written from fix6 on; absent = before fix6 = "yes"). When it is in,
+#                      it is taken back out, -SW/(ρ₀ cₚ) with the coupler's TEOS10 ρ₀ = 1020 and
+#                      cₚ = 3991.87, so `heat` is non-solar on both sides: B-SOSE's TFLUX - oceQsw.
 #     ice_salt_flux    J_S, kinematic (g/kg m/s), positive out: the sea-ice salt exchange only
 #     freshwater_flux  J_w (m/s), positive INTO the ocean: rain, snow, evaporation, ice melt/growth
 #     shortwave        W/m2, negative down, already (1 - ℵ)-weighted; it all penetrates
@@ -61,6 +67,7 @@
 #     BOX          lon1,lon2,lat1,lat2 of the extra region                  (default: 130,150,-70,-65)
 #     TRIM_SPONGE  boundary band left out, deg                              (default 3.0 via sponge.jl)
 #     S0           B-SOSE's reference salinity for the virtual salt flux    (default: 34.0)
+#     SW_IN_HEAT_FLUX  1/0: override the file's shortwave_in_heat_flux attribute   (default: the file)
 #     OUTDIR       figures                                                  (default: plots)
 # ==============================================================================
 
@@ -83,6 +90,7 @@ const LAT   = (-70.0, -45.0)
 const BANDS = [(-70.0, -65.0), (-65.0, -60.0), (-60.0, -55.0), (-55.0, -50.0), (-50.0, -45.0)]
 const KEEP  = sponge_trimmer(LON, LAT)
 const ρ₀, cₚ, g = 1026.0, 3991.86795711963, 9.81       # B-SOSE's conversion, as mixing_energetics
+const ρc_MODEL = 1020.0 * 3991.86795711963             # the coupler's: TEOS10 reference density and cp
 const SCALE = 1e8                                      # print buoyancy in 1e-8 m2/s3
 
 const REGIONS = [[(@sprintf("%.0fS-%.0fS", -lo, -hi), (λ, φ) -> lo <= φ < hi) for (lo, hi) in BANDS];
@@ -117,6 +125,8 @@ const M = let
     win = haskey(ds.attrib, "averaging_window_seconds") ? Float64(ds.attrib["averaging_window_seconds"]) : 86400.0
     start = DateTime(string(ds.attrib["start_date"]))
     bh = haskey(ds, "bottom_height") ? f64(ds["bottom_height"][:, :]) : nothing
+    sw_in = haskey(ENV, "SW_IN_HEAT_FLUX") ? ENV["SW_IN_HEAT_FLUX"] == "1" :
+            haskey(ds.attrib, "shortwave_in_heat_flux") ? string(ds.attrib["shortwave_in_heat_flux"]) == "yes" : true
     close(ds)
     ss = NCDataset(SURFFILE)
     ts = f64(ss["time"][:])
@@ -124,8 +134,10 @@ const M = let
     close(ss)
     keep = findall(>(0), tf)                                  # t = 0 is the initial state, not a mean
     centres = [start + Millisecond(round(Int, 1000 * (x - win / 2))) for x in tf]
-    (; lon, lat, wet = bh .< 0, tf, ts, start, win, keep, centres)
+    (; lon, lat, wet = bh .< 0, tf, ts, start, win, keep, centres, sw_in)
 end
+@info M.sw_in ? "the shortwave is IN this run's heat_flux (no penetrating shortwave): taking it out, so `heat` is non-solar" :
+                "the shortwave penetrated in this run: heat_flux is already non-solar"
 @info @sprintf("%s: %d daily flux means, %s to %s", basename(FLUXFILE), length(M.keep),
                Date(M.centres[M.keep[1]]), Date(M.centres[M.keep[end]]))
 
@@ -147,6 +159,7 @@ function model_window(a, b)
     Jw = readrecs(ds, "freshwater_flux", n)
     SW = dropdims(mean(readrecs(ds, "shortwave", n), dims = 3), dims = 3)
     close(ds)
+    M.sw_in && (JT = JT .- SW ./ ρc_MODEL)                # SW is negative down: J_T + |SW|/(ρ₀cₚ)
     # S_top: the surface snapshots at the two ends of each day, averaged into the day
     ss = NCDataset(SURFFILE)
     ends = [M.tf[k] for k in n]

@@ -106,14 +106,34 @@ const COASTAL_FRESHWATER_FILE = "coastal_freshwater_bsose.nc"   # written by too
 const ICE_INIT                = "bsose"   # "bsose": start from B-SOSE's ice; "none": ice-free (up to fix3)
 const ICE_BOUNDARY            = "bsose"   # "bsose": relax the open-side bands to B-SOSE's ice; "delete" (up to fix3)
 const ICE_RELAXATION_HOURS    = 6         # the bands' relaxation time, with ICE_BOUNDARY = "bsose"
+const PENETRATING_SHORTWAVE   = true      # shortwave through the column (TwoColorRadiation); false: all in the top cell (up to fix5_flux)
 
 ICE_INIT in ("bsose", "none") || error("ICE_INIT must be \"bsose\" or \"none\", got $ICE_INIT")
 ICE_BOUNDARY in ("bsose", "delete") || error("ICE_BOUNDARY must be \"bsose\" or \"delete\", got $ICE_BOUNDARY")
-for name in ("COASTAL_FRESHWATER", "COASTAL_FRESHWATER_FILE", "ICE_INIT", "ICE_BOUNDARY", "ICE_RELAXATION_HOURS")
+for name in ("COASTAL_FRESHWATER", "COASTAL_FRESHWATER_FILE", "ICE_INIT", "ICE_BOUNDARY", "ICE_RELAXATION_HOURS",
+             "PENETRATING_SHORTWAVE")
     haskey(ENV, name) && @warn "$name is set in the environment, which this script no longer reads: set it in the switches block of examples/sowinwarp_nested.jl"
 end
 @info "switches: COASTAL_FRESHWATER = $COASTAL_FRESHWATER ($COASTAL_FRESHWATER_FILE), ICE_INIT = $ICE_INIT, " *
-      "ICE_BOUNDARY = $ICE_BOUNDARY, ICE_RELAXATION_HOURS = $ICE_RELAXATION_HOURS"
+      "ICE_BOUNDARY = $ICE_BOUNDARY, ICE_RELAXATION_HOURS = $ICE_RELAXATION_HOURS, " *
+      "PENETRATING_SHORTWAVE = $PENETRATING_SHORTWAVE"
+
+# ── penetrating shortwave (PENETRATING_SHORTWAVE, in the switches) ────────────────────────────
+# The coupler finds the ocean's TwoColorRadiation with `get_radiative_forcing(ocean)`
+# (Radiations/apply_air_sea_radiative_fluxes.jl). NumericalEarth's ss/nested-ocean-model branch
+# (PR #676) has that method for a HydrostaticFreeSurfaceModel but not for a NestedModel, so for
+# this nest it fell through to `get_radiative_forcing(something) = nothing`: ALL the shortwave went
+# into the top cell's heat flux, and the TwoColorRadiation the child carries (hydrostatic_ocean_model's
+# default) was never fed. Every nested run up to 2Y_nested_seaice_fix5_flux ran that way; its
+# _surface_fluxes.nc heat_flux follows the shortwave through the seasons. Forward to the child, as
+# NestedModels/nested_component.jl already forwards net_fluxes. Only defined when the package has
+# no method of its own, so this goes quiet by itself once #676 carries the fix. Checked after the
+# coupled model is built (search "penetrating shortwave: ON").
+if PENETRATING_SHORTWAVE &&
+   Base.unwrap_unionall(which(NumericalEarth.Oceans.get_radiative_forcing, (NumericalEarth.NestedModel,)).sig).parameters[2] === Any
+    NumericalEarth.Oceans.get_radiative_forcing(nm::NumericalEarth.NestedModel) =
+        NumericalEarth.Oceans.get_radiative_forcing(nm.child)
+end
 
 # ── domain: the production SOWinWaRP box at 1/6 deg ───────────────────────────────────────────
 const λ₁, λ₂ = 90.0, 150.0
@@ -435,6 +455,17 @@ end
 
 coupled_model = OceanSeaIceModel(ocean, sea_ice; atmosphere, radiation)
 
+let R = NumericalEarth.Oceans.get_radiative_forcing(ocean)
+    if PENETRATING_SHORTWAVE
+        R isa NumericalEarth.Oceans.TwoColorRadiation ||
+            error("PENETRATING_SHORTWAVE = true, but the coupler finds $(typeof(R)) for this ocean, not the child's " *
+                  "TwoColorRadiation: the shortwave would all go into the top cell. See \"penetrating shortwave\".")
+        @info "penetrating shortwave: ON (the coupler feeds the child's TwoColorRadiation)"
+    else
+        @warn "PENETRATING_SHORTWAVE = false: all the shortwave is absorbed in the top cell, as up to fix5_flux"
+    end
+end
+
 # ── stepping and progress, as src/model.jl ────────────────────────────────────────────────────
 # Start with a very small Δt so the first CATKE evaluation is numerically gentle;
 # the wizard will ramp this up within a few iterations.
@@ -685,6 +716,8 @@ output_metadata = Dict("run_name" => RUN_NAME,
                  (ICE_BOUNDARY == "bsose" ? "open-side bands relaxed to B-SOSE ice on $(ICE_RELAXATION / hours) h" :
                                             "open-side bands ice deleted"),
     "coastal_freshwater" => COASTAL_FRESHWATER ? "B-SOSE coastal excess from $(COASTAL_FRESHWATER_FILE)" : "none",
+    "penetrating_shortwave" => PENETRATING_SHORTWAVE ? "yes: TwoColorRadiation fed by the coupler" :
+                                                       "no: all shortwave in the top cell's heat flux",
     "vertical_coordinate" => "static z, B-SOSE i156's 52 levels")
 
 ocean.output_writers[:surface] = NetCDFWriter(
@@ -770,6 +803,7 @@ isempty(surface_fluxes) || (ocean.output_writers[:surface_fluxes] = NetCDFWriter
     schedule=AveragedTimeInterval(output_interval, window=output_interval),
     global_attributes=merge(output_metadata, Dict(
         "flux_convention" => "kinematic, positive OUT of the ocean, except freshwater_flux (+ into the ocean) and shortwave (W/m2, negative down)",
+        "shortwave_in_heat_flux" => PENETRATING_SHORTWAVE ? "no" : "yes",
         "salt_flux_seen_by_ocean" => "ice_salt_flux + S_top * freshwater_flux, S_top from the surface file",
         "averaging_window_seconds" => Float64(output_interval))),
     overwrite_files=!PICKUP
