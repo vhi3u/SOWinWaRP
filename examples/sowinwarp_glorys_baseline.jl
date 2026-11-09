@@ -416,8 +416,8 @@ if !PICKUP
     fill_halo_regions!(sea_ice.model.ice_thickness)
     area₀, volume₀ = ice_totals(ℵ₀, V₀)
     _, volume_if_cell_mean = ice_totals(ℵ₀, h₀)    # h₀ = V₀/ℵ₀ is sithick itself
-    @info @sprintf("sea ice from GLORYS on %s: area %.2f 10⁶ km², volume %.0f km³ taking sithick as floe thickness " *
-                   "(%.0f km³ if it were volume per cell area; B-SOSE ~650), h up to %.1f m",
+    @info @sprintf("sea ice from GLORYS on %s: area %.2f 10⁶ km², volume %.0f km³ taking sithick as floe thickness (%.0f km³ if it were volume per cell area; B-SOSE ~650), h up to %.1f m",
+                   
                    start_date, area₀, volume₀, volume_if_cell_mean, maximum(h₀))
 end
 

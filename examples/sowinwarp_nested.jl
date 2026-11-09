@@ -256,8 +256,8 @@ if BATHYMETRY == "bsose"
     wet_e, wet_b = etopo .< 0, z_bsose .< 0
     both = wet_e .& wet_b
     depth_at(z, λ, φ) = z[floor(Int, (λ - λ₁) * SCALING) + 1, floor(Int, (φ - φ₁) * SCALING) + 1]
-    @info @sprintf("bathymetry: B-SOSE i156 Depth -- %d wet cells (ETOPO2022 %d); %d wet only in B-SOSE, %d only in ETOPO; " *
-                   "%d lake cells removed", count(wet_b), count(wet_e), count(wet_b .& .!wet_e), count(wet_e .& .!wet_b), lakes)
+    @info @sprintf("bathymetry: B-SOSE i156 Depth -- %d wet cells (ETOPO2022 %d); %d wet only in B-SOSE, %d only in ETOPO; %d lake cells removed",
+                    count(wet_b), count(wet_e), count(wet_b .& .!wet_e), count(wet_e .& .!wet_b), lakes)
     @info @sprintf("bathymetry: where both are wet, depth differs by >50%% in %d of %d cells; cells <= 30 m deep: B-SOSE %d, ETOPO %d",
                    count(abs.(z_bsose[both] .- etopo[both]) .> 0.5 .* abs.(etopo[both])), count(both),
                    count(wet_b .& (z_bsose .>= -30)), count(wet_e .& (etopo .>= -30)))
