@@ -65,6 +65,7 @@ using NCDatasets      # loads Oceananigans' NetCDFWriter
 using Dates, Printf
 
 include(joinpath(@__DIR__, "..", "src", "setup_bsose.jl"))   # only for default_bsose_directory(), where ERA5 lives
+include(joinpath(@__DIR__, "..", "src", "glorys_ncar.jl"))   # cutting NCAR's GLORYS files; the ice days and region
 
 const SMOKE    = get(ENV, "SMOKE", "0") == "1"
 const PICKUP   = get(ENV, "PICKUP", "0") == "1"
@@ -91,55 +92,17 @@ NCAR_GLORYS || COPERNICUS ||
 # A daily GLORYS Metadatum is "downloaded" by cutting it out of that day's NCAR file. This method is
 # more specific than the CopernicusMarine extension's (Metadatum{<:GLORYSDataset}), so it takes
 # GLORYSDaily only; GLORYSStatic (deptho) still goes to Copernicus. The variable keeps its NCAR name,
-# dimensions, packing and attributes, which are Copernicus' own (thetao, so, uo, vo, zos, siconc,
-# sithick on longitude x latitude [x depth] x time). Written to a .part file and renamed, so a file
-# that exists is complete even with several prefetch jobs at once.
-const NCAR_MARGIN = 2 / 12   # two native cells, as the Copernicus backend pads its requests
-
-function ncar_glorys_file(date)
-    prefix = "mercatorglorys12v1_gl12_mean_" * Dates.format(date, "yyyymmdd") * "_R"
-    for folder in (joinpath(GLORYS_SOURCE, string(year(date))), GLORYS_SOURCE)
-        isdir(folder) || continue
-        found = sort(filter(f -> startswith(f, prefix) && endswith(f, ".nc"), readdir(folder)))
-        isempty(found) || return joinpath(folder, last(found))
-    end
-    error("no NCAR GLORYS file for $(Date(date)) in $GLORYS_SOURCE (looked for $(year(date))/$(prefix)*.nc)")
-end
-
-function cut_ncar_glorys(meta, path)
-    name = dataset_variable_name(meta)
-    region = meta.region
-    src = NCDataset(ncar_glorys_file(meta.dates))
-    λ, φ = src["longitude"][:], src["latitude"][:]
-    pick(x, bounds) = isnothing(bounds) ? (1:length(x)) :
-        (k = findall(c -> bounds[1] - NCAR_MARGIN <= c <= bounds[2] + NCAR_MARGIN, x); minimum(k):maximum(k))
-    i, j = pick(λ, isnothing(region) ? nothing : region.longitude), pick(φ, isnothing(region) ? nothing : region.latitude)
-    v = src[name]
-    dims = dimnames(v)
-    index = Tuple(d == "longitude" ? i : d == "latitude" ? j : Colon() for d in dims)
-
-    part = path * ".part"
-    isfile(part) && rm(part)
-    NCDataset(part, "c") do out
-        for d in dims
-            n = d == "longitude" ? length(i) : d == "latitude" ? length(j) : src.dim[d]
-            defDim(out, d, n)
-            c = src[d]
-            cv = defVar(out, d, eltype(c.var), (d,); attrib = collect(c.attrib))
-            cv.var[:] = d == "longitude" ? c.var[i] : d == "latitude" ? c.var[j] : c.var[:]
-        end
-        ov = defVar(out, name, eltype(v.var), dims; attrib = collect(v.attrib))
-        ov.var[ntuple(_ -> Colon(), length(dims))...] = v.var[index...]
-    end
-    close(src)
-    mv(part, path; force = true)
-    return path
-end
-
+# dimensions, packing and attributes, which are Copernicus' own. The cut itself is in
+# src/glorys_ncar.jl, shared with tools/convert_glorys_ncar.jl, which cuts everything ahead of the
+# run; this catches anything that converter did not.
 if NCAR_GLORYS
     function NumericalEarth.DataWrangling.Downloads.download(meta::Metadatum{<:GLORYSDaily}; kwargs...)
         path = joinpath(meta.dir, meta.filename)
-        isfile(path) || cut_ncar_glorys(meta, path)
+        isfile(path) && return path
+        @info "GLORYS: cutting $(meta.filename) now (tools/convert_glorys_ncar.jl did not make it)"
+        NCDataset(ncar_glorys_file(GLORYS_SOURCE, meta.dates)) do src
+            cut_ncar_glorys(src, dataset_variable_name(meta), meta.region, path)
+        end
         return path
     end
 end
@@ -148,7 +111,7 @@ end
 const PENETRATING_SHORTWAVE = true    # forward get_radiative_forcing to the child (see sowinwarp_nested.jl)
 const ICE_GROUNDING         = false   # LandfastBasalStress off, as fix7
 const ICE_RELAXATION_HOURS  = 6       # open-side band ice relaxed to GLORYS's on this timescale
-const ICE_RECORD_DAYS       = 5       # GLORYS ice sampled every 5 days for the bands (B-SOSE's cadence)
+const ICE_RECORD_DAYS       = GLORYS_ICE_RECORD_DAYS   # 5: GLORYS ice sampled every 5 days (set in src/glorys_ncar.jl, which the converter shares)
 
 @info "switches: parent = GLORYS daily, bathymetry = ETOPO2022, PENETRATING_SHORTWAVE = $PENETRATING_SHORTWAVE, " *
       "ICE_GROUNDING = $ICE_GROUNDING, ICE_RELAXATION_HOURS = $ICE_RELAXATION_HOURS, ICE_RECORD_DAYS = $ICE_RECORD_DAYS"
@@ -239,16 +202,10 @@ grid = ImmersedBoundaryGrid(underlying_grid,
 # cell area, the edge floes would be 4-7 m thick. The startup line still prints the volume both ways.
 const ICE_ℵ_MIN = 0.01
 const ICE_FILL_CELLS = 6
-const ICE_REGION = BoundingBox(longitude = (λ₁ - 1, λ₂ + 1), latitude = (φ₁ - 1, φ₂ + 1))
+const ICE_REGION = glorys_ice_region(λ₁, λ₂, φ₁, φ₂)
 
-# Days sampled for the ice: the day before first_date, every ICE_RECORD_DAYS after it, and the day
-# after last_date, so the records (placed at noon) bracket the run without reaching past the
-# 2014-05-31 to 2016-06-02 the ocean needs anyway
-function ice_record_starts(first_date, last_date)
-    starts = collect(floor(first_date, Day) - Day(1):Day(ICE_RECORD_DAYS):last_date)
-    last(starts) + Hour(12) < last_date && push!(starts, floor(last_date, Day) + Day(1))
-    return starts
-end
+# The days sampled for the ice (src/glorys_ncar.jl): the day before the start, every 5 days, the day after the end
+ice_record_starts(first_date, last_date) = glorys_ice_record_starts(first_date, last_date; every = ICE_RECORD_DAYS)
 
 glorys_ice_file(name, date) =
     NumericalEarth.DataWrangling.Downloads.download(Metadatum(name; dataset = GLORYSDaily(), date,
@@ -355,7 +312,9 @@ if PREFETCH
     nested_ocean_model(grid, GLORYSDaily(); dates = (prefetch_start, prefetch_end), dir = GLORYS_DIR,
                        parent_bottom_height = parent_seafloor(prefetch_start))
     @info @sprintf("prefetch: ocean strips done in %.1f h", (time() - t₀) / 3600)
-    for d in ice_record_starts(prefetch_start, prefetch_end), name in (:sea_ice_concentration, :sea_ice_thickness)
+    # The run's ice days (anchored to ITS start) that fall in this window
+    window_days = filter(d -> prefetch_start - Day(1) <= d <= prefetch_end + Day(1), ice_record_starts(start_date, end_date))
+    for d in window_days, name in (:sea_ice_concentration, :sea_ice_thickness)
         glorys_ice_file(name, d)
     end
     @info @sprintf("prefetch: %s to %s in %s, %.1f h in all", prefetch_start, prefetch_end, GLORYS_DIR, (time() - t₀) / 3600)
