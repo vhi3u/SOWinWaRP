@@ -1,5 +1,5 @@
 # Convert the hourly ERA5 single-level fields that NumericalEarth's `ERA5PrescribedAtmosphere` (10 m winds, 2 m
-# temperature and dewpoint, surface and mean sea level pressure, total precipitation) and `ERA5PrescribedRadiation`
+# temperature and dewpoint, surface and mean sea level pressure, total precipitation, snowfall) and `ERA5PrescribedRadiation`
 # (downwelling shortwave and longwave) read, from a Globus copy of NSF NCAR's ERA5 (RDA ds633.0, GDEX /d633000/), into
 # the yearly files NumericalEarth's `ERA5YearlySingleLevel` reads, cropped to the SOWinWaRP box. Nothing is downloaded.
 #
@@ -20,9 +20,9 @@
 # (precipitation, radiation) in forecast form: 12 hourly steps after each 06 and 18 UTC forecast start, in half-month
 # files. Each step is the accumulation over the hour ending at start + step, as ERA5 on the CDS, so it is written at that
 # time. The first hours of 1 January come from the previous December's last file. ERA5's total precipitation is NCAR's
-# large-scale plus convective precipitation. A year is only kept if every hour was filled.
+# large-scale plus convective precipitation; snowfall (in it) is NCAR's 128_144_sf. A year is only kept if every hour was filled.
 #
-# Units as NCAR stores them: winds m s⁻¹ (eastward/northward positive), temperatures K, pressure Pa, precipitation m (of
+# Units as NCAR stores them: winds m s⁻¹ (eastward/northward positive), temperatures K, pressure Pa, precipitation and snowfall m (of
 # water equivalent) and radiation J m⁻² (positive downwards) accumulated over the hour.
 #
 #     SOURCE_DIR=<BSOSE_DIR>/ncar-era5  ERA5_DIR=<BSOSE_DIR>/era5  YEARS=2014:2016   (or the years as arguments)
@@ -56,6 +56,7 @@ variables = [(name = :eastward_velocity,               short = "u10",  product =
              (name = :surface_pressure,                short = "sp",   product = analysis, parameters = ["128_134_sp"]),
              (name = :mean_sea_level_pressure,         short = "msl",  product = analysis, parameters = ["128_151_msl"]),
              (name = :total_precipitation,             short = "tp",   product = forecast, parameters = ["128_142_lsp", "128_143_cp"]),
+             (name = :snowfall,                        short = "sf",   product = forecast, parameters = ["128_144_sf"]),
              (name = :downwelling_shortwave_radiation, short = "ssrd", product = forecast, parameters = ["128_169_ssrd"]),
              (name = :downwelling_longwave_radiation,  short = "strd", product = forecast, parameters = ["128_175_strd"])]
 

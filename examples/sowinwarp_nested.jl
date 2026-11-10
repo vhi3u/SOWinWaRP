@@ -386,7 +386,8 @@ era5_end   = end_date + Hour(1)
 
 # Fail here rather than let the backend start a year-long CDS request for a missing file
 era5_names = (:eastward_velocity, :northward_velocity, :temperature, :dewpoint_temperature, era5_pressure,
-              :total_precipitation, :downwelling_shortwave_radiation, :downwelling_longwave_radiation)
+              :total_precipitation, :snowfall,   # snowfall: NumericalEarth reads it since d59fa0a (rain = total - snow)
+              :downwelling_shortwave_radiation, :downwelling_longwave_radiation)
 missing_era5 = [path for name in era5_names
                 for path in unique(metadata_path(Metadata(name; dataset = era5_dataset,
                                                           start_date = era5_start, end_date = era5_end,
