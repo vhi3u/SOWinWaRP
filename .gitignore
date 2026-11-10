@@ -33,3 +33,6 @@ run_animate_simulation
 run_obc_tests
 run_surface_tests
 run_testbed
+
+# tools/update_numericalearth.jl backs up the Manifest before each update
+Manifest.toml.*.bak
