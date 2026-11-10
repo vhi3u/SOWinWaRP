@@ -8,8 +8,8 @@
 #     julia --project=. examples/sowinwarp_glorys_baseline.jl               # GPU: the run itself
 #     SMOKE=1 julia --project=. examples/sowinwarp_glorys_baseline.jl       # 2 days, proves it starts
 #
-# RUN_NAME defaults to 2Y_nested_glorys_baseline and END_DATE to 2016-06-01T12:00 (the same span
-# as the 2-year B-SOSE runs), so a plain sbatch of this script is the baseline.
+# RUN_NAME defaults to 2Y_nested_glorys_baseline; END_DATE is hard-coded below to 2016-06-01T12:00 (the same span
+# as the 2-year B-SOSE runs; an END_DATE in the environment is ignored), so a plain sbatch of this script is the baseline.
 #
 # WHAT IT KEEPS from examples/sowinwarp_nested.jl, so that the parent is what differs from fix7:
 #   the domain and grid (1/6 deg, B-SOSE i156's 52 static levels), ETOPO2022 with the same knobs and
@@ -140,7 +140,8 @@ const Nz = length(z) - 1
 # GLORYS daily records are stamped at 00:00 (the start of their day), so any midnight is native.
 # Noon on 1 June would match the B-SOSE runs to the hour, but would not be a GLORYS stamp.
 start_date = DateTime(2014, 6, 1)
-end_date   = SMOKE ? DateTime(2014, 6, 3) : DateTime(get(ENV, "END_DATE", "2016-06-01T12:00"))
+const END_DATE = DateTime(2016, 6, 1, 12)   # hard-coded: 2 years, the span the GLORYS cuts cover (not read from ENV)
+end_date   = SMOKE ? DateTime(2014, 6, 3) : END_DATE
 const RUN_NAME = get(ENV, "RUN_NAME", SMOKE ? "glorys_smoke" : "2Y_nested_glorys_baseline")
 
 # PREFETCH fetches what a run over [PREFETCH_START, PREFETCH_END] reads; default the whole run
