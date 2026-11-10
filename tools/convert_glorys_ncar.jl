@@ -18,7 +18,10 @@
 #   - on the run's first days, the same five over the whole domain: the nest's starting state, and the
 #     temperature the baseline takes GLORYS' seafloor from without Copernicus credentials;
 #   - on the baseline's ice days (every 5 days, src/glorys_ncar.jl), siconc and sithick over the domain + 1 deg.
+# Then it inpaints each ocean file as the run would and writes NumericalEarth's cache of it beside the file
+# (<file>_inpainted.jld2), so the run loads the inpainted fields and inpaints nothing (INPAINT=0 to skip).
 # A file already in GLORYS_DIR is skipped, so rerun after a failure; a file is written whole or not at all.
+# A rerun over days already cut only inpaints.
 # The baseline cuts anything missed itself at startup (e.g. a south strip, if NumericalEarth ever opens the
 # south side), from the same NCAR files.
 #
@@ -28,12 +31,13 @@
 #     GLORYS_SOURCE=<BSOSE_DIR>/ncar-glorys  GLORYS_DIR=<BSOSE_DIR>/glorys  RUN_START=2014-06-01  RUN_END=2016-06-01T12:00
 #     DRY_RUN=1   lists what it would cut on the first two days, and the strip regions, and stops (seconds; login node)
 
-using Dates, Printf
+using Dates, Printf, Logging
 using NCDatasets
 using Oceananigans
 using NumericalEarth
 using NumericalEarth.DataWrangling: Metadata, Metadatum, BoundingBox, dataset_variable_name, bracketing_dates,
-                                    default_horizontal_padding, axis_padding
+                                    default_horizontal_padding, axis_padding,
+                                    default_inpainting, inpainted_metadata_path, jldopen
 using NumericalEarth.DataWrangling.GLORYS: GLORYSDaily
 
 include(joinpath(@__DIR__, "..", "src", "glorys_ncar.jl"))
@@ -71,15 +75,37 @@ strips  = (west  = BoundingBox(longitude = (λ₁ - δλ, λ₁ + w + δλ), lat
 domain  = BoundingBox(grid; padding)
 ocean_names = (:temperature, :salinity, :u_velocity, :v_velocity, :free_surface)
 
-# Every file to cut, grouped by day: (NCAR variable, region, path). Built from NumericalEarth's own Metadata,
-# so the dates and names are the ones the run asks for.
-cuts = Dict{Date, Vector{Tuple{String, Any, String}}}()
+# Every file to cut, grouped by day: path => Metadatum. Built from NumericalEarth's own Metadata, so the
+# dates and names are the ones the run asks for.
+cuts = Dict{Date, Dict{String, Any}}()
 add!(m) = for d in m
     day = Date(d.dates)
     window[1] <= day < window[2] || continue   # END is exclusive, so adjacent windows share no day
-    entry = (dataset_variable_name(d), d.region, joinpath(d.dir, d.filename))
-    list = get!(cuts, day, Tuple{String, Any, String}[])
-    entry in list || push!(list, entry)
+    get!(cuts, day, Dict{String, Any}())[joinpath(d.dir, d.filename)] = d
+end
+
+# INPAINT (default on): also write the inpainted copy NumericalEarth caches beside each file it inpaints
+# (DataWrangling/metadata_field.jl: `Field(metadatum, arch)` loads <file>_inpainted.jld2 when its
+# inpainting_maxiter matches, and otherwise inpaints and writes it). The run then inpaints nothing. Same
+# call, inpainting and halo as the run's (regrid_from_metadata!: default_inpainting, halo (3, 3, 3)), so
+# the cache is the one the run would have written. Ice is never inpainted (default_inpainting is nothing).
+const INPAINT = get(ENV, "INPAINT", "1") == "1"
+const INPAINT_HALO = (3, 3, 3)
+to_inpaint(m) = INPAINT && !isnothing(default_inpainting(m)) && !isfile(inpainted_metadata_path(m))
+
+function inpaint!(m)
+    inpainting = default_inpainting(m)
+    field = with_logger(ConsoleLogger(stderr, Logging.Warn)) do   # NumericalEarth logs two lines per field
+        Field(m, CPU(); inpainting, halo = INPAINT_HALO, cache_inpainted_data = false)
+    end
+    path = inpainted_metadata_path(m)
+    part = path * ".part" * string(getpid())   # written whole, then renamed: the run may read it meanwhile
+    jldopen(part, "w") do file
+        file["data"] = parent(field)
+        file["inpainting_maxiter"] = inpainting.maxiter
+    end
+    mv(part, path; force = true)
+    return nothing
 end
 
 strip_dates = bracketing_dates(dataset, :temperature, (run_start, run_end))
@@ -105,33 +131,42 @@ if get(ENV, "DRY_RUN", "0") == "1"
     foreach(side -> println("  $side: ", strips[side]), open_sides)
     for day in days[1:min(2, end)]
         println("$day ($(length(cuts[day])) files):")
-        foreach(c -> println("  ", rpad(c[1], 8), basename(c[3]), isfile(c[3]) ? "  (there)" : ""), cuts[day])
+        for (out, m) in sort(collect(cuts[day]); by = first)
+            println("  ", rpad(dataset_variable_name(m), 8), basename(out), isfile(out) ? "  (there)" : "",
+                    isnothing(default_inpainting(m)) ? "" : isfile(inpainted_metadata_path(m)) ? "  (inpainted)" : "  (to inpaint)")
+        end
     end
     exit(0)
 end
 
-done, skipped, missing_days = 0, 0, Date[]
+done, skipped, inpainted, missing_days = 0, 0, 0, Date[]
 t₀ = time()
 for (n, day) in enumerate(days)
-    todo = filter(c -> !isfile(c[3]), cuts[day])
+    todo = [(out, m) for (out, m) in cuts[day] if !isfile(out)]
     global skipped += length(cuts[day]) - length(todo)
-    isempty(todo) && continue
-    path = try
-        ncar_glorys_file(source, DateTime(day))
-    catch
-        push!(missing_days, day)
-        continue
-    end
-    NCDataset(path) do src
-        for (name, region, out) in todo
-            cut_ncar_glorys(src, name, region, out)
-            global done += 1
+    if !isempty(todo)
+        path = try
+            ncar_glorys_file(source, DateTime(day))
+        catch
+            push!(missing_days, day)
+            continue
+        end
+        NCDataset(path) do src
+            for (out, m) in todo
+                cut_ncar_glorys(src, dataset_variable_name(m), m.region, out)
+                global done += 1
+            end
         end
     end
+    for m in values(cuts[day])
+        to_inpaint(m) || continue
+        inpaint!(m)
+        global inpainted += 1
+    end
     (n % 30 == 0 || n == length(days)) &&
-        @info @sprintf("%s: %d of %d days, %d files cut, %d already there, %.2f h", day, n, length(days), done, skipped, (time() - t₀) / 3600)
+        @info @sprintf("%s: %d of %d days, %d files cut, %d already there, %d inpainted, %.2f h", day, n, length(days), done, skipped, inpainted, (time() - t₀) / 3600)
 end
 
 isempty(missing_days) ||
     @warn "$(length(missing_days)) days have no NCAR file in $source, so nothing was cut for them: " * join(string.(missing_days), ", ")
-@info @sprintf("GLORYS from NCAR: %d files cut, %d already there, %d days missing, %.2f h", done, skipped, length(missing_days), (time() - t₀) / 3600)
+@info @sprintf("GLORYS from NCAR: %d files cut, %d already there, %d inpainted, %d days missing, %.2f h", done, skipped, inpainted, length(missing_days), (time() - t₀) / 3600)
