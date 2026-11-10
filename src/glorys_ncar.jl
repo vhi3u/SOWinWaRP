@@ -7,7 +7,7 @@
 # A cut keeps one variable over a region plus two native cells, as NumericalEarth's Copernicus backend pads its
 # requests, under the file name NumericalEarth gives that Metadatum, so NumericalEarth finds it and downloads
 # nothing. Used by examples/sowinwarp_glorys_baseline.jl (cuts on demand) and tools/convert_glorys_ncar.jl
-# (cuts everything ahead of the run). Needs Dates, NCDatasets and NumericalEarth's BoundingBox in scope.
+# (cuts everything ahead of the run). Needs Dates, NCDatasets, Logging and NumericalEarth's BoundingBox in scope.
 
 const NCAR_MARGIN = 2 / 12            # two native (1/12 deg) cells
 const GLORYS_ICE_RECORD_DAYS = 5      # the baseline samples GLORYS ice every 5 days (B-SOSE's cadence)
@@ -72,4 +72,87 @@ function glorys_ice_record_starts(first_date, last_date; every = GLORYS_ICE_RECO
     starts = collect(floor(first_date, Day) - Day(1):Day(every):last_date)
     last(starts) + Hour(12) < last_date && push!(starts, floor(last_date, Day) + Day(1))
     return starts
+end
+
+# ── The GLORYS files a run reads, and their inpainted caches ─────────────────────────────────────
+# Shared by tools/convert_glorys_ncar.jl (cuts and inpaints them ahead of the run) and
+# examples/sowinwarp_glorys_baseline.jl (checks them at startup, so the run itself never cuts or inpaints).
+# Needs Oceananigans and NumericalEarth loaded.
+
+const GLORYS_OCEAN_NAMES = (:temperature, :salinity, :u_velocity, :v_velocity, :free_surface)
+const GLORYS_OPEN_SIDES  = (:west, :east, :north)   # the south row is Antarctica: NumericalEarth's open_boundary_sides drops it
+const INPAINT_HALO       = (3, 3, 3)                # regrid_from_metadata!'s default, so the cache is the run's own
+
+"""
+    glorys_run_files(dir, run_start, run_end; λ₁, λ₂, φ₁, φ₂, Nx, Ny)
+
+Every GLORYS daily Metadatum a nested run over `run_start`-`run_end` reads, deduplicated by file:
+T, S, u, v, η on each open side's strip (the regions NumericalEarth's BoundaryPrescribedComponent asks
+for, computed with its own functions); the same five over the domain on the first days (the starting
+state, and the temperature GLORYS' seafloor comes from without Copernicus); and the ice days. Returns
+`(; metadata, strips, width, w, padding)`. The regions depend only on the horizontal extent and
+resolution, so a one-level stand-in grid is used.
+"""
+function glorys_run_files(dir, run_start, run_end; λ₁, λ₂, φ₁, φ₂, Nx, Ny)
+    DW = NumericalEarth.DataWrangling
+    dataset = DW.GLORYS.GLORYSDaily()
+    grid = LatitudeLongitudeGrid(CPU(); size = (Nx, Ny, 1), longitude = (λ₁, λ₂), latitude = (φ₁, φ₂), z = (-1, 0))
+
+    padding = DW.default_horizontal_padding(dataset)
+    width   = NumericalEarth.NestedModels.cells_spanning(grid, NumericalEarth.NestedModels.default_relaxation_degrees)
+    w       = NumericalEarth.EarthSystemModels.relaxation_zone_width(grid, width)
+    δλ, δφ  = DW.axis_padding(padding)
+    λ, φ    = (λ₁ - δλ, λ₂ + δλ), (φ₁ - δφ, φ₂ + δφ)
+    strips  = (west  = DW.BoundingBox(longitude = (λ₁ - δλ, λ₁ + w + δλ), latitude = φ),
+               east  = DW.BoundingBox(longitude = (λ₂ - w - δλ, λ₂ + δλ), latitude = φ),
+               north = DW.BoundingBox(longitude = λ, latitude = (φ₂ - w - δφ, φ₂ + δφ)))
+    domain  = DW.BoundingBox(grid; padding)
+
+    files = Dict{String, Any}()
+    add!(m) = for d in m
+        files[joinpath(d.dir, d.filename)] = d
+    end
+    strip_dates = DW.bracketing_dates(dataset, :temperature, (run_start, run_end))
+    for side in GLORYS_OPEN_SIDES, name in GLORYS_OCEAN_NAMES
+        add!(DW.Metadata(name; dataset, dates = strip_dates, region = strips[side], dir))
+    end
+    for name in GLORYS_OCEAN_NAMES
+        add!(DW.Metadata(name; dataset, dates = DW.bracketing_dates(dataset, :temperature, [run_start]), region = domain, dir))
+    end
+    add!(DW.Metadatum(:temperature; dataset, date = run_start, region = domain, dir))
+    ice_region = glorys_ice_region(λ₁, λ₂, φ₁, φ₂)
+    for date in glorys_ice_record_starts(run_start, run_end), name in (:sea_ice_concentration, :sea_ice_thickness)
+        add!(DW.Metadatum(name; dataset, date, region = ice_region, dir))
+    end
+    metadata = [files[k] for k in sort(collect(keys(files)))]
+    return (; metadata, strips, width, w, padding)
+end
+
+"Does `m` get inpainted when read (ocean: yes; ice: never), and is its cache still missing?"
+needs_inpainting(m) = !isnothing(NumericalEarth.DataWrangling.default_inpainting(m)) &&
+                      !isfile(NumericalEarth.DataWrangling.inpainted_metadata_path(m))
+
+"""
+    inpaint_glorys!(m)
+
+Inpaint `m` as the run would and write NumericalEarth's cache of it, <file>_inpainted.jld2, beside the
+file. `Field(metadatum, arch)` (DataWrangling/metadata_field.jl) loads that cache, silently, whenever its
+inpainting_maxiter matches, and only otherwise inpaints. Same inpainting and halo as the run's
+regrid_from_metadata!, so the cache is the one the run would have written. Written to a per-process
+.part and renamed, so a run reading it meanwhile never sees half a file.
+"""
+function inpaint_glorys!(m)
+    DW = NumericalEarth.DataWrangling
+    inpainting = DW.default_inpainting(m)
+    field = Logging.with_logger(Logging.ConsoleLogger(stderr, Logging.Warn)) do   # NumericalEarth logs two lines per field
+        Field(m, CPU(); inpainting, halo = INPAINT_HALO, cache_inpainted_data = false)
+    end
+    path = DW.inpainted_metadata_path(m)
+    part = path * ".part" * string(getpid())
+    DW.jldopen(part, "w") do file
+        file["data"] = parent(field)
+        file["inpainting_maxiter"] = inpainting.maxiter
+    end
+    mv(part, path; force = true)
+    return nothing
 end

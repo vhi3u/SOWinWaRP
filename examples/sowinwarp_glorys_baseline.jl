@@ -62,7 +62,7 @@ using Oceananigans.BoundaryConditions: fill_halo_regions!
 using NumericalEarth.SeaIces.ClimaSeaIce: IncrementalRemapping
 using Oceanostics.ProgressMessengers: TimedMessenger
 using NCDatasets      # loads Oceananigans' NetCDFWriter
-using Dates, Printf
+using Dates, Printf, Logging
 
 include(joinpath(@__DIR__, "..", "src", "setup_bsose.jl"))   # only for default_bsose_directory(), where ERA5 lives
 include(joinpath(@__DIR__, "..", "src", "glorys_ncar.jl"))   # cutting NCAR's GLORYS files; the ice days and region
@@ -150,6 +150,23 @@ prefetch_end   = DateTime(get(ENV, "PREFETCH_END",   string(end_date)))
 
 @info "SOWinWaRP GLORYS baseline: $(Nx)x$(Ny)x$(Nz) over $(λ₁)-$(λ₂)E, $(φ₁)-$(φ₂)S, " *
       (PREFETCH ? "PREFETCH $prefetch_start to $prefetch_end into $GLORYS_DIR" : "$start_date to $end_date")
+
+# ── GLORYS, all of it, before the run ─────────────────────────────────────────────────────────
+# Every GLORYS file the run will read (src/glorys_ncar.jl, glorys_run_files: the strips for every day, the
+# starting state, the ice days) is checked now: cut from NCAR if missing, and inpainted if NumericalEarth's
+# cache of it (<file>_inpainted.jld2) is missing. tools/convert_glorys_ncar.jl normally did both already,
+# and then this takes seconds. During the run NumericalEarth reads each day's strips from disk (2 records in
+# memory) from those caches, with nothing to cut or inpaint; its info lines are silenced too (see run!).
+if !PREFETCH
+    let t₀ = time(), files = glorys_run_files(GLORYS_DIR, start_date, end_date; λ₁, λ₂, φ₁, φ₂, Nx, Ny).metadata
+        missing_files = count(m -> !isfile(metadata_path(m)), files)
+        foreach(NumericalEarth.DataWrangling.Downloads.download, files)   # cuts (or downloads) any that are missing
+        todo = filter(needs_inpainting, files)
+        isempty(todo) || @info "GLORYS: inpainting $(length(todo)) files now (tools/convert_glorys_ncar.jl had not)"
+        foreach(inpaint_glorys!, todo)
+        @info @sprintf("GLORYS: all %d files the run reads are on disk and inpainted (%d cut and %d inpainted now, %.1f min)", length(files), missing_files, length(todo), (time() - t₀) / 60)
+    end
+end
 
 underlying_grid = LatitudeLongitudeGrid(ARCH;
                                         size = (Nx, Ny, Nz),
@@ -645,6 +662,21 @@ const CHECKPOINT_DAYS = parse(Float64, get(ENV, "CHECKPOINT_DAYS", SMOKE ? "1" :
 simulation.output_writers[:checkpointer] = Checkpointer(coupled_model;
                                                         schedule = TimeInterval(CHECKPOINT_DAYS * days),
                                                         prefix = "$(RUN_NAME)_checkpoint")
+
+# NumericalEarth's DataWrangling info lines (reading, inpainting parent data) are dropped from here on: every
+# GLORYS file was cut and inpainted at startup, so they carry nothing, and the log is the model's. Its
+# warnings, and every other module's lines, still show.
+struct QuietParentData{L <: Logging.AbstractLogger} <: Logging.AbstractLogger
+    logger :: L
+end
+is_data_wrangling(m::Module) = m === NumericalEarth.DataWrangling ||
+                               (parentmodule(m) !== m && is_data_wrangling(parentmodule(m)))
+Logging.min_enabled_level(q::QuietParentData) = Logging.min_enabled_level(q.logger)
+Logging.catch_exceptions(q::QuietParentData)  = Logging.catch_exceptions(q.logger)
+Logging.shouldlog(q::QuietParentData, level, _module, group, id) =
+    (level >= Logging.Warn || !is_data_wrangling(_module)) && Logging.shouldlog(q.logger, level, _module, group, id)
+Logging.handle_message(q::QuietParentData, args...; kwargs...) = Logging.handle_message(q.logger, args...; kwargs...)
+global_logger(QuietParentData(global_logger()))
 
 PICKUP && @info "picking up $RUN_NAME from its latest checkpoint"
 @info "starting"

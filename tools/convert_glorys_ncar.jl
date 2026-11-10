@@ -35,9 +35,7 @@ using Dates, Printf, Logging
 using NCDatasets
 using Oceananigans
 using NumericalEarth
-using NumericalEarth.DataWrangling: Metadata, Metadatum, BoundingBox, dataset_variable_name, bracketing_dates,
-                                    default_horizontal_padding, axis_padding,
-                                    default_inpainting, inpainted_metadata_path, jldopen
+using NumericalEarth.DataWrangling: Metadatum, BoundingBox, dataset_variable_name, default_inpainting, inpainted_metadata_path
 using NumericalEarth.DataWrangling.GLORYS: GLORYSDaily
 
 include(joinpath(@__DIR__, "..", "src", "glorys_ncar.jl"))
@@ -64,69 +62,21 @@ mkpath(dir)
 const λ₁, λ₂ = 90.0, 150.0
 const φ₁, φ₂ = -70.0, -45.0
 const Nx, Ny = 360, 150
-open_sides = (:west, :east, :north)   # the south row is Antarctica: NumericalEarth's open_boundary_sides drops it
 
-# A horizontal stand-in for the baseline's grid: the regions only depend on its extent and spacing
-grid = LatitudeLongitudeGrid(CPU(); size = (Nx, Ny, 1), longitude = (λ₁, λ₂), latitude = (φ₁, φ₂), z = (-1, 0))
-dataset = GLORYSDaily()
-
-# The strips, as NumericalEarth's BoundaryPrescribedComponent (DataWrangling/boundary_prescribed_component.jl)
-# builds them for nested_ocean_model's defaults: `width` cells of relaxation, padded by the dataset's padding
-padding = default_horizontal_padding(dataset)
-width   = NumericalEarth.NestedModels.cells_spanning(grid, NumericalEarth.NestedModels.default_relaxation_degrees)
-w       = NumericalEarth.EarthSystemModels.relaxation_zone_width(grid, width)
-δλ, δφ  = axis_padding(padding)
-λ, φ    = (λ₁ - δλ, λ₂ + δλ), (φ₁ - δφ, φ₂ + δφ)
-strips  = (west  = BoundingBox(longitude = (λ₁ - δλ, λ₁ + w + δλ), latitude = φ),
-           east  = BoundingBox(longitude = (λ₂ - w - δλ, λ₂ + δλ), latitude = φ),
-           north = BoundingBox(longitude = λ, latitude = (φ₂ - w - δφ, φ₂ + δφ)))
-domain  = BoundingBox(grid; padding)
-ocean_names = (:temperature, :salinity, :u_velocity, :v_velocity, :free_surface)
-
-# Every file to cut, grouped by day: path => Metadatum. Built from NumericalEarth's own Metadata, so the
-# dates and names are the ones the run asks for.
-cuts = Dict{Date, Dict{String, Any}}()
-add!(m) = for d in m
-    day = Date(d.dates)
-    window[1] <= day < window[2] || continue   # END is exclusive, so adjacent windows share no day
-    get!(cuts, day, Dict{String, Any}())[joinpath(d.dir, d.filename)] = d
-end
-
-# INPAINT (default on): also write the inpainted copy NumericalEarth caches beside each file it inpaints
-# (DataWrangling/metadata_field.jl: `Field(metadatum, arch)` loads <file>_inpainted.jld2 when its
-# inpainting_maxiter matches, and otherwise inpaints and writes it). The run then inpaints nothing. Same
-# call, inpainting and halo as the run's (regrid_from_metadata!: default_inpainting, halo (3, 3, 3)), so
-# the cache is the one the run would have written. Ice is never inpainted (default_inpainting is nothing).
+# INPAINT (default on): also write the inpainted cache NumericalEarth keeps beside each file it inpaints
+# (src/glorys_ncar.jl, inpaint_glorys!), so the run inpaints nothing. Ice is never inpainted.
 const INPAINT = get(ENV, "INPAINT", "1") == "1"
-const INPAINT_HALO = (3, 3, 3)
-to_inpaint(m) = INPAINT && !isnothing(default_inpainting(m)) && !isfile(inpainted_metadata_path(m))
+to_inpaint(m) = INPAINT && needs_inpainting(m)
 
-function inpaint!(m)
-    inpainting = default_inpainting(m)
-    field = with_logger(ConsoleLogger(stderr, Logging.Warn)) do   # NumericalEarth logs two lines per field
-        Field(m, CPU(); inpainting, halo = INPAINT_HALO, cache_inpainted_data = false)
-    end
-    path = inpainted_metadata_path(m)
-    part = path * ".part" * string(getpid())   # written whole, then renamed: the run may read it meanwhile
-    jldopen(part, "w") do file
-        file["data"] = parent(field)
-        file["inpainting_maxiter"] = inpainting.maxiter
-    end
-    mv(part, path; force = true)
-    return nothing
-end
-
-strip_dates = bracketing_dates(dataset, :temperature, (run_start, run_end))
-for side in open_sides, name in ocean_names
-    add!(Metadata(name; dataset, dates = strip_dates, region = strips[side], dir))
-end
-for name in ocean_names
-    add!(Metadata(name; dataset, dates = bracketing_dates(dataset, :temperature, [run_start]), region = domain, dir))
-end
-add!(Metadatum(:temperature; dataset, date = run_start, region = domain, dir))
-ice_region = glorys_ice_region(λ₁, λ₂, φ₁, φ₂)
-for date in glorys_ice_record_starts(run_start, run_end), name in (:sea_ice_concentration, :sea_ice_thickness)
-    add!(Metadatum(name; dataset, date, region = ice_region, dir))
+# Every file to cut, grouped by day: path => Metadatum, from the list the baseline checks at startup
+run_files = glorys_run_files(dir, run_start, run_end; λ₁, λ₂, φ₁, φ₂, Nx, Ny)
+strips, width, w, padding = run_files.strips, run_files.width, run_files.w, run_files.padding
+open_sides = GLORYS_OPEN_SIDES
+cuts = Dict{Date, Dict{String, Any}}()
+for m in run_files.metadata
+    day = Date(m.dates)
+    window[1] <= day < window[2] || continue   # END is exclusive, so adjacent windows share no day
+    get!(cuts, day, Dict{String, Any}())[joinpath(m.dir, m.filename)] = m
 end
 
 days = sort(collect(keys(cuts)))
@@ -168,7 +118,7 @@ for (n, day) in enumerate(days)
     end
     for m in values(cuts[day])
         to_inpaint(m) || continue
-        inpaint!(m)
+        inpaint_glorys!(m)
         global inpainted += 1
     end
     (n % 30 == 0 || n == length(days)) &&
