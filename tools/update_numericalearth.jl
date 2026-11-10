@@ -5,8 +5,12 @@
 #     julia --project=. tools/update_numericalearth.jl check      # only say whether it has moved
 #     julia --project=. tools/update_numericalearth.jl rollback   # back to the Manifest before the last update
 #
-# RUN IT ON A GPU NODE (salloc ... --gres=gpu:V100:1). It precompiles, and precompiling on a CPU node
-# breaks CUDA for every later GPU job in this checkout; it refuses to update without a GPU.
+# FROM A LOGIN NODE, update and rollback SUBMIT THEMSELVES as a 1-GPU job: ./create_job.sh writes
+# slurm_update_numericalearth.sh (your account stays in that gitignored script), sbatch submits it, and the
+# job runs this script again with the mode in NE_MODE. Its log is out/update_numericalearth. `check` runs
+# where you are, in seconds.
+# On a GPU node (salloc ... --gres=gpu:V100:1) it runs right there. It never precompiles without a GPU:
+# precompiling on a CPU node breaks CUDA for every later GPU job in this checkout.
 #
 # What an update does:
 #   1. asks GitHub for the branch's head commit (git ls-remote; nothing is cloned);
@@ -17,8 +21,10 @@
 #   5. precompiles, then loads CUDA, Oceananigans and NumericalEarth in a fresh Julia and checks the GPU works.
 # It changes Manifest.toml (and Project.toml the first time). Commit those yourself once a SMOKE run is good.
 #
-#     NE_URL     the repository   (default https://github.com/NumericalEarth/NumericalEarth.jl)
-#     NE_BRANCH  the branch       (default ss/nested-ocean-model)
+#     NE_URL       the repository              (default https://github.com/NumericalEarth/NumericalEarth.jl)
+#     NE_BRANCH    the branch                  (default ss/nested-ocean-model)
+#     NE_GPU       the GPU the job asks for    (default V100)
+#     NE_WALLTIME  the job's hours             (default 2: the first update precompiles Oceananigans too)
 
 using Pkg, Dates, UUIDs
 
@@ -27,7 +33,7 @@ const NE_URL    = get(ENV, "NE_URL", "https://github.com/NumericalEarth/Numerica
 const NE_BRANCH = get(ENV, "NE_BRANCH", "ss/nested-ocean-model")
 const PROJECT   = dirname(Base.active_project())
 const MANIFEST  = joinpath(PROJECT, "Manifest.toml")
-const MODE      = isempty(ARGS) ? "update" : ARGS[1]
+const MODE      = isempty(ARGS) ? get(ENV, "NE_MODE", "update") : ARGS[1]
 MODE in ("update", "check", "rollback") || error("usage: julia --project=. tools/update_numericalearth.jl [check|rollback]")
 isfile(joinpath(PROJECT, "Project.toml")) && occursin("SOWinWaRP", PROJECT) ||
     @warn "the active project is $PROJECT; run this with --project=. from the SOWinWaRP checkout"
@@ -35,7 +41,31 @@ isfile(joinpath(PROJECT, "Project.toml")) && occursin("SOWinWaRP", PROJECT) ||
 has_gpu() = try success(pipeline(`nvidia-smi -L`; stdout = devnull, stderr = devnull)) catch; false end
 require_gpu(what) = has_gpu() ||
     error("no GPU on this node: $what precompiles, which on a CPU node breaks CUDA for later GPU jobs. " *
-          "Get a GPU node first (salloc ... --gres=gpu:V100:1).")
+          "Run it from a login node (it submits a GPU job) or on a GPU node.")
+
+"""
+On a login node (no GPU, not inside a job): write the job with ./create_job.sh, submit it with sbatch, and stop.
+The job runs this script with NE_MODE = `mode`; sbatch passes the environment through.
+"""
+function submit_job(mode)
+    has_gpu() && return false
+    haskey(ENV, "SLURM_JOB_ID") && error("inside job $(ENV["SLURM_JOB_ID"]) but this node has no GPU: resubmit with a GPU")
+    create = joinpath(PROJECT, "create_job.sh")
+    isfile(create) || error("$create not found: it writes the job script (with your account), so this needs it")
+    name = "update_numericalearth"
+    gpu, hours = get(ENV, "NE_GPU", "V100"), get(ENV, "NE_WALLTIME", "2")
+    cd(PROJECT) do
+        run(pipeline(`bash create_job.sh $name gpu $hours $gpu 32G tools/update_numericalearth.jl`; stdout = devnull))
+        submitted = read(addenv(`sbatch slurm_$name.sh`, "NE_MODE" => mode), String)
+        @info strip(submitted) * " ($mode, 1 $gpu, $(hours) h). Its log: $(joinpath(PROJECT, "out", name)); " *
+              "follow it with  tail -f out/$name"
+    end
+    return true
+end
+
+# The job's own JULIA_CPU_TARGET is generic (create_job.sh), so the packages compiled here run on every node
+# type; an interactive GPU session may not set it, so default it the same way before anything compiles.
+haskey(ENV, "JULIA_CPU_TARGET") || (ENV["JULIA_CPU_TARGET"] = "generic")
 
 """What the project has now: the commit it is pinned to (or nothing), and a short description."""
 function current()
@@ -72,6 +102,7 @@ backups() = sort(filter(f -> startswith(f, "Manifest.toml.") && endswith(f, ".ba
 
 # ── rollback ──────────────────────────────────────────────────────────────────────────────────
 if MODE == "rollback"
+    submit_job("rollback") && exit(0)
     b = backups()
     isempty(b) && error("no Manifest.toml.*.bak in $PROJECT to roll back to")
     require_gpu("rollback")
@@ -99,6 +130,7 @@ if MODE == "check"
     exit(0)
 end
 
+submit_job("update") && exit(0)
 require_gpu("an update")
 old = something(now_.rev, "v" * string(get(Pkg.dependencies(), NE_UUID, (; version = "none")).version))
 backup = joinpath(PROJECT, "Manifest.toml.$(first(old, 9)).bak")
