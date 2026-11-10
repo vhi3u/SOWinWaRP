@@ -68,6 +68,17 @@ function NumericalEarth.DataWrangling.Downloads.download(meta::Metadatum{<:Union
     return path
 end
 
+# A FieldTimeSeries downloads its whole Metadata at once: each date in turn, as the CopernicusMarine
+# extension's method does (ext/NumericalEarthCopernicusMarineExt.jl). Metadatum is the single-date Metadata,
+# so the method above stays the more specific one for a single date.
+function NumericalEarth.DataWrangling.Downloads.download(metadata::NumericalEarth.DataWrangling.Metadata{<:Union{GLORYSDaily, GLORYSStatic}}; kwargs...)
+    paths = Array{String}(undef, length(metadata))
+    for (m, metadatum) in enumerate(metadata)
+        paths[m] = NumericalEarth.DataWrangling.Downloads.download(metadatum; kwargs...)
+    end
+    return paths
+end
+
 # ── experiment switches: set HERE, as in sowinwarp_nested.jl ──────────────────────────────────
 const PENETRATING_SHORTWAVE = true    # forward get_radiative_forcing to the child (see sowinwarp_nested.jl)
 const ICE_GROUNDING         = false   # LandfastBasalStress off, as fix7
