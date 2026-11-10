@@ -6,8 +6,9 @@
 # the same product, variable names, dimensions and packing as Copernicus' cmems_mod_glo_phy_my_0.083deg_P1D-m.
 # A cut keeps one variable over a region plus two native cells, as NumericalEarth's Copernicus backend pads its
 # requests, under the file name NumericalEarth gives that Metadatum, so NumericalEarth finds it and downloads
-# nothing. Used by examples/sowinwarp_glorys_baseline.jl (cuts on demand) and tools/convert_glorys_ncar.jl
-# (cuts everything ahead of the run). Needs Dates, NCDatasets, Logging and NumericalEarth's BoundingBox in scope.
+# nothing. Used by tools/prefetch_glorys.jl, which cuts and inpaints everything ahead of the run, and by
+# examples/sowinwarp_glorys_baseline.jl, which checks it is all there. Needs Dates, NCDatasets, Logging,
+# Oceananigans and NumericalEarth loaded.
 
 const NCAR_MARGIN = 2 / 12            # two native (1/12 deg) cells
 const GLORYS_ICE_RECORD_DAYS = 5      # the baseline samples GLORYS ice every 5 days (B-SOSE's cadence)
@@ -75,8 +76,8 @@ function glorys_ice_record_starts(first_date, last_date; every = GLORYS_ICE_RECO
 end
 
 # ── The GLORYS files a run reads, and their inpainted caches ─────────────────────────────────────
-# Shared by tools/convert_glorys_ncar.jl (cuts and inpaints them ahead of the run) and
-# examples/sowinwarp_glorys_baseline.jl (checks them at startup, so the run itself never cuts or inpaints).
+# Shared by tools/prefetch_glorys.jl (cuts and inpaints them ahead of the run) and
+# examples/sowinwarp_glorys_baseline.jl (checks them at startup, then holds them all in memory).
 # Needs Oceananigans and NumericalEarth loaded.
 
 const GLORYS_OCEAN_NAMES = (:temperature, :salinity, :u_velocity, :v_velocity, :free_surface)
@@ -89,9 +90,12 @@ const INPAINT_HALO       = (3, 3, 3)                # regrid_from_metadata!'s de
 Every GLORYS daily Metadatum a nested run over `run_start`-`run_end` reads, deduplicated by file:
 T, S, u, v, η on each open side's strip (the regions NumericalEarth's BoundaryPrescribedComponent asks
 for, computed with its own functions); the same five over the domain on the first days (the starting
-state, and the temperature GLORYS' seafloor comes from without Copernicus); and the ice days. Returns
-`(; metadata, strips, width, w, padding)`. The regions depend only on the horizontal extent and
-resolution, so a one-level stand-in grid is used.
+state, and the temperature GLORYS' seafloor is taken from when there is no deptho); and the ice days.
+Returns `(; metadata, first_strip_records, deptho, strips, width, w, padding)`: `first_strip_records`
+is each strip variable's first record (to size the parent held in memory), `deptho` the Metadatum of
+GLORYS' static seafloor over the nest's snapshot region (fetched from Copernicus only, so not in
+`metadata`). The regions depend only on the horizontal extent and resolution, so a one-level stand-in
+grid is used.
 """
 function glorys_run_files(dir, run_start, run_end; λ₁, λ₂, φ₁, φ₂, Nx, Ny)
     DW = NumericalEarth.DataWrangling
@@ -113,8 +117,11 @@ function glorys_run_files(dir, run_start, run_end; λ₁, λ₂, φ₁, φ₂, N
         files[joinpath(d.dir, d.filename)] = d
     end
     strip_dates = DW.bracketing_dates(dataset, :temperature, (run_start, run_end))
+    first_strip_records = []
     for side in GLORYS_OPEN_SIDES, name in GLORYS_OCEAN_NAMES
-        add!(DW.Metadata(name; dataset, dates = strip_dates, region = strips[side], dir))
+        series = DW.Metadata(name; dataset, dates = strip_dates, region = strips[side], dir)
+        add!(series)
+        push!(first_strip_records, first(series))
     end
     for name in GLORYS_OCEAN_NAMES
         add!(DW.Metadata(name; dataset, dates = DW.bracketing_dates(dataset, :temperature, [run_start]), region = domain, dir))
@@ -125,7 +132,8 @@ function glorys_run_files(dir, run_start, run_end; λ₁, λ₂, φ₁, φ₂, N
         add!(DW.Metadatum(name; dataset, date, region = ice_region, dir))
     end
     metadata = [files[k] for k in sort(collect(keys(files)))]
-    return (; metadata, strips, width, w, padding)
+    deptho = DW.Metadatum(:depth; dataset = DW.GLORYS.GLORYSStatic(), region = domain, dir)
+    return (; metadata, first_strip_records, deptho, strips, width, w, padding)
 end
 
 "Does `m` get inpainted when read (ocean: yes; ice: never), and is its cache still missing?"

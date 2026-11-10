@@ -2,9 +2,9 @@
 # sowinwarp_glorys_baseline.jl -- the SOWinWaRP box nested in GLORYS instead of B-SOSE, as a
 # baseline. After NumericalEarth's examples/bouvet_nested_ocean_simulation.jl: GLORYS daily for the
 # ocean parent, ERA5 for the atmosphere, ClimaSeaIce for the ice, ETOPO2022 bathymetry, and the
-# nest's own defaults for the boundary relaxation and the parent streaming.
+# nest's own defaults for the boundary relaxation.
 #
-#     PREFETCH=1 julia --project=. examples/sowinwarp_glorys_baseline.jl    # CPU: cut/download GLORYS, then stop
+#     julia --project=. tools/prefetch_glorys.jl                            # FIRST, on CPU: makes all the GLORYS ready
 #     julia --project=. examples/sowinwarp_glorys_baseline.jl               # GPU: the run itself
 #     SMOKE=1 julia --project=. examples/sowinwarp_glorys_baseline.jl       # 2 days, proves it starts
 #
@@ -17,43 +17,24 @@
 #   IncrementalRemapping ice advection, free-slip ice coasts, grounding off, the ice CFL in the
 #   wizard, the 50 m ice-volume stop, the health line, and the same output files, so every tool in
 #   tools/ reads this run as it reads the B-SOSE ones.
-# WHAT IT DROPS: B-SOSE's coastal freshwater (derived from B-SOSE), and the resident parent (the
-#   nest's default of 2 records streamed from disk, as in the Bouvet example: two years of daily
-#   GLORYS strips do not fit on the GPU).
+#   Like it, EVERY parent record is held in memory, loaded at startup (see "the nest").
+# WHAT IT DROPS: B-SOSE's coastal freshwater (derived from B-SOSE).
 # WHAT CHANGES: the ice starts from GLORYS siconc/sithick on 2014-06-01, and the 4-cell open-side
 #   bands are relaxed to GLORYS ice, in place of B-SOSE's (see "GLORYS sea ice").
 #
-# WHERE GLORYS COMES FROM. NSF NCAR's copy of GLORYS12V1 (GDEX d010049), the same product as
-# Copernicus' cmems_mod_glo_phy_my_0.083deg_P1D-m: one global file per day holding every variable,
-# <GLORYS_SOURCE>/<YYYY>/mercatorglorys12v1_gl12_mean_<YYYYMMDD>_R<YYYYMMDD>.nc (~1.3 GB each),
-# copied with Globus as the ERA5 was. When GLORYS_SOURCE (default <data>/ncar-glorys) exists, every
-# GLORYS daily file the nest asks for is CUT from that day's NCAR file -- the variable, over the
-# region asked for plus two native cells, as the Copernicus backend would have downloaded it -- and
-# written under NumericalEarth's own file name in GLORYS_DIR, so nothing is downloaded. The run
-# needs the days 2014-05-31 to 2016-06-02 (the run plus the samples either side).
-#   Without GLORYS_SOURCE it downloads from Copernicus instead, with COPERNICUSMARINE_SERVICE_USERNAME
-# and _PASSWORD from .copernicus_env (create_job.sh sources it). Either way, GLORYS' static seafloor
-# (deptho, which NCAR does not carry) comes from Copernicus when those are set -- one small file --
-# and otherwise from where GLORYS' temperature is missing on the first day.
-#
-# CUT FIRST (PREFETCH), on CPU nodes. The nest asks for T, S, u, v and η on each open side's strip,
-# one day at a time: ~11,000 files for two years, plus a full-domain first day and the ice. The files
-# are named by date and region only, so the window can be split across jobs that run at once:
-#
-#     PREFETCH=1 PREFETCH_START=2014-05-31 PREFETCH_END=2014-12-01 julia --project=. examples/sowinwarp_glorys_baseline.jl
-#     PREFETCH=1 PREFETCH_START=2014-12-01 PREFETCH_END=2015-06-01 ...
-#     PREFETCH=verify julia --project=. examples/sowinwarp_glorys_baseline.jl   # afterwards: drop broken files
-#
-# Files go to GLORYS_DIR (default <data>/glorys on scratch, ~10-25 GB for two years). Files already
-# there are skipped, so a prefetch can be rerun. Once the GPU run has started cleanly, the NCAR copy
-# (~1 TB) can be deleted.
+# GLORYS, AS ERA5: PREFETCHED, THEN LOADED. tools/prefetch_glorys.jl, one CPU job, makes every GLORYS file
+# this run reads -- cut from the Globus copy of NSF NCAR's GLORYS12V1 (GDEX d010049) under NumericalEarth's
+# own names, inpainted as NumericalEarth would and kept as its cache (<file>_inpainted.jld2), and deptho
+# from Copernicus if the credentials are set -- and ends with "GLORYS READY". This run reads only those
+# files: it checks they are all there at startup, as it checks the ERA5 files, and stops if not; then it
+# loads every daily record of the boundary strips into memory before the first step. Nothing is cut,
+# downloaded or inpainted while it runs, so its log is the model's.
 # ==============================================================================================
 
 using CUDA            # loads Oceananigans' CUDA extension, which is what defines `GPU()`
-using CopernicusMarine              # the GLORYS backend
 using CopernicusClimateDataStore    # an ERA5 backend: the ERA5 constructors always call `download`
 using NumericalEarth
-using NumericalEarth.DataWrangling: metadata_path, Metadatum, BoundingBox, dataset_variable_name
+using NumericalEarth.DataWrangling: metadata_path, Metadatum, BoundingBox, bracketing_dates, inpainted_metadata_path, jldopen
 using NumericalEarth.DataWrangling.GLORYS: GLORYSDaily, GLORYSStatic
 using Oceananigans
 using Oceananigans.Units
@@ -65,12 +46,11 @@ using NCDatasets      # loads Oceananigans' NetCDFWriter
 using Dates, Printf, Logging
 
 include(joinpath(@__DIR__, "..", "src", "setup_bsose.jl"))   # only for default_bsose_directory(), where ERA5 lives
-include(joinpath(@__DIR__, "..", "src", "glorys_ncar.jl"))   # cutting NCAR's GLORYS files; the ice days and region
+include(joinpath(@__DIR__, "..", "src", "glorys_ncar.jl"))   # the GLORYS files this run reads; the ice days and region
 
 const SMOKE    = get(ENV, "SMOKE", "0") == "1"
 const PICKUP   = get(ENV, "PICKUP", "0") == "1"
-const PREFETCH = get(ENV, "PREFETCH", "0") in ("1", "verify")
-const ARCH     = PREFETCH ? CPU() : (get(ENV, "ARCH", "GPU") == "CPU" ? CPU() : GPU())
+const ARCH     = get(ENV, "ARCH", "GPU") == "CPU" ? CPU() : GPU()
 ARCH isa GPU && !CUDA.functional() &&
     (CUDA.functional(true); error("CUDA is not functional on this node. Check the GPU allocation, or set ARCH=CPU."))
 ARCH isa GPU && @info "Running on GPU: $(CUDA.name(CUDA.device()))"
@@ -79,39 +59,20 @@ const DATA_DIR   = default_bsose_directory()
 const GLORYS_DIR = get(ENV, "GLORYS_DIR", joinpath(DATA_DIR, "glorys"))
 mkpath(GLORYS_DIR)
 
-const GLORYS_SOURCE = get(ENV, "GLORYS_SOURCE", joinpath(DATA_DIR, "ncar-glorys"))
-const NCAR_GLORYS   = isdir(GLORYS_SOURCE)
-const COPERNICUS    = haskey(ENV, "COPERNICUSMARINE_SERVICE_USERNAME") && haskey(ENV, "COPERNICUSMARINE_SERVICE_PASSWORD")
-
-@info "GLORYS: " * (NCAR_GLORYS ? "cut from NCAR's daily files in $GLORYS_SOURCE" : "downloaded from Copernicus") *
-      " into $GLORYS_DIR; seafloor " * (COPERNICUS ? "deptho from Copernicus" : "from GLORYS' temperature mask (no Copernicus credentials)")
-NCAR_GLORYS || COPERNICUS ||
-    @warn "neither $GLORYS_SOURCE nor Copernicus credentials: any GLORYS file not yet in $GLORYS_DIR will fail"
-
-# ── GLORYS from NCAR's copy ───────────────────────────────────────────────────────────────────
-# A daily GLORYS Metadatum is "downloaded" by cutting it out of that day's NCAR file. This method is
-# more specific than the CopernicusMarine extension's (Metadatum{<:GLORYSDataset}), so it takes
-# GLORYSDaily only; GLORYSStatic (deptho) still goes to Copernicus. The variable keeps its NCAR name,
-# dimensions, packing and attributes, which are Copernicus' own. The cut itself is in
-# src/glorys_ncar.jl, shared with tools/convert_glorys_ncar.jl, which cuts everything ahead of the
-# run; this catches anything that converter did not.
-if NCAR_GLORYS
-    function NumericalEarth.DataWrangling.Downloads.download(meta::Metadatum{<:GLORYSDaily}; kwargs...)
-        path = joinpath(meta.dir, meta.filename)
-        isfile(path) && return path
-        @info "GLORYS: cutting $(meta.filename) now (tools/convert_glorys_ncar.jl did not make it)"
-        NCDataset(ncar_glorys_file(GLORYS_SOURCE, meta.dates)) do src
-            cut_ncar_glorys(src, dataset_variable_name(meta), meta.region, path)
-        end
-        return path
-    end
+# Every GLORYS file is on disk before the run (tools/prefetch_glorys.jl): "downloading" one is finding it.
+# More specific than any backend's method, so nothing here ever goes to the network.
+function NumericalEarth.DataWrangling.Downloads.download(meta::Metadatum{<:Union{GLORYSDaily, GLORYSStatic}}; kwargs...)
+    path = joinpath(meta.dir, meta.filename)
+    isfile(path) || error("$path is missing: run tools/prefetch_glorys.jl")
+    return path
 end
 
 # ── experiment switches: set HERE, as in sowinwarp_nested.jl ──────────────────────────────────
 const PENETRATING_SHORTWAVE = true    # forward get_radiative_forcing to the child (see sowinwarp_nested.jl)
 const ICE_GROUNDING         = false   # LandfastBasalStress off, as fix7
 const ICE_RELAXATION_HOURS  = 6       # open-side band ice relaxed to GLORYS's on this timescale
-const ICE_RECORD_DAYS       = GLORYS_ICE_RECORD_DAYS   # 5: GLORYS ice sampled every 5 days (set in src/glorys_ncar.jl, which the converter shares)
+const ICE_RECORD_DAYS       = GLORYS_ICE_RECORD_DAYS   # 5: GLORYS ice sampled every 5 days (set in src/glorys_ncar.jl, which tools/prefetch_glorys.jl shares)
+const PARENT_IN_MEMORY      = true    # every GLORYS strip record held in memory, loaded at startup; false streams 2 from disk
 
 @info "switches: parent = GLORYS daily, bathymetry = ETOPO2022, PENETRATING_SHORTWAVE = $PENETRATING_SHORTWAVE, " *
       "ICE_GROUNDING = $ICE_GROUNDING, ICE_RELAXATION_HOURS = $ICE_RELAXATION_HOURS, ICE_RECORD_DAYS = $ICE_RECORD_DAYS"
@@ -140,32 +101,24 @@ const Nz = length(z) - 1
 # GLORYS daily records are stamped at 00:00 (the start of their day), so any midnight is native.
 # Noon on 1 June would match the B-SOSE runs to the hour, but would not be a GLORYS stamp.
 start_date = DateTime(2014, 6, 1)
-const END_DATE = DateTime(2016, 6, 1, 12)   # hard-coded: 2 years, the span the GLORYS cuts cover (not read from ENV)
+const END_DATE = DateTime(2016, 6, 1, 12)   # hard-coded: 2 years (not read from ENV); tools/prefetch_glorys.jl's RUN_END must match
 end_date   = SMOKE ? DateTime(2014, 6, 3) : END_DATE
 const RUN_NAME = get(ENV, "RUN_NAME", SMOKE ? "glorys_smoke" : "2Y_nested_glorys_baseline")
 
-# PREFETCH fetches what a run over [PREFETCH_START, PREFETCH_END] reads; default the whole run
-prefetch_start = DateTime(get(ENV, "PREFETCH_START", string(start_date)))
-prefetch_end   = DateTime(get(ENV, "PREFETCH_END",   string(end_date)))
+@info "SOWinWaRP GLORYS baseline: $(Nx)x$(Ny)x$(Nz) over $(λ₁)-$(λ₂)E, $(φ₁)-$(φ₂)S, $start_date to $end_date"
 
-@info "SOWinWaRP GLORYS baseline: $(Nx)x$(Ny)x$(Nz) over $(λ₁)-$(λ₂)E, $(φ₁)-$(φ₂)S, " *
-      (PREFETCH ? "PREFETCH $prefetch_start to $prefetch_end into $GLORYS_DIR" : "$start_date to $end_date")
-
-# ── GLORYS, all of it, before the run ─────────────────────────────────────────────────────────
-# Every GLORYS file the run will read (src/glorys_ncar.jl, glorys_run_files: the strips for every day, the
-# starting state, the ice days) is checked now: cut from NCAR if missing, and inpainted if NumericalEarth's
-# cache of it (<file>_inpainted.jld2) is missing. tools/convert_glorys_ncar.jl normally did both already,
-# and then this takes seconds. During the run NumericalEarth reads each day's strips from disk (2 records in
-# memory) from those caches, with nothing to cut or inpaint; its info lines are silenced too (see run!).
-if !PREFETCH
-    let t₀ = time(), files = glorys_run_files(GLORYS_DIR, start_date, end_date; λ₁, λ₂, φ₁, φ₂, Nx, Ny).metadata
-        missing_files = count(m -> !isfile(metadata_path(m)), files)
-        foreach(NumericalEarth.DataWrangling.Downloads.download, files)   # cuts (or downloads) any that are missing
-        todo = filter(needs_inpainting, files)
-        isempty(todo) || @info "GLORYS: inpainting $(length(todo)) files now (tools/convert_glorys_ncar.jl had not)"
-        foreach(inpaint_glorys!, todo)
-        @info @sprintf("GLORYS: all %d files the run reads are on disk and inpainted (%d cut and %d inpainted now, %.1f min)", length(files), missing_files, length(todo), (time() - t₀) / 60)
-    end
+# ── GLORYS: all there? (as the ERA5 check below) ──────────────────────────────────────────────
+# Every GLORYS file this run reads (src/glorys_ncar.jl, glorys_run_files: the strips for every day, the
+# starting state, the ice days), and NumericalEarth's inpainted cache of each ocean one. Stop here, before
+# any of the setup, if tools/prefetch_glorys.jl has not made them all.
+const GLORYS_FILES = glorys_run_files(GLORYS_DIR, start_date, end_date; λ₁, λ₂, φ₁, φ₂, Nx, Ny)
+let missing_files = [basename(metadata_path(m)) for m in GLORYS_FILES.metadata if !isfile(metadata_path(m))],
+    not_inpainted = [basename(metadata_path(m)) for m in GLORYS_FILES.metadata if isfile(metadata_path(m)) && needs_inpainting(m)]
+    isempty(missing_files) && isempty(not_inpainted) ||
+        error("GLORYS is not ready in $GLORYS_DIR: $(length(missing_files)) files missing, $(length(not_inpainted)) not inpainted. " *
+              "Run tools/prefetch_glorys.jl. The first ones:\n  " * join(first(vcat(missing_files, not_inpainted), 10), "\n  "))
+    @info "GLORYS: all $(length(GLORYS_FILES.metadata)) files this run reads are in $GLORYS_DIR, inpainted; seafloor " *
+          (isfile(metadata_path(GLORYS_FILES.deptho)) ? "from deptho" : "from GLORYS' first-day temperature (no deptho)")
 end
 
 underlying_grid = LatitudeLongitudeGrid(ARCH;
@@ -295,57 +248,46 @@ function ice_totals(ℵ, V)
 end
 
 # GLORYS' seafloor for the nest's bathymetry blend and Flather depth mean: NumericalEarth's default
-# (deptho, from Copernicus) when the credentials are set, else the seafloor GLORYS' temperature marks
-# by its missing values on the first day, which is NumericalEarth's own fallback for a dataset
-# without a static depth (nested_ocean_model.jl). Same region as the nest's own snapshot.
+# (deptho) when tools/prefetch_glorys.jl fetched it, else the seafloor GLORYS' temperature marks by its
+# missing values on the first day, which is NumericalEarth's own fallback for a dataset without a static
+# depth (nested_ocean_model.jl). Same region as the nest's own snapshot.
 parent_seafloor(first_date) =
-    COPERNICUS || isfile(metadata_path(Metadatum(:depth; dataset = GLORYSStatic(), region = BoundingBox(grid; padding = 1/6), dir = GLORYS_DIR))) ?
+    isfile(metadata_path(GLORYS_FILES.deptho)) ?
         nothing :
         regrid_bathymetry(underlying_grid, Metadatum(:temperature; dataset = GLORYSDaily(), date = first_date,
                                                      region = BoundingBox(grid; padding = 1/6), dir = GLORYS_DIR);
                           major_basins = Inf)
 
-# ── PREFETCH: build the nest on the CPU (that downloads its strips, the starting snapshot and
-# GLORYS' seafloor), fetch the ice for the same window, and stop ──────────────────────────────
-# PREFETCH=verify: open every file in GLORYS_DIR and delete the ones that do not open, so the next
-# prefetch fetches them again. Prefetch jobs running at once can write the same boundary-day file,
-# and a job killed mid-download leaves a partial file that every later run would skip as present.
-if get(ENV, "PREFETCH", "0") == "verify"
-    files = filter(f -> endswith(f, ".nc"), readdir(GLORYS_DIR; join = true))
-    broken = filter(files) do f
-        try
-            close(NCDataset(f)); false
-        catch
-            true
-        end
-    end
-    foreach(rm, broken)
-    @info "prefetch verify: $(length(files)) files in $GLORYS_DIR, $(length(broken)) unreadable and deleted" *
-          (isempty(broken) ? "" : ": rerun the prefetch windows that hold them\n  " * join(basename.(broken), "\n  "))
-    exit(0)
-end
-
-if PREFETCH
-    t₀ = time()
-    nested_ocean_model(grid, GLORYSDaily(); dates = (prefetch_start, prefetch_end), dir = GLORYS_DIR,
-                       parent_bottom_height = parent_seafloor(prefetch_start))
-    @info @sprintf("prefetch: ocean strips done in %.1f h", (time() - t₀) / 3600)
-    # The run's ice days (anchored to ITS start) that fall in this window
-    window_days = filter(d -> prefetch_start - Day(1) <= d <= prefetch_end + Day(1), ice_record_starts(start_date, end_date))
-    for d in window_days, name in (:sea_ice_concentration, :sea_ice_thickness)
-        glorys_ice_file(name, d)
-    end
-    @info @sprintf("prefetch: %s to %s in %s, %.1f h in all", prefetch_start, prefetch_end, GLORYS_DIR, (time() - t₀) / 3600)
-    exit(0)
-end
-
 # ── the nest ──────────────────────────────────────────────────────────────────────────────────
 # As the Bouvet example: GLORYS daily, all open sides (the south has no wet columns), the default
-# relaxation band and rate, 2 parent records in memory, the seafloor blended toward GLORYS' own.
+# relaxation band and rate, the seafloor blended toward GLORYS' own. Unlike it, and like
+# sowinwarp_nested.jl's B-SOSE parent, EVERY daily record of the strips is held in memory
+# (PARENT_IN_MEMORY): nested_ocean_simulation loads them all here, from the inpainted caches, before the
+# first step, and the run never touches GLORYS on disk again. The strips sit on the GPU with the model;
+# their size is measured from the caches first, and the run stops here if they would not fit.
+const PARENT_RECORDS = length(bracketing_dates(GLORYSDaily(), :temperature, (start_date, end_date)))
+parent_records_in_memory = PARENT_IN_MEMORY ? PARENT_RECORDS : 2
+
+let bytes_per_record = sum(m -> sizeof(jldopen(file -> file["data"], inpainted_metadata_path(m), "r")), GLORYS_FILES.first_strip_records),
+    need = parent_records_in_memory * bytes_per_record
+    if ARCH isa GPU
+        free = CUDA.available_memory()
+        reserve = 10e9   # the model, sea ice, coupler and output buffers on top
+        need > free - reserve &&
+            error(@sprintf("the GLORYS parent needs %.1f GB of GPU memory for %d daily records, and %.1f GB of this GPU's %.1f GB free is left after a %.0f GB reserve for the model. Use a GPU with more memory, or set PARENT_IN_MEMORY = false (streams 2 records from disk).", need / 1e9, parent_records_in_memory, max(free - reserve, 0) / 1e9, free / 1e9, reserve / 1e9))
+        @info @sprintf("GLORYS parent: loading %d daily records into memory, %.1f GB of the GPU's %.1f GB free", parent_records_in_memory, need / 1e9, free / 1e9)
+    else
+        @info @sprintf("GLORYS parent: loading %d daily records into memory, %.1f GB", parent_records_in_memory, need / 1e9)
+    end
+end
+
+const PARENT_LOAD_T₀ = time()
 ocean = nested_ocean_simulation(grid, GLORYSDaily();
                                 dates = (start_date, end_date),
                                 dir = GLORYS_DIR,
+                                parent_time_indices_in_memory = parent_records_in_memory,
                                 parent_bottom_height = parent_seafloor(start_date))
+@info @sprintf("GLORYS parent: loaded in %.1f min", (time() - PARENT_LOAD_T₀) / 60)
 
 child = ocean.model.child
 
@@ -663,9 +605,9 @@ simulation.output_writers[:checkpointer] = Checkpointer(coupled_model;
                                                         schedule = TimeInterval(CHECKPOINT_DAYS * days),
                                                         prefix = "$(RUN_NAME)_checkpoint")
 
-# NumericalEarth's DataWrangling info lines (reading, inpainting parent data) are dropped from here on: every
-# GLORYS file was cut and inpainted at startup, so they carry nothing, and the log is the model's. Its
-# warnings, and every other module's lines, still show.
+# NumericalEarth's DataWrangling info lines (reading, inpainting parent data) are dropped from here on: the
+# GLORYS parent is all in memory and was inpainted by tools/prefetch_glorys.jl, so they would carry nothing,
+# and the log is the model's. Its warnings, and every other module's lines, still show.
 struct QuietParentData{L <: Logging.AbstractLogger} <: Logging.AbstractLogger
     logger :: L
 end
