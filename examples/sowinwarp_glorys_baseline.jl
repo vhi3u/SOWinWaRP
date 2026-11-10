@@ -1,8 +1,8 @@
 # ==============================================================================================
 # sowinwarp_glorys_baseline.jl -- the SOWinWaRP box nested in GLORYS instead of B-SOSE, as a
-# baseline. After NumericalEarth's examples/bouvet_nested_ocean_simulation.jl: GLORYS MONTHLY means for the
-# ocean parent, ERA5 for the atmosphere, ClimaSeaIce for the ice, ETOPO2022 bathymetry, and the
-# nest's own defaults for the boundary relaxation.
+# baseline. After NumericalEarth's examples/arctic_nested_ocean_sea_ice.jl: GLORYS MONTHLY means for the
+# ocean AND the sea ice parent (nested_ocean_simulation + nested_sea_ice_simulation), ERA5 for the
+# atmosphere, ETOPO2022 bathymetry, and the nest's own defaults for the boundary relaxation.
 #
 #     julia --project=. examples/sowinwarp_glorys_baseline.jl               # GPU: the run itself
 #     SMOKE=1 julia --project=. examples/sowinwarp_glorys_baseline.jl       # 2 days, proves it starts
@@ -18,8 +18,11 @@
 #   tools/ reads this run as it reads the B-SOSE ones.
 #   Like it, the parent is monthly and every record is held in memory (~0.6 GB for the 2 years).
 # WHAT IT DROPS: B-SOSE's coastal freshwater (derived from B-SOSE).
-# WHAT CHANGES: the ice starts from GLORYS monthly siconc/sithick, and the 4-cell open-side bands are
-#   relaxed to GLORYS ice, in place of B-SOSE's (see "GLORYS sea ice").
+# WHAT CHANGES: the sea ice crosses the open sides as the Arctic example's does (see "sea ice"): GLORYS
+#   ice thickness and concentration are its boundary values, its normal velocity lets ice out but never
+#   pulls it in, inflowing ice carries no snow, and it starts from GLORYS' ice on start_date. That
+#   replaces our 4-cell band relaxation, and sowinwarp_nested.jl's ICE_BOUNDARY = "open" does the same
+#   with B-SOSE's ice, so the two runs differ in their parent, not in how ice meets it.
 #
 # GLORYS MONTHLY, DOWNLOADED BY NUMERICALEARTH. Every GLORYS file (cmems_mod_glo_phy_my_0.083deg_P1M-m: the
 # strips, the starting state, the ice; and the static deptho for the seafloor) is downloaded from Copernicus
@@ -34,7 +37,7 @@ using CUDA            # loads Oceananigans' CUDA extension, which is what define
 using CopernicusClimateDataStore    # an ERA5 backend: the ERA5 constructors always call `download`
 using CopernicusMarine              # the GLORYS backend: NumericalEarth downloads every GLORYS file through it
 using NumericalEarth
-using NumericalEarth.DataWrangling: metadata_path, Metadatum, BoundingBox, bracketing_dates, window_center
+using NumericalEarth.DataWrangling: metadata_path, BoundingBox, bracketing_dates
 using NumericalEarth.DataWrangling.GLORYS: GLORYSMonthly
 using Oceananigans
 using Oceananigans.Units
@@ -65,10 +68,9 @@ mkpath(GLORYS_DIR)
 # ── experiment switches: set HERE, as in sowinwarp_nested.jl ──────────────────────────────────
 const PENETRATING_SHORTWAVE = true    # forward get_radiative_forcing to the child (see sowinwarp_nested.jl)
 const ICE_GROUNDING         = false   # LandfastBasalStress off, as fix7
-const ICE_RELAXATION_HOURS  = 6       # open-side band ice relaxed to GLORYS's on this timescale
 
-@info "switches: parent = GLORYS monthly, bathymetry = ETOPO2022, PENETRATING_SHORTWAVE = $PENETRATING_SHORTWAVE, " *
-      "ICE_GROUNDING = $ICE_GROUNDING, ICE_RELAXATION_HOURS = $ICE_RELAXATION_HOURS"
+@info "switches: parent = GLORYS monthly (ocean and sea ice), bathymetry = ETOPO2022, " *
+      "PENETRATING_SHORTWAVE = $PENETRATING_SHORTWAVE, ICE_GROUNDING = $ICE_GROUNDING, ice at the open sides = open boundaries"
 
 if PENETRATING_SHORTWAVE &&
    Base.unwrap_unionall(which(NumericalEarth.Oceans.get_radiative_forcing, (NumericalEarth.NestedModel,)).sig).parameters[2] === Any
@@ -140,87 +142,7 @@ grid = ImmersedBoundaryGrid(underlying_grid,
                             PartialCellBottom(bottom_height; minimum_fractional_cell_height = 0.2);
                             active_cells_map = true)
 
-# ── GLORYS sea ice ────────────────────────────────────────────────────────────────────────────
-# siconc (ℵ) and sithick, monthly means, over the domain plus a degree, aggregated
-# onto the child grid: each child cell takes the mean of the GLORYS ocean cells (1/12 deg, so ~4)
-# whose centres fall inside it; a child ocean cell with none (our coast is not GLORYS's) takes the
-# nearest child cell that has one, within ICE_FILL_CELLS. GLORYS land is missing in siconc.
-#
-# sithick is the thickness of the ice that is there (floe thickness), not volume per cell area, so
-# the volume per cell area is sithick·siconc. Checked on NCAR's 2014-06-12 file over 90-150E,
-# 70-55S: median sithick is 0.27 m where siconc < 0.15 and 0.99 m where siconc > 0.9; as volume per
-# cell area, the edge floes would be 4-7 m thick. The startup line still prints the volume both ways.
-const ICE_ℵ_MIN = 0.01
-const ICE_FILL_CELLS = 6
-const ICE_REGION = BoundingBox(longitude = (λ₁ - 1, λ₂ + 1), latitude = (φ₁ - 1, φ₂ + 1))
-
-# The months whose centres bracket the run, as the parent's own (bracketing_dates)
-ice_record_starts(first_date, last_date) =
-    bracketing_dates(GLORYSMonthly(), :sea_ice_concentration, (first_date, last_date))
-
-ice_metadatum(name, date) = Metadatum(name; dataset = GLORYSMonthly(), date, region = ICE_REGION, dir = GLORYS_DIR)
-glorys_ice_file(name, date) = NumericalEarth.DataWrangling.Downloads.download(ice_metadatum(name, date))
-
-function read_glorys_2d(path, name)
-    ds = NCDataset(path)
-    lon, lat = Float64.(ds["longitude"][:]), Float64.(ds["latitude"][:])
-    A = Array(ds[name])                         # (longitude, latitude[, time = 1])
-    close(ds)
-    return lon, lat, Float64.(coalesce.(ndims(A) == 3 ? A[:, :, 1] : A, NaN))
-end
-
-function load_glorys_ice(first_date, last_date)
-    starts = ice_record_starts(first_date, last_date)
-    wet = Array(interior(bottom_height))[:, :, 1] .< 0
-    ℵs, Vs = Matrix{Float64}[], Matrix{Float64}[]
-    for (n, d) in enumerate(starts)
-        lon, lat, c = read_glorys_2d(glorys_ice_file(:sea_ice_concentration, d), "siconc")
-        _, _, h     = read_glorys_2d(glorys_ice_file(:sea_ice_thickness, d), "sithick")
-        sum_ℵ, sum_V, cells = zeros(Nx, Ny), zeros(Nx, Ny), zeros(Int, Nx, Ny)
-        for jb in eachindex(lat), ib in eachindex(lon)
-            isnan(c[ib, jb]) && continue                         # GLORYS land
-            i = floor(Int, (lon[ib] - λ₁) * SCALING) + 1
-            j = floor(Int, (lat[jb] - φ₁) * SCALING) + 1
-            (1 <= i <= Nx && 1 <= j <= Ny) || continue
-            sum_ℵ[i, j] += c[ib, jb]
-            sum_V[i, j] += c[ib, jb] * (isnan(h[ib, jb]) ? 0.0 : h[ib, jb])
-            cells[i, j] += 1
-        end
-        ℵ = [cells[i, j] > 0 ? sum_ℵ[i, j] / cells[i, j] : NaN for i in 1:Nx, j in 1:Ny]
-        V = [cells[i, j] > 0 ? sum_V[i, j] / cells[i, j] : NaN for i in 1:Nx, j in 1:Ny]
-        # Child ocean cells with no GLORYS ocean inside: nearest child cell that has one
-        unreached = 0
-        for i in 1:Nx, j in 1:Ny
-            (wet[i, j] && cells[i, j] == 0) || continue
-            best, distance = nothing, Inf
-            for di in -ICE_FILL_CELLS:ICE_FILL_CELLS, dj in -ICE_FILL_CELLS:ICE_FILL_CELLS
-                a, b = i + di, j + dj
-                (1 <= a <= Nx && 1 <= b <= Ny && cells[a, b] > 0 && di^2 + dj^2 < distance) || continue
-                best, distance = (a, b), di^2 + dj^2
-            end
-            isnothing(best) ? (unreached += 1) : (ℵ[i, j] = ℵ[best...]; V[i, j] = V[best...])
-        end
-        n == 1 && unreached > 0 &&
-            @warn "$unreached child ocean cells are over $ICE_FILL_CELLS cells from GLORYS ocean: no GLORYS ice there"
-        for k in eachindex(ℵ)
-            open_water = !wet[k] || isnan(ℵ[k]) || ℵ[k] < ICE_ℵ_MIN
-            ℵ[k] = open_water ? 0.0 : min(ℵ[k], 1.0)
-            V[k] = open_water ? 0.0 : max(V[k], 0.0)
-        end
-        push!(ℵs, ℵ); push!(Vs, V)
-    end
-    # A monthly GLORYS record is the mean over its calendar month: place it at the month's centre
-    return (; dates = [window_center(ice_metadatum(:sea_ice_concentration, d)) for d in starts], ℵ = stack(ℵs), V = stack(Vs))
-end
-
-function glorys_ice_at(ice, date)
-    n = searchsortedlast(ice.dates, date)
-    1 <= n < length(ice.dates) || error("$date is outside the GLORYS ice records")
-    w = (date - ice.dates[n]) / (ice.dates[n+1] - ice.dates[n])
-    return (1 - w) .* ice.ℵ[:, :, n] .+ w .* ice.ℵ[:, :, n+1],
-           (1 - w) .* ice.V[:, :, n] .+ w .* ice.V[:, :, n+1]
-end
-
+# Ice area and volume over the domain, for the startup line
 function ice_totals(ℵ, V)
     A = [(6.371e6 * deg2rad(1 / SCALING))^2 * cosd(φ₁ + (j - 0.5) / SCALING) for i in 1:Nx, j in 1:Ny]
     return sum(ℵ .* A) / 1e12, sum(V .* A) / 1e9   # 10⁶ km², km³
@@ -267,30 +189,32 @@ atmosphere = ERA5PrescribedAtmosphere(ARCH; dataset = era5_dataset, start_date =
 radiation  = ERA5PrescribedRadiation(ARCH; dataset = era5_dataset, start_date = era5_start, end_date = era5_end,
                                      region = era5_region, dir = era5_dir)
 
-# ── sea ice: as sowinwarp_nested.jl (remapping, free-slip, grounding switch) ──────────────────
+# ── sea ice: through the open sides, as the Arctic example ────────────────────────────────────
+# nested_sea_ice_simulation (NestedModels/sea_ice_open_boundaries.jl) reads GLORYS' sithick, siconc, usi and
+# vsi over the domain onto the child grid, starts the ice from them on start_date, and gives the ice the
+# ocean's open sides: h and ℵ take GLORYS' values there, inflowing ice carries no snow, and the normal ice
+# velocity lets ice leave but not be pulled in (where GLORYS has no ice velocity, the ocean's is used).
+# sithick is floe thickness, ClimaSeaIce's h, as before. Ours on top of the example's defaults: remapping
+# advection, free-slip coasts and grounding off (see sowinwarp_nested.jl, "sea ice"), and every monthly
+# record held in memory, as for the ocean.
 ice_dynamics = ICE_GROUNDING ? NumericalEarth.SeaIces.sea_ice_dynamics(child.grid, ocean) :
                                NumericalEarth.SeaIces.sea_ice_dynamics(child.grid, ocean; basal_stress = nothing)
-sea_ice = sea_ice_simulation(child.grid, ocean; advection = IncrementalRemapping(),
-                             lateral_boundary_condition = :free_slip,
-                             dynamics = ice_dynamics)
+sea_ice = nested_sea_ice_simulation(ocean, GLORYSMonthly();
+                                    dates = (start_date, end_date),
+                                    dir = GLORYS_DIR,
+                                    time_indices_in_memory = PARENT_RECORDS,
+                                    advection = IncrementalRemapping(),
+                                    lateral_boundary_condition = :free_slip,
+                                    dynamics = ice_dynamics)
 @info "sea-ice grounding: $(ICE_GROUNDING ? "ON (LandfastBasalStress)" : "OFF")" *
       " -- basal_stress is $(nameof(typeof(sea_ice.model.dynamics.basal_stress)))"
 
-const GLORYS_ICE = load_glorys_ice(start_date, end_date)
-
 if !PICKUP
-    ℵ₀, V₀ = glorys_ice_at(GLORYS_ICE, start_date)
-    h₀ = map((a, v) -> a >= ICE_ℵ_MIN ? v / a : 0.0, ℵ₀, V₀)
-    ℵ₀[h₀ .== 0] .= 0
-    set!(sea_ice.model.ice_concentration, reshape(ℵ₀, Nx, Ny, 1))
-    set!(sea_ice.model.ice_thickness, reshape(h₀, Nx, Ny, 1))
-    fill_halo_regions!(sea_ice.model.ice_concentration)
-    fill_halo_regions!(sea_ice.model.ice_thickness)
-    area₀, volume₀ = ice_totals(ℵ₀, V₀)
-    _, volume_if_cell_mean = ice_totals(ℵ₀, h₀)    # h₀ = V₀/ℵ₀ is sithick itself
-    @info @sprintf("sea ice from GLORYS on %s: area %.2f 10⁶ km², volume %.0f km³ taking sithick as floe thickness (%.0f km³ if it were volume per cell area; B-SOSE ~650), h up to %.1f m",
-                   
-                   start_date, area₀, volume₀, volume_if_cell_mean, maximum(h₀))
+    h₀ = Array(interior(sea_ice.model.ice_thickness))[:, :, 1]
+    ℵ₀ = Array(interior(sea_ice.model.ice_concentration))[:, :, 1]
+    area₀, volume₀ = ice_totals(ℵ₀, h₀ .* ℵ₀)
+    @info @sprintf("sea ice from GLORYS on %s: area %.2f 10⁶ km², volume %.0f km³ (B-SOSE ~650), h up to %.1f m",
+                   start_date, area₀, volume₀, maximum(h₀))
 end
 
 coupled_model = OceanSeaIceModel(ocean, sea_ice; atmosphere, radiation)
@@ -327,45 +251,6 @@ simulation.callbacks[:nan_checker] =
                                        (; h = sea_ice.model.ice_thickness, ℵ = sea_ice.model.ice_concentration)),
                         erroring = true),
              IterationInterval(1))
-
-# ── ice at the open sides: relaxed to GLORYS's in the 4-cell band (sowinwarp_nested.jl's "bsose") ─
-const ICE_EDGE = 4
-const ICE_FIELDS = (sea_ice.model.ice_thickness, sea_ice.model.ice_concentration, sea_ice.model.snow_thickness)
-const ICE_RELAXATION = ICE_RELAXATION_HOURS * hours
-const ICE_TARGET_EVERY = 1hours
-const ICE_BAND = on_architecture(ARCH, [i <= ICE_EDGE || i > Nx - ICE_EDGE || j > Ny - ICE_EDGE
-                                        for i in 1:Nx, j in 1:Ny])
-const ICE_TARGET_ℵ = on_architecture(ARCH, zeros(Nx, Ny))
-const ICE_TARGET_V = on_architecture(ARCH, zeros(Nx, Ny))
-const ICE_TARGET_TIME = Ref(-Inf)
-
-function refresh_ice_target!(t)
-    t - ICE_TARGET_TIME[] < ICE_TARGET_EVERY && return nothing
-    ℵ★, V★ = glorys_ice_at(GLORYS_ICE, start_date + Millisecond(round(Int, 1000t)))
-    copyto!(ICE_TARGET_ℵ, ℵ★)
-    copyto!(ICE_TARGET_V, V★)
-    ICE_TARGET_TIME[] = t
-    return nothing
-end
-
-@inline relaxed_area(ℵ, ℵ★, r) = (1 - r) * ℵ + r * ℵ★
-@inline function relaxed_thickness(h, ℵ, ℵ★, V★, r)
-    a = relaxed_area(ℵ, ℵ★, r)
-    return ifelse(a < ICE_ℵ_MIN, zero(h), ((1 - r) * h * ℵ + r * V★) / max(a, ICE_ℵ_MIN))
-end
-
-function relax_edge_ice!(sim)
-    refresh_ice_target!(time(sim))
-    r = min(1.0, sim.Δt / ICE_RELAXATION)
-    h, ℵ, hs = (view(interior(f), :, :, 1) for f in ICE_FIELDS)
-    ℵ★, V★, band = ICE_TARGET_ℵ, ICE_TARGET_V, ICE_BAND
-    @. hs = ifelse(band & (relaxed_area(ℵ, ℵ★, r) < ICE_ℵ_MIN), zero(hs), hs)
-    @. h  = ifelse(band, relaxed_thickness(h, ℵ, ℵ★, V★, r), h)
-    @. ℵ  = ifelse(band, ifelse(relaxed_area(ℵ, ℵ★, r) < ICE_ℵ_MIN, zero(ℵ), relaxed_area(ℵ, ℵ★, r)), ℵ)
-    return nothing
-end
-
-simulation.callbacks[:edge_ice] = Callback(relax_edge_ice!, IterationInterval(1))
 
 const ICE_MAX_VOLUME = 50
 function check_ice_volume(sim)
@@ -472,8 +357,8 @@ output_metadata = Dict("run_name" => RUN_NAME,
     "dataset" => "GLORYS",
     "boundaries" => "one-way nest in GLORYS monthly (NumericalEarth nested_ocean_simulation, defaults)",
     "atmosphere" => "ERA5 (NCAR ds633.0), $(era5_pressure)",
-    "sea_ice" => "ClimaSeaIce via sea_ice_simulation defaults, IncrementalRemapping advection, free-slip coasts, " *
-                 "started from GLORYS monthly siconc/sithick, open-side bands relaxed to GLORYS ice on $(ICE_RELAXATION / hours) h",
+    "sea_ice" => "ClimaSeaIce via nested_sea_ice_simulation, IncrementalRemapping advection, free-slip coasts, " *
+                 "started from GLORYS monthly siconc/sithick, open sides take GLORYS monthly ice (open boundaries)",
     "coastal_freshwater" => "none",
     "ice_grounding" => ICE_GROUNDING ? "LandfastBasalStress (NumericalEarth default)" : "off (basal_stress = nothing)",
     "bathymetry" => "ETOPO2022",

@@ -41,9 +41,12 @@
 #      ice-ocean heat flux. The
 #      nest's ocean coupling forwards to the child (NestedModels/nested_component.jl), so the ice
 #      sees the child ocean. The ice starts from B-SOSE's SIarea/SIheff on start_date (5-day files,
-#      read in this script, not through setup_bsose.jl), bare of snow. The ice model's sides are
-#      walls, so in the 4-cell relaxation band along the open W, E and N sides the ice is relaxed
-#      to B-SOSE's every step: ice leaves through the band and B-SOSE's ice enters from it.
+#      read in this script, not through setup_bsose.jl), bare of snow. At the open W, E and N sides
+#      (ICE_BOUNDARY = "open", from fix9) the ice crosses the boundary as in NumericalEarth's Arctic
+#      example: those B-SOSE fields become the parent ice of nested_sea_ice_simulation, whose open
+#      boundaries take B-SOSE's h and ℵ, let ice out but never pull it in, and bring no snow in. Up to
+#      fix8 (ICE_BOUNDARY = "bsose") the ice model's sides were walls and the ice in the 4-cell
+#      relaxation band along them was relaxed to B-SOSE's every step instead.
 #      Up to fix3 the ice started at zero on 1 June and the band's ice was deleted, so all of it
 #      was frozen locally (ICE_INIT = "none", ICE_BOUNDARY = "delete" in the switches give that back). The wizard also limits Δt on the ICE
 #      speed, and a run stops if the ice volume h·ℵ passes 50 m. 2Y_nested_seaice_full had none of these
@@ -80,6 +83,7 @@ using Oceananigans.Units
 using Oceananigans.Diagnostics: NaNChecker
 using Oceananigans.BoundaryConditions: fill_halo_regions!
 using Oceananigans.Operators: Δzᶜᶜᶜ
+using Oceananigans.OutputReaders: Clamp
 using NumericalEarth.SeaIces.ClimaSeaIce: IncrementalRemapping   # via NumericalEarth, not a direct dependency
 using Oceanostics.ProgressMessengers: TimedMessenger
 using NCDatasets      # loads Oceananigans' NetCDFWriter
@@ -104,14 +108,17 @@ const BDIR  = get(ENV, "BSOSE_DIR", default_bsose_directory())
 const COASTAL_FRESHWATER      = true                            # B-SOSE's coastal freshwater; see "coastal freshwater"
 const COASTAL_FRESHWATER_FILE = "coastal_freshwater_bsose.nc"   # written by tools/coastal_freshwater.jl
 const ICE_INIT                = "bsose"   # "bsose": start from B-SOSE's ice; "none": ice-free (up to fix3)
-const ICE_BOUNDARY            = "bsose"   # "bsose": relax the open-side bands to B-SOSE's ice; "delete" (up to fix3)
-const ICE_RELAXATION_HOURS    = 6         # the bands' relaxation time, with ICE_BOUNDARY = "bsose"
+const ICE_BOUNDARY            = "open"    # "open": B-SOSE ice through open boundaries (nested_sea_ice_simulation, from fix9);
+                                          # "bsose": relax the open-side bands to B-SOSE's ice (fix4-fix8); "delete" (up to fix3)
+const ICE_RELAXATION_HOURS    = 6         # the bands' relaxation time, with ICE_BOUNDARY = "bsose" only
 const PENETRATING_SHORTWAVE   = true      # shortwave through the column (TwoColorRadiation); false: all in the top cell (up to fix5_flux)
 const ICE_GROUNDING           = false     # Lemieux (2015) landfast basal stress where depth < 30 m; true up to fix6 (see "sea ice")
 const BATHYMETRY              = "bsose"   # "bsose": B-SOSE i156's own Depth (grid.nc); "etopo": ETOPO2022 (up to fix7). See "bathymetry"
 
 ICE_INIT in ("bsose", "none") || error("ICE_INIT must be \"bsose\" or \"none\", got $ICE_INIT")
-ICE_BOUNDARY in ("bsose", "delete") || error("ICE_BOUNDARY must be \"bsose\" or \"delete\", got $ICE_BOUNDARY")
+ICE_BOUNDARY in ("open", "bsose", "delete") || error("ICE_BOUNDARY must be \"open\", \"bsose\" or \"delete\", got $ICE_BOUNDARY")
+ICE_BOUNDARY == "open" && ICE_INIT != "bsose" &&
+    error("ICE_BOUNDARY = \"open\" starts the ice from B-SOSE's (nested_sea_ice_simulation does): set ICE_INIT = \"bsose\"")
 BATHYMETRY in ("bsose", "etopo") || error("BATHYMETRY must be \"bsose\" or \"etopo\", got $BATHYMETRY")
 for name in ("COASTAL_FRESHWATER", "COASTAL_FRESHWATER_FILE", "ICE_INIT", "ICE_BOUNDARY", "ICE_RELAXATION_HOURS",
              "PENETRATING_SHORTWAVE", "ICE_GROUNDING", "BATHYMETRY")
@@ -416,11 +423,7 @@ radiation  = ERA5PrescribedRadiation(ARCH; dataset = era5_dataset, start_date = 
 # stays free-slip.
 ice_dynamics = ICE_GROUNDING ? NumericalEarth.SeaIces.sea_ice_dynamics(child.grid, ocean) :
                                NumericalEarth.SeaIces.sea_ice_dynamics(child.grid, ocean; basal_stress = nothing)
-sea_ice = sea_ice_simulation(child.grid, ocean; advection = IncrementalRemapping(),
-                             lateral_boundary_condition = :free_slip,
-                             dynamics = ice_dynamics)
-@info "sea-ice grounding: $(ICE_GROUNDING ? "ON (LandfastBasalStress)" : "OFF")" *
-      " -- basal_stress is $(nameof(typeof(sea_ice.model.dynamics.basal_stress)))"
+# The sea ice itself is built below, once B-SOSE's ice is loaded: with ICE_BOUNDARY = "open" that ice is its parent.
 
 # ── B-SOSE sea ice: the starting state and the open-side bands (note 1) ──────────────────────
 # SIarea is ℵ; SIheff is ice volume per unit area of CELL, i.e. h·ℵ, not h. Both come from the
@@ -537,11 +540,47 @@ function ice_totals(ℵ, V)
     return sum(ℵ .* A) / 1e12, sum(V .* A) / 1e9   # 10⁶ km², km³
 end
 
+# ── the sea ice model ─────────────────────────────────────────────────────────────────────────
+# ICE_BOUNDARY = "open": B-SOSE's ice as the parent of nested_sea_ice_simulation, the B-SOSE counterpart of
+# the Arctic example's GLORYS ice and of sowinwarp_glorys_baseline.jl. The parent is a NamedTuple of
+# FieldTimeSeries on the child grid (NestedModels/sea_ice_open_boundaries.jl): h = SIheff/SIarea and ℵ =
+# SIarea at the 5-day window centres, as load_bsose_ice regrids them, clamped outside the records.
+# u and v are zero: B-SOSE's ice velocities are not read, and where the parent's ice velocity is zero the
+# boundary takes the nest's own surface ocean velocity as the ice's outside velocity, as for free drift.
+# The ice then starts from that parent at time 0, i.e. B-SOSE's ice on start_date, as ICE_INIT = "bsose".
+function bsose_parent_ice(ice)
+    times = [Dates.value(date - start_date) / 1000 for date in ice.dates]   # s since start_date: the clock's time
+    series(times) = FieldTimeSeries{Center, Center, Nothing}(child.grid, times; time_indexing = Clamp())
+    h, ℵ = series(times), series(times)
+    for n in eachindex(times)
+        ℵⁿ, Vⁿ = ice.ℵ[:, :, n], ice.V[:, :, n]
+        set!(ℵ[n], reshape(ℵⁿ, Nx, Ny, 1))
+        set!(h[n], reshape(map((a, v) -> a >= ICE_ℵ_MIN ? v / a : 0.0, ℵⁿ, Vⁿ), Nx, Ny, 1))
+    end
+    no_velocity = series([first(times), last(times)])
+    @info @sprintf("sea ice at the open sides: B-SOSE's, %d 5-day records, through nested_sea_ice_simulation", length(times))
+    return (; h, ℵ, u = no_velocity, v = no_velocity)
+end
+
+sea_ice = ICE_BOUNDARY == "open" ?
+    nested_sea_ice_simulation(ocean, bsose_parent_ice(BSOSE_ICE); advection = IncrementalRemapping(),
+                              lateral_boundary_condition = :free_slip, dynamics = ice_dynamics) :
+    sea_ice_simulation(child.grid, ocean; advection = IncrementalRemapping(),
+                       lateral_boundary_condition = :free_slip, dynamics = ice_dynamics)
+@info "sea-ice grounding: $(ICE_GROUNDING ? "ON (LandfastBasalStress)" : "OFF")" *
+      " -- basal_stress is $(nameof(typeof(sea_ice.model.dynamics.basal_stress)))"
+
 # Start from B-SOSE's ice on start_date, not from none. Starting ice-free on 1 June made the model
 # freeze a whole early winter's ice out of an ocean that B-SOSE had already balanced against that
 # ice, and fix3's interior surface salinity rose 34.04 → 34.20 in the first 50 days. A pickup
-# takes its ice from the checkpoint instead.
-if ICE_INIT == "bsose" && !PICKUP
+# takes its ice from the checkpoint instead. With ICE_BOUNDARY = "open" nested_sea_ice_simulation has already
+# set it, from the same B-SOSE fields, and only the startup line is printed here.
+if ICE_BOUNDARY == "open" && !PICKUP
+    h₀ = Array(interior(sea_ice.model.ice_thickness))[:, :, 1]
+    ℵ₀ = Array(interior(sea_ice.model.ice_concentration))[:, :, 1]
+    @info @sprintf("sea ice from B-SOSE on %s: area %.2f 10⁶ km², volume %.0f km³, h up to %.1f m",
+                   start_date, ice_totals(ℵ₀, h₀ .* ℵ₀)..., maximum(h₀))
+elseif ICE_INIT == "bsose" && !PICKUP
     ℵ₀, V₀ = bsose_ice_at(BSOSE_ICE, start_date)
     h₀ = map((a, v) -> a >= ICE_ℵ_MIN ? v / a : 0.0, ℵ₀, V₀)
     ℵ₀[h₀ .== 0] .= 0
@@ -605,8 +644,8 @@ simulation.callbacks[:nan_checker] =
                         erroring = true),
              IterationInterval(1))
 
-# ── ice at the open sides ─────────────────────────────────────────────────────────────────────
-# The ocean's W, E and N sides are open, but the ice model's are walls: ice drifting west along
+# ── ice at the open sides (ICE_BOUNDARY = "bsose" or "delete"; "open" needs none of this) ─────
+# The ocean's W, E and N sides are open, but up to fix8 the ice model's were walls: ice drifting west along
 # the coast piled against the west edge, ice carried east by the ACC against the east edge, and
 # the first runaway thickness in 2Y_nested_seaice_full started at the east edge (i = 360, day 110).
 # So the ice is taken in hand in the band where the nest relaxes the ocean to B-SOSE (8/12 deg,
@@ -671,9 +710,8 @@ function relax_edge_ice!(sim)
     return nothing
 end
 
-simulation.callbacks[:edge_ice] = ICE_BOUNDARY == "bsose" ?
-    Callback(relax_edge_ice!, IterationInterval(1)) :
-    Callback(remove_edge_ice!, IterationInterval(1))
+ICE_BOUNDARY == "bsose"  && (simulation.callbacks[:edge_ice] = Callback(relax_edge_ice!, IterationInterval(1)))
+ICE_BOUNDARY == "delete" && (simulation.callbacks[:edge_ice] = Callback(remove_edge_ice!, IterationInterval(1)))
 
 # Ice can run away without ever going NaN (the NaN checker did not fire on 2Y_nested_seaice_full,
 # whose ice reached 10⁶ m). Watched as VOLUME per unit area, h·ℵ: h alone is the thickness of the
@@ -811,9 +849,10 @@ output_metadata = Dict("run_name" => RUN_NAME,
     "dataset" => "BSOSE",
     "boundaries" => "one-way nest in B-SOSE (NumericalEarth nested_ocean_simulation)",
     "atmosphere" => "ERA5 (NCAR ds633.0), $(era5_pressure)",
-    "sea_ice" => "ClimaSeaIce via sea_ice_simulation defaults, IncrementalRemapping advection, free-slip coasts, " *
+    "sea_ice" => "ClimaSeaIce, IncrementalRemapping advection, free-slip coasts, " *
                  (ICE_INIT == "bsose" ? "started from B-SOSE SIarea/SIheff" : "started ice-free") * ", " *
-                 (ICE_BOUNDARY == "bsose" ? "open-side bands relaxed to B-SOSE ice on $(ICE_RELAXATION / hours) h" :
+                 (ICE_BOUNDARY == "open"  ? "open sides take B-SOSE 5-day ice (nested_sea_ice_simulation open boundaries)" :
+                  ICE_BOUNDARY == "bsose" ? "open-side bands relaxed to B-SOSE ice on $(ICE_RELAXATION / hours) h" :
                                             "open-side bands ice deleted"),
     "coastal_freshwater" => COASTAL_FRESHWATER ? "B-SOSE coastal excess from $(COASTAL_FRESHWATER_FILE)" : "none",
     "ice_grounding" => ICE_GROUNDING ? "LandfastBasalStress (NumericalEarth default)" : "off (basal_stress = nothing)",
