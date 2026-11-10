@@ -24,18 +24,17 @@
 #
 # GLORYS, AS ERA5: PREFETCHED, THEN LOADED. tools/prefetch_glorys.jl, one CPU job, makes every GLORYS file
 # this run reads -- cut from the Globus copy of NSF NCAR's GLORYS12V1 (GDEX d010049) under NumericalEarth's
-# own names, and deptho from Copernicus if the credentials are set -- and ends with "GLORYS READY". This run
-# reads only those files: it checks they are all there at startup, as it checks the ERA5 files, and stops
-# if not. Then it loads every daily record of the boundary strips into memory before the first step,
-# inpainting each on the GPU as it goes (~0.25 s a day; NumericalEarth also keeps each as
-# <file>_inpainted.jld2, so a restart only loads). Nothing is read, downloaded or inpainted while it runs,
-# so its log is the model's.
+# own names, inpainted as NumericalEarth would and kept as its cache (<file>_inpainted.jld2), and deptho
+# from Copernicus if the credentials are set -- and ends with "GLORYS READY". This run reads only those
+# files: it checks they are all there at startup, as it checks the ERA5 files, and stops if not; then it
+# loads every daily record of the boundary strips into memory before the first step. Nothing is cut,
+# downloaded or inpainted while it runs, so its log is the model's.
 # ==============================================================================================
 
 using CUDA            # loads Oceananigans' CUDA extension, which is what defines `GPU()`
 using CopernicusClimateDataStore    # an ERA5 backend: the ERA5 constructors always call `download`
 using NumericalEarth
-using NumericalEarth.DataWrangling: metadata_path, Metadatum, BoundingBox, bracketing_dates, dataset_variable_name
+using NumericalEarth.DataWrangling: metadata_path, Metadatum, BoundingBox, bracketing_dates, inpainted_metadata_path, jldopen
 using NumericalEarth.DataWrangling.GLORYS: GLORYSDaily, GLORYSStatic
 using Oceananigans
 using Oceananigans.Units
@@ -110,14 +109,15 @@ const RUN_NAME = get(ENV, "RUN_NAME", SMOKE ? "glorys_smoke" : "2Y_nested_glorys
 
 # ── GLORYS: all there? (as the ERA5 check below) ──────────────────────────────────────────────
 # Every GLORYS file this run reads (src/glorys_ncar.jl, glorys_run_files: the strips for every day, the
-# starting state, the ice days). Stop here, before any of the setup, if tools/prefetch_glorys.jl has not
-# made them all.
+# starting state, the ice days), and NumericalEarth's inpainted cache of each ocean one. Stop here, before
+# any of the setup, if tools/prefetch_glorys.jl has not made them all.
 const GLORYS_FILES = glorys_run_files(GLORYS_DIR, start_date, end_date; λ₁, λ₂, φ₁, φ₂, Nx, Ny)
-let missing_files = [basename(metadata_path(m)) for m in GLORYS_FILES.metadata if !isfile(metadata_path(m))]
-    isempty(missing_files) ||
-        error("GLORYS is not ready in $GLORYS_DIR: $(length(missing_files)) files missing. " *
-              "Run tools/prefetch_glorys.jl. The first ones:\n  " * join(first(missing_files, 10), "\n  "))
-    @info "GLORYS: all $(length(GLORYS_FILES.metadata)) files this run reads are in $GLORYS_DIR; seafloor " *
+let missing_files = [basename(metadata_path(m)) for m in GLORYS_FILES.metadata if !isfile(metadata_path(m))],
+    not_inpainted = [basename(metadata_path(m)) for m in GLORYS_FILES.metadata if isfile(metadata_path(m)) && needs_inpainting(m)]
+    isempty(missing_files) && isempty(not_inpainted) ||
+        error("GLORYS is not ready in $GLORYS_DIR: $(length(missing_files)) files missing, $(length(not_inpainted)) not inpainted. " *
+              "Run tools/prefetch_glorys.jl. The first ones:\n  " * join(first(vcat(missing_files, not_inpainted), 10), "\n  "))
+    @info "GLORYS: all $(length(GLORYS_FILES.metadata)) files this run reads are in $GLORYS_DIR, inpainted; seafloor " *
           (isfile(metadata_path(GLORYS_FILES.deptho)) ? "from deptho" : "from GLORYS' first-day temperature (no deptho)")
 end
 
@@ -262,18 +262,13 @@ parent_seafloor(first_date) =
 # As the Bouvet example: GLORYS daily, all open sides (the south has no wet columns), the default
 # relaxation band and rate, the seafloor blended toward GLORYS' own. Unlike it, and like
 # sowinwarp_nested.jl's B-SOSE parent, EVERY daily record of the strips is held in memory
-# (PARENT_IN_MEMORY): nested_ocean_simulation loads them all here before the first step, inpainting each
-# on the GPU (or loading NumericalEarth's cache of it from an earlier start), and the run never touches
-# GLORYS on disk again. The strips sit on the GPU with the model; their size is estimated from the files
-# first, and the run stops here if they would not fit.
+# (PARENT_IN_MEMORY): nested_ocean_simulation loads them all here, from the inpainted caches, before the
+# first step, and the run never touches GLORYS on disk again. The strips sit on the GPU with the model;
+# their size is measured from the caches first, and the run stops here if they would not fit.
 const PARENT_RECORDS = length(bracketing_dates(GLORYSDaily(), :temperature, (start_date, end_date)))
 parent_records_in_memory = PARENT_IN_MEMORY ? PARENT_RECORDS : 2
 
-# A record's size: each strip variable's cut (longitude, latitude[, depth]), plus 3 halo cells a side, in Float64
-record_bytes(m) = NCDataset(metadata_path(m)) do ds
-    8 * prod(n -> n + 6, size(ds[dataset_variable_name(m)])[1:end-1])   # the last dimension is time (1)
-end
-let bytes_per_record = sum(record_bytes, GLORYS_FILES.first_strip_records),
+let bytes_per_record = sum(m -> sizeof(jldopen(file -> file["data"], inpainted_metadata_path(m), "r")), GLORYS_FILES.first_strip_records),
     need = parent_records_in_memory * bytes_per_record
     if ARCH isa GPU
         free = CUDA.available_memory()
@@ -286,29 +281,13 @@ let bytes_per_record = sum(record_bytes, GLORYS_FILES.first_strip_records),
     end
 end
 
-# NumericalEarth's DataWrangling info lines are dropped from here on: two per GLORYS record inpainted while
-# the parent loads (~22,000), then nothing worth reading, as the parent is all in memory. The load gets one
-# summary line instead, and the log is the model's. Its warnings, and every other module's lines, still show.
-struct QuietParentData{L <: Logging.AbstractLogger} <: Logging.AbstractLogger
-    logger :: L
-end
-is_data_wrangling(m::Module) = m === NumericalEarth.DataWrangling ||
-                               (parentmodule(m) !== m && is_data_wrangling(parentmodule(m)))
-Logging.min_enabled_level(q::QuietParentData) = Logging.min_enabled_level(q.logger)
-Logging.catch_exceptions(q::QuietParentData)  = Logging.catch_exceptions(q.logger)
-Logging.shouldlog(q::QuietParentData, level, _module, group, id) =
-    (level >= Logging.Warn || !is_data_wrangling(_module)) && Logging.shouldlog(q.logger, level, _module, group, id)
-Logging.handle_message(q::QuietParentData, args...; kwargs...) = Logging.handle_message(q.logger, args...; kwargs...)
-global_logger(QuietParentData(global_logger()))
-
 const PARENT_LOAD_T₀ = time()
-const PARENT_TO_INPAINT = count(needs_inpainting, GLORYS_FILES.metadata)
 ocean = nested_ocean_simulation(grid, GLORYSDaily();
                                 dates = (start_date, end_date),
                                 dir = GLORYS_DIR,
                                 parent_time_indices_in_memory = parent_records_in_memory,
                                 parent_bottom_height = parent_seafloor(start_date))
-@info @sprintf("GLORYS parent: loaded in %.1f min, %d records inpainted on the way (the rest from earlier caches)", (time() - PARENT_LOAD_T₀) / 60, PARENT_TO_INPAINT - count(needs_inpainting, GLORYS_FILES.metadata))
+@info @sprintf("GLORYS parent: loaded in %.1f min", (time() - PARENT_LOAD_T₀) / 60)
 
 child = ocean.model.child
 
@@ -626,6 +605,20 @@ simulation.output_writers[:checkpointer] = Checkpointer(coupled_model;
                                                         schedule = TimeInterval(CHECKPOINT_DAYS * days),
                                                         prefix = "$(RUN_NAME)_checkpoint")
 
+# NumericalEarth's DataWrangling info lines (reading, inpainting parent data) are dropped from here on: the
+# GLORYS parent is all in memory and was inpainted by tools/prefetch_glorys.jl, so they would carry nothing,
+# and the log is the model's. Its warnings, and every other module's lines, still show.
+struct QuietParentData{L <: Logging.AbstractLogger} <: Logging.AbstractLogger
+    logger :: L
+end
+is_data_wrangling(m::Module) = m === NumericalEarth.DataWrangling ||
+                               (parentmodule(m) !== m && is_data_wrangling(parentmodule(m)))
+Logging.min_enabled_level(q::QuietParentData) = Logging.min_enabled_level(q.logger)
+Logging.catch_exceptions(q::QuietParentData)  = Logging.catch_exceptions(q.logger)
+Logging.shouldlog(q::QuietParentData, level, _module, group, id) =
+    (level >= Logging.Warn || !is_data_wrangling(_module)) && Logging.shouldlog(q.logger, level, _module, group, id)
+Logging.handle_message(q::QuietParentData, args...; kwargs...) = Logging.handle_message(q.logger, args...; kwargs...)
+global_logger(QuietParentData(global_logger()))
 
 PICKUP && @info "picking up $RUN_NAME from its latest checkpoint"
 @info "starting"
