@@ -42,6 +42,14 @@ using NumericalEarth.DataWrangling.GLORYS: GLORYSDaily
 
 include(joinpath(@__DIR__, "..", "src", "glorys_ncar.jl"))
 
+# NumericalEarth's Field(metadatum) calls download first, even for a file on disk, and with no backend loaded
+# its fallback errors. Here every file is cut before it is read, so "downloading" is finding it.
+function NumericalEarth.DataWrangling.Downloads.download(meta::Metadatum{<:GLORYSDaily}; kwargs...)
+    path = joinpath(meta.dir, meta.filename)
+    isfile(path) || error("$path is not cut: the converter reads only files it has cut")
+    return path
+end
+
 data_dir  = get(ENV, "BSOSE_DIR", "/storage/scratch1/1/vnguyen480/SOWinWaRP/data")
 source    = get(ENV, "GLORYS_SOURCE", joinpath(data_dir, "ncar-glorys"))
 dir       = get(ENV, "GLORYS_DIR", joinpath(data_dir, "glorys"))
