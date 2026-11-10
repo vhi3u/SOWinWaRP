@@ -70,11 +70,16 @@ haskey(ENV, "JULIA_CPU_TARGET") || (ENV["JULIA_CPU_TARGET"] = "generic")
 """What the project has now: the commit it is pinned to (or nothing), and a short description."""
 function current()
     info = get(Pkg.dependencies(), NE_UUID, nothing)
-    info === nothing && return (rev = nothing, label = "not installed")
+    info === nothing && return (rev = nothing, label = "not installed", tag = "none")
     rev = info.git_revision                       # the rev it was added with: a commit, a branch, or nothing
     label = "v$(info.version)" * (info.git_source === nothing ? " (registered release)" :
                                   " from $(info.git_source) at $(something(rev, "?"))")
-    return (; rev, label)
+    # A name for the backup: the commit if it was added by commit, else the version and its tree hash
+    # (a branch name such as ss/nested-ocean-model has a / in it, and says nothing once the branch moves)
+    is_commit = rev !== nothing && occursin(r"^[0-9a-f]{7,40}$", rev)
+    tree = info.tree_hash === nothing ? "" : "-tree" * first(string(info.tree_hash), 9)
+    tag = is_commit ? first(rev, 9) : replace("v$(info.version)$tree", r"[^A-Za-z0-9._-]" => "-")
+    return (; rev, label, tag)
 end
 
 """The branch's head commit on GitHub."""
@@ -132,8 +137,8 @@ end
 
 submit_job("update") && exit(0)
 require_gpu("an update")
-old = something(now_.rev, "v" * string(get(Pkg.dependencies(), NE_UUID, (; version = "none")).version))
-backup = joinpath(PROJECT, "Manifest.toml.$(first(old, 9)).bak")
+old = now_.tag
+backup = joinpath(PROJECT, "Manifest.toml.$(old).bak")
 isfile(MANIFEST) && cp(MANIFEST, backup; force = true)
 @info "backed up the Manifest as $(basename(backup)); `rollback` restores it"
 
@@ -150,5 +155,5 @@ catch err
 end
 
 Pkg.status(["NumericalEarth", "Oceananigans", "ClimaSeaIce", "Breeze", "CUDA"])
-@info "updated NumericalEarth $(first(old, 9)) -> $(head[1:9]) in $(round((time() - t₀) / 60, digits = 1)) min. " *
+@info "updated NumericalEarth $(old) -> $(head[1:9]) in $(round((time() - t₀) / 60, digits = 1)) min. " *
       "Next: SMOKE=1 runs of the run scripts, then commit Manifest.toml and Project.toml."
