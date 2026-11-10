@@ -17,7 +17,7 @@
 #   IncrementalRemapping ice advection, free-slip ice coasts, grounding off, the ice CFL in the
 #   wizard, the 50 m ice-volume stop, the health line, and the same output files, so every tool in
 #   tools/ reads this run as it reads the B-SOSE ones.
-#   Like it, EVERY parent record is held in memory, loaded at startup (see "the nest").
+#   Like it, every parent record can be held in memory (PARENT_IN_MEMORY; see "the nest").
 # WHAT IT DROPS: B-SOSE's coastal freshwater (derived from B-SOSE).
 # WHAT CHANGES: the ice starts from GLORYS siconc/sithick on 2014-06-01, and the 4-cell open-side
 #   bands are relaxed to GLORYS ice, in place of B-SOSE's (see "GLORYS sea ice").
@@ -26,9 +26,10 @@
 # this run reads -- cut from the Globus copy of NSF NCAR's GLORYS12V1 (GDEX d010049) under NumericalEarth's
 # own names, inpainted as NumericalEarth would and kept as its cache (<file>_inpainted.jld2), and deptho
 # from Copernicus if the credentials are set -- and ends with "GLORYS READY". This run reads only those
-# files: it checks they are all there at startup, as it checks the ERA5 files, and stops if not; then it
-# loads every daily record of the boundary strips into memory before the first step. Nothing is cut,
-# downloaded or inpainted while it runs, so its log is the model's.
+# files: it checks they are all there at startup, as it checks the ERA5 files, and stops if not. The
+# strips then come from those inpainted caches, 2 days on the GPU at a time (PARENT_IN_MEMORY = false), or
+# all of them loaded before the first step (true, on a >= 32 GB GPU). Nothing is cut, downloaded or
+# inpainted while it runs, and NumericalEarth's data lines are silenced, so its log is the model's.
 # ==============================================================================================
 
 using CUDA            # loads Oceananigans' CUDA extension, which is what defines `GPU()`
@@ -72,7 +73,7 @@ const PENETRATING_SHORTWAVE = true    # forward get_radiative_forcing to the chi
 const ICE_GROUNDING         = false   # LandfastBasalStress off, as fix7
 const ICE_RELAXATION_HOURS  = 6       # open-side band ice relaxed to GLORYS's on this timescale
 const ICE_RECORD_DAYS       = GLORYS_ICE_RECORD_DAYS   # 5: GLORYS ice sampled every 5 days (set in src/glorys_ncar.jl, which tools/prefetch_glorys.jl shares)
-const PARENT_IN_MEMORY      = true    # every GLORYS strip record held in memory, loaded at startup; false streams 2 from disk
+const PARENT_IN_MEMORY      = false   # false: 2 GLORYS strip records on the GPU (~50 MB), the next read from its inpainted cache each day; true: all 734 at startup (17.9 GB, needs a >= 32 GB GPU)
 
 @info "switches: parent = GLORYS daily, bathymetry = ETOPO2022, PENETRATING_SHORTWAVE = $PENETRATING_SHORTWAVE, " *
       "ICE_GROUNDING = $ICE_GROUNDING, ICE_RELAXATION_HOURS = $ICE_RELAXATION_HOURS, ICE_RECORD_DAYS = $ICE_RECORD_DAYS"
@@ -261,10 +262,11 @@ parent_seafloor(first_date) =
 # ── the nest ──────────────────────────────────────────────────────────────────────────────────
 # As the Bouvet example: GLORYS daily, all open sides (the south has no wet columns), the default
 # relaxation band and rate, the seafloor blended toward GLORYS' own. Unlike it, and like
-# sowinwarp_nested.jl's B-SOSE parent, EVERY daily record of the strips is held in memory
-# (PARENT_IN_MEMORY): nested_ocean_simulation loads them all here, from the inpainted caches, before the
-# first step, and the run never touches GLORYS on disk again. The strips sit on the GPU with the model;
-# their size is measured from the caches first, and the run stops here if they would not fit.
+# sowinwarp_nested.jl's B-SOSE parent, every daily record of the strips can be held in memory
+# (PARENT_IN_MEMORY = true): nested_ocean_simulation loads them all here, from the inpainted caches,
+# before the first step. That is 17.9 GB for the 2 years, too much for a 16 GB V100, so the default
+# (false) keeps 2 records (~50 MB) and loads the next from its cache each day. The strips sit on the GPU
+# with the model; their size is measured from the caches first, and the run stops here if they would not fit.
 const PARENT_RECORDS = length(bracketing_dates(GLORYSDaily(), :temperature, (start_date, end_date)))
 parent_records_in_memory = PARENT_IN_MEMORY ? PARENT_RECORDS : 2
 
