@@ -6,7 +6,7 @@
 # the same product, variable names, dimensions and packing as Copernicus' cmems_mod_glo_phy_my_0.083deg_P1D-m.
 # A cut keeps one variable over a region plus two native cells, as NumericalEarth's Copernicus backend pads its
 # requests, under the file name NumericalEarth gives that Metadatum, so NumericalEarth finds it and downloads
-# nothing. Used by tools/prefetch_glorys.jl, which cuts and inpaints everything ahead of the run, and by
+# nothing. Used by tools/prefetch_glorys.jl, which cuts everything ahead of the run, and by
 # examples/sowinwarp_glorys_baseline.jl, which checks it is all there. Needs Dates, NCDatasets, Logging,
 # Oceananigans and NumericalEarth loaded.
 
@@ -76,13 +76,12 @@ function glorys_ice_record_starts(first_date, last_date; every = GLORYS_ICE_RECO
 end
 
 # ── The GLORYS files a run reads, and their inpainted caches ─────────────────────────────────────
-# Shared by tools/prefetch_glorys.jl (cuts and inpaints them ahead of the run) and
-# examples/sowinwarp_glorys_baseline.jl (checks them at startup, then holds them all in memory).
+# Shared by tools/prefetch_glorys.jl (cuts them ahead of the run) and examples/sowinwarp_glorys_baseline.jl
+# (checks them at startup, then holds them all in memory).
 # Needs Oceananigans and NumericalEarth loaded.
 
 const GLORYS_OCEAN_NAMES = (:temperature, :salinity, :u_velocity, :v_velocity, :free_surface)
 const GLORYS_OPEN_SIDES  = (:west, :east, :north)   # the south row is Antarctica: NumericalEarth's open_boundary_sides drops it
-const INPAINT_HALO       = (3, 3, 3)                # regrid_from_metadata!'s default, so the cache is the run's own
 
 """
     glorys_run_files(dir, run_start, run_end; λ₁, λ₂, φ₁, φ₂, Nx, Ny)
@@ -139,28 +138,3 @@ end
 "Does `m` get inpainted when read (ocean: yes; ice: never), and is its cache still missing?"
 needs_inpainting(m) = !isnothing(NumericalEarth.DataWrangling.default_inpainting(m)) &&
                       !isfile(NumericalEarth.DataWrangling.inpainted_metadata_path(m))
-
-"""
-    inpaint_glorys!(m)
-
-Inpaint `m` as the run would and write NumericalEarth's cache of it, <file>_inpainted.jld2, beside the
-file. `Field(metadatum, arch)` (DataWrangling/metadata_field.jl) loads that cache, silently, whenever its
-inpainting_maxiter matches, and only otherwise inpaints. Same inpainting and halo as the run's
-regrid_from_metadata!, so the cache is the one the run would have written. Written to a per-process
-.part and renamed, so a run reading it meanwhile never sees half a file.
-"""
-function inpaint_glorys!(m)
-    DW = NumericalEarth.DataWrangling
-    inpainting = DW.default_inpainting(m)
-    field = Logging.with_logger(Logging.ConsoleLogger(stderr, Logging.Warn)) do   # NumericalEarth logs two lines per field
-        Field(m, CPU(); inpainting, halo = INPAINT_HALO, cache_inpainted_data = false)
-    end
-    path = DW.inpainted_metadata_path(m)
-    part = path * ".part" * string(getpid())
-    DW.jldopen(part, "w") do file
-        file["data"] = parent(field)
-        file["inpainting_maxiter"] = inpainting.maxiter
-    end
-    mv(part, path; force = true)
-    return nothing
-end
