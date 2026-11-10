@@ -271,7 +271,7 @@ parent_records_in_memory = PARENT_IN_MEMORY ? PARENT_RECORDS : 2
 let bytes_per_record = sum(m -> sizeof(jldopen(file -> file["data"], inpainted_metadata_path(m), "r")), GLORYS_FILES.first_strip_records),
     need = parent_records_in_memory * bytes_per_record
     if ARCH isa GPU
-        free = CUDA.available_memory()
+        free = CUDA.free_memory()   # CUDA.jl 5.x and 6.x (public in CUDACore)
         reserve = 10e9   # the model, sea ice, coupler and output buffers on top
         need > free - reserve &&
             error(@sprintf("the GLORYS parent needs %.1f GB of GPU memory for %d daily records, and %.1f GB of this GPU's %.1f GB free is left after a %.0f GB reserve for the model. Use a GPU with more memory, or set PARENT_IN_MEMORY = false (streams 2 records from disk).", need / 1e9, parent_records_in_memory, max(free - reserve, 0) / 1e9, free / 1e9, reserve / 1e9))
