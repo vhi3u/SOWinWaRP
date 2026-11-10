@@ -1,10 +1,9 @@
 # ==============================================================================================
 # sowinwarp_glorys_baseline.jl -- the SOWinWaRP box nested in GLORYS instead of B-SOSE, as a
-# baseline. After NumericalEarth's examples/bouvet_nested_ocean_simulation.jl: GLORYS daily for the
+# baseline. After NumericalEarth's examples/bouvet_nested_ocean_simulation.jl: GLORYS MONTHLY means for the
 # ocean parent, ERA5 for the atmosphere, ClimaSeaIce for the ice, ETOPO2022 bathymetry, and the
 # nest's own defaults for the boundary relaxation.
 #
-#     julia --project=. tools/prefetch_glorys.jl                            # FIRST, on CPU: makes all the GLORYS ready
 #     julia --project=. examples/sowinwarp_glorys_baseline.jl               # GPU: the run itself
 #     SMOKE=1 julia --project=. examples/sowinwarp_glorys_baseline.jl       # 2 days, proves it starts
 #
@@ -17,26 +16,26 @@
 #   IncrementalRemapping ice advection, free-slip ice coasts, grounding off, the ice CFL in the
 #   wizard, the 50 m ice-volume stop, the health line, and the same output files, so every tool in
 #   tools/ reads this run as it reads the B-SOSE ones.
-#   Like it, every parent record can be held in memory (PARENT_IN_MEMORY; see "the nest").
+#   Like it, the parent is monthly and every record is held in memory (~0.6 GB for the 2 years).
 # WHAT IT DROPS: B-SOSE's coastal freshwater (derived from B-SOSE).
-# WHAT CHANGES: the ice starts from GLORYS siconc/sithick on 2014-06-01, and the 4-cell open-side
-#   bands are relaxed to GLORYS ice, in place of B-SOSE's (see "GLORYS sea ice").
+# WHAT CHANGES: the ice starts from GLORYS monthly siconc/sithick, and the 4-cell open-side bands are
+#   relaxed to GLORYS ice, in place of B-SOSE's (see "GLORYS sea ice").
 #
-# GLORYS, AS ERA5: PREFETCHED, THEN LOADED. tools/prefetch_glorys.jl, one CPU job, makes every GLORYS file
-# this run reads -- cut from the Globus copy of NSF NCAR's GLORYS12V1 (GDEX d010049) under NumericalEarth's
-# own names, inpainted as NumericalEarth would and kept as its cache (<file>_inpainted.jld2), and deptho
-# from Copernicus if the credentials are set -- and ends with "GLORYS READY". This run reads only those
-# files: it checks they are all there at startup, as it checks the ERA5 files, and stops if not. The
-# strips then come from those inpainted caches, 2 days on the GPU at a time (PARENT_IN_MEMORY = false), or
-# all of them loaded before the first step (true, on a >= 32 GB GPU). Nothing is cut, downloaded or
-# inpainted while it runs, and NumericalEarth's data lines are silenced, so its log is the model's.
+# GLORYS MONTHLY, DOWNLOADED BY NUMERICALEARTH. Every GLORYS file (cmems_mod_glo_phy_my_0.083deg_P1M-m: the
+# strips, the starting state, the ice; and the static deptho for the seafloor) is downloaded from Copernicus
+# Marine by NumericalEarth's CopernicusMarine extension the first time this runs, into GLORYS_DIR
+# (<data>/glorys_monthly), and inpainted on first read, with the inpainted copy cached beside it. Later runs
+# find both and download nothing. It needs COPERNICUSMARINE_SERVICE_USERNAME and _PASSWORD (create_job.sh
+# sources the gitignored .copernicus_env), or a stored `copernicusmarine login`, and a node that can reach
+# Copernicus. The daily path (tools/prefetch_glorys.jl, src/glorys_ncar.jl, <data>/glorys) is not used here.
 # ==============================================================================================
 
 using CUDA            # loads Oceananigans' CUDA extension, which is what defines `GPU()`
 using CopernicusClimateDataStore    # an ERA5 backend: the ERA5 constructors always call `download`
+using CopernicusMarine              # the GLORYS backend: NumericalEarth downloads every GLORYS file through it
 using NumericalEarth
-using NumericalEarth.DataWrangling: metadata_path, Metadatum, BoundingBox, bracketing_dates, inpainted_metadata_path, jldopen
-using NumericalEarth.DataWrangling.GLORYS: GLORYSDaily, GLORYSStatic
+using NumericalEarth.DataWrangling: metadata_path, Metadatum, BoundingBox, bracketing_dates, window_center
+using NumericalEarth.DataWrangling.GLORYS: GLORYSMonthly
 using Oceananigans
 using Oceananigans.Units
 using Oceananigans.Diagnostics: NaNChecker
@@ -47,7 +46,6 @@ using NCDatasets      # loads Oceananigans' NetCDFWriter
 using Dates, Printf, Logging
 
 include(joinpath(@__DIR__, "..", "src", "setup_bsose.jl"))   # only for default_bsose_directory(), where ERA5 lives
-include(joinpath(@__DIR__, "..", "src", "glorys_ncar.jl"))   # the GLORYS files this run reads; the ice days and region
 
 const SMOKE    = get(ENV, "SMOKE", "0") == "1"
 const PICKUP   = get(ENV, "PICKUP", "0") == "1"
@@ -57,37 +55,20 @@ ARCH isa GPU && !CUDA.functional() &&
 ARCH isa GPU && @info "Running on GPU: $(CUDA.name(CUDA.device()))"
 
 const DATA_DIR   = default_bsose_directory()
-const GLORYS_DIR = get(ENV, "GLORYS_DIR", joinpath(DATA_DIR, "glorys"))
+const GLORYS_DIR = get(ENV, "GLORYS_DIR", joinpath(DATA_DIR, "glorys_monthly"))
 mkpath(GLORYS_DIR)
 
-# Every GLORYS file is on disk before the run (tools/prefetch_glorys.jl): "downloading" one is finding it.
-# More specific than any backend's method, so nothing here ever goes to the network.
-function NumericalEarth.DataWrangling.Downloads.download(meta::Metadatum{<:Union{GLORYSDaily, GLORYSStatic}}; kwargs...)
-    path = joinpath(meta.dir, meta.filename)
-    isfile(path) || error("$path is missing: run tools/prefetch_glorys.jl")
-    return path
-end
-
-# A FieldTimeSeries downloads its whole Metadata at once: each date in turn, as the CopernicusMarine
-# extension's method does (ext/NumericalEarthCopernicusMarineExt.jl). Metadatum is the single-date Metadata,
-# so the method above stays the more specific one for a single date.
-function NumericalEarth.DataWrangling.Downloads.download(metadata::NumericalEarth.DataWrangling.Metadata{<:Union{GLORYSDaily, GLORYSStatic}}; kwargs...)
-    paths = Array{String}(undef, length(metadata))
-    for (m, metadatum) in enumerate(metadata)
-        paths[m] = NumericalEarth.DataWrangling.Downloads.download(metadatum; kwargs...)
-    end
-    return paths
-end
+@info "GLORYS monthly in $GLORYS_DIR; Copernicus credentials " *
+      (haskey(ENV, "COPERNICUSMARINE_SERVICE_USERNAME") && haskey(ENV, "COPERNICUSMARINE_SERVICE_PASSWORD") ?
+       "from the environment" : "NOT in the environment: any missing file needs a stored `copernicusmarine login`")
 
 # ── experiment switches: set HERE, as in sowinwarp_nested.jl ──────────────────────────────────
 const PENETRATING_SHORTWAVE = true    # forward get_radiative_forcing to the child (see sowinwarp_nested.jl)
 const ICE_GROUNDING         = false   # LandfastBasalStress off, as fix7
 const ICE_RELAXATION_HOURS  = 6       # open-side band ice relaxed to GLORYS's on this timescale
-const ICE_RECORD_DAYS       = GLORYS_ICE_RECORD_DAYS   # 5: GLORYS ice sampled every 5 days (set in src/glorys_ncar.jl, which tools/prefetch_glorys.jl shares)
-const PARENT_IN_MEMORY      = false   # false: 2 GLORYS strip records on the GPU (~50 MB), the next read from its inpainted cache each day; true: all 734 at startup (17.9 GB, needs a >= 32 GB GPU)
 
-@info "switches: parent = GLORYS daily, bathymetry = ETOPO2022, PENETRATING_SHORTWAVE = $PENETRATING_SHORTWAVE, " *
-      "ICE_GROUNDING = $ICE_GROUNDING, ICE_RELAXATION_HOURS = $ICE_RELAXATION_HOURS, ICE_RECORD_DAYS = $ICE_RECORD_DAYS"
+@info "switches: parent = GLORYS monthly, bathymetry = ETOPO2022, PENETRATING_SHORTWAVE = $PENETRATING_SHORTWAVE, " *
+      "ICE_GROUNDING = $ICE_GROUNDING, ICE_RELAXATION_HOURS = $ICE_RELAXATION_HOURS"
 
 if PENETRATING_SHORTWAVE &&
    Base.unwrap_unionall(which(NumericalEarth.Oceans.get_radiative_forcing, (NumericalEarth.NestedModel,)).sig).parameters[2] === Any
@@ -110,28 +91,14 @@ const BSOSE_DRF = [4.2, 5.0, 5.9, 6.9, 8.5, 9.5, 10.0, 10.0, 10.0, 10.0,
 z = reverse(-vcat(0.0, cumsum(BSOSE_DRF))) .+ 0.0
 const Nz = length(z) - 1
 
-# GLORYS daily records are stamped at 00:00 (the start of their day), so any midnight is native.
+# GLORYS monthly records are stamped at 00:00 on the 1st (the start of their month), so 1 June is native.
 # Noon on 1 June would match the B-SOSE runs to the hour, but would not be a GLORYS stamp.
 start_date = DateTime(2014, 6, 1)
-const END_DATE = DateTime(2016, 6, 1, 12)   # hard-coded: 2 years (not read from ENV); tools/prefetch_glorys.jl's RUN_END must match
+const END_DATE = DateTime(2016, 6, 1, 12)   # hard-coded: 2 years (not read from ENV)
 end_date   = SMOKE ? DateTime(2014, 6, 3) : END_DATE
 const RUN_NAME = get(ENV, "RUN_NAME", SMOKE ? "glorys_smoke" : "2Y_nested_glorys_baseline")
 
 @info "SOWinWaRP GLORYS baseline: $(Nx)x$(Ny)x$(Nz) over $(λ₁)-$(λ₂)E, $(φ₁)-$(φ₂)S, $start_date to $end_date"
-
-# ── GLORYS: all there? (as the ERA5 check below) ──────────────────────────────────────────────
-# Every GLORYS file this run reads (src/glorys_ncar.jl, glorys_run_files: the strips for every day, the
-# starting state, the ice days), and NumericalEarth's inpainted cache of each ocean one. Stop here, before
-# any of the setup, if tools/prefetch_glorys.jl has not made them all.
-const GLORYS_FILES = glorys_run_files(GLORYS_DIR, start_date, end_date; λ₁, λ₂, φ₁, φ₂, Nx, Ny)
-let missing_files = [basename(metadata_path(m)) for m in GLORYS_FILES.metadata if !isfile(metadata_path(m))],
-    not_inpainted = [basename(metadata_path(m)) for m in GLORYS_FILES.metadata if isfile(metadata_path(m)) && needs_inpainting(m)]
-    isempty(missing_files) && isempty(not_inpainted) ||
-        error("GLORYS is not ready in $GLORYS_DIR: $(length(missing_files)) files missing, $(length(not_inpainted)) not inpainted. " *
-              "Run tools/prefetch_glorys.jl. The first ones:\n  " * join(first(vcat(missing_files, not_inpainted), 10), "\n  "))
-    @info "GLORYS: all $(length(GLORYS_FILES.metadata)) files this run reads are in $GLORYS_DIR, inpainted; seafloor " *
-          (isfile(metadata_path(GLORYS_FILES.deptho)) ? "from deptho" : "from GLORYS' first-day temperature (no deptho)")
-end
 
 underlying_grid = LatitudeLongitudeGrid(ARCH;
                                         size = (Nx, Ny, Nz),
@@ -174,7 +141,7 @@ grid = ImmersedBoundaryGrid(underlying_grid,
                             active_cells_map = true)
 
 # ── GLORYS sea ice ────────────────────────────────────────────────────────────────────────────
-# siconc (ℵ) and sithick, every ICE_RECORD_DAYS days, over the domain plus a degree, aggregated
+# siconc (ℵ) and sithick, monthly means, over the domain plus a degree, aggregated
 # onto the child grid: each child cell takes the mean of the GLORYS ocean cells (1/12 deg, so ~4)
 # whose centres fall inside it; a child ocean cell with none (our coast is not GLORYS's) takes the
 # nearest child cell that has one, within ICE_FILL_CELLS. GLORYS land is missing in siconc.
@@ -185,14 +152,14 @@ grid = ImmersedBoundaryGrid(underlying_grid,
 # cell area, the edge floes would be 4-7 m thick. The startup line still prints the volume both ways.
 const ICE_ℵ_MIN = 0.01
 const ICE_FILL_CELLS = 6
-const ICE_REGION = glorys_ice_region(λ₁, λ₂, φ₁, φ₂)
+const ICE_REGION = BoundingBox(longitude = (λ₁ - 1, λ₂ + 1), latitude = (φ₁ - 1, φ₂ + 1))
 
-# The days sampled for the ice (src/glorys_ncar.jl): the day before the start, every 5 days, the day after the end
-ice_record_starts(first_date, last_date) = glorys_ice_record_starts(first_date, last_date; every = ICE_RECORD_DAYS)
+# The months whose centres bracket the run, as the parent's own (bracketing_dates)
+ice_record_starts(first_date, last_date) =
+    bracketing_dates(GLORYSMonthly(), :sea_ice_concentration, (first_date, last_date))
 
-glorys_ice_file(name, date) =
-    NumericalEarth.DataWrangling.Downloads.download(Metadatum(name; dataset = GLORYSDaily(), date,
-                                                              region = ICE_REGION, dir = GLORYS_DIR))
+ice_metadatum(name, date) = Metadatum(name; dataset = GLORYSMonthly(), date, region = ICE_REGION, dir = GLORYS_DIR)
+glorys_ice_file(name, date) = NumericalEarth.DataWrangling.Downloads.download(ice_metadatum(name, date))
 
 function read_glorys_2d(path, name)
     ds = NCDataset(path)
@@ -242,8 +209,8 @@ function load_glorys_ice(first_date, last_date)
         end
         push!(ℵs, ℵ); push!(Vs, V)
     end
-    # A daily GLORYS record is the mean over its day: place it at noon
-    return (; dates = starts .+ Hour(12), ℵ = stack(ℵs), V = stack(Vs))
+    # A monthly GLORYS record is the mean over its calendar month: place it at the month's centre
+    return (; dates = [window_center(ice_metadatum(:sea_ice_concentration, d)) for d in starts], ℵ = stack(ℵs), V = stack(Vs))
 end
 
 function glorys_ice_at(ice, date)
@@ -259,47 +226,19 @@ function ice_totals(ℵ, V)
     return sum(ℵ .* A) / 1e12, sum(V .* A) / 1e9   # 10⁶ km², km³
 end
 
-# GLORYS' seafloor for the nest's bathymetry blend and Flather depth mean: NumericalEarth's default
-# (deptho) when tools/prefetch_glorys.jl fetched it, else the seafloor GLORYS' temperature marks by its
-# missing values on the first day, which is NumericalEarth's own fallback for a dataset without a static
-# depth (nested_ocean_model.jl). Same region as the nest's own snapshot.
-parent_seafloor(first_date) =
-    isfile(metadata_path(GLORYS_FILES.deptho)) ?
-        nothing :
-        regrid_bathymetry(underlying_grid, Metadatum(:temperature; dataset = GLORYSDaily(), date = first_date,
-                                                     region = BoundingBox(grid; padding = 1/6), dir = GLORYS_DIR);
-                          major_basins = Inf)
-
 # ── the nest ──────────────────────────────────────────────────────────────────────────────────
-# As the Bouvet example: GLORYS daily, all open sides (the south has no wet columns), the default
-# relaxation band and rate, the seafloor blended toward GLORYS' own. Unlike it, and like
-# sowinwarp_nested.jl's B-SOSE parent, every daily record of the strips can be held in memory
-# (PARENT_IN_MEMORY = true): nested_ocean_simulation loads them all here, from the inpainted caches,
-# before the first step. That is 17.9 GB for the 2 years, too much for a 16 GB V100, so the default
-# (false) keeps 2 records (~50 MB) and loads the next from its cache each day. The strips sit on the GPU
-# with the model; their size is measured from the caches first, and the run stops here if they would not fit.
-const PARENT_RECORDS = length(bracketing_dates(GLORYSDaily(), :temperature, (start_date, end_date)))
-parent_records_in_memory = PARENT_IN_MEMORY ? PARENT_RECORDS : 2
-
-let bytes_per_record = sum(m -> sizeof(jldopen(file -> file["data"], inpainted_metadata_path(m), "r")), GLORYS_FILES.first_strip_records),
-    need = parent_records_in_memory * bytes_per_record
-    if ARCH isa GPU
-        free = CUDA.free_memory()   # CUDA.jl 5.x and 6.x (public in CUDACore)
-        reserve = 10e9   # the model, sea ice, coupler and output buffers on top
-        need > free - reserve &&
-            error(@sprintf("the GLORYS parent needs %.1f GB of GPU memory for %d daily records, and %.1f GB of this GPU's %.1f GB free is left after a %.0f GB reserve for the model. Use a GPU with more memory, or set PARENT_IN_MEMORY = false (streams 2 records from disk).", need / 1e9, parent_records_in_memory, max(free - reserve, 0) / 1e9, free / 1e9, reserve / 1e9))
-        @info @sprintf("GLORYS parent: loading %d daily records into memory, %.1f GB of the GPU's %.1f GB free", parent_records_in_memory, need / 1e9, free / 1e9)
-    else
-        @info @sprintf("GLORYS parent: loading %d daily records into memory, %.1f GB", parent_records_in_memory, need / 1e9)
-    end
-end
+# As the Bouvet example: all open sides (the south has no wet columns), the default relaxation band and
+# rate, the seafloor blended toward GLORYS' own (its static deptho, which NumericalEarth downloads: no
+# parent_bottom_height). Unlike it, and like sowinwarp_nested.jl's B-SOSE parent, the parent is monthly and
+# every record of the strips is held in memory, loaded before the first step (~25 MB a record).
+const PARENT_RECORDS = length(bracketing_dates(GLORYSMonthly(), :temperature, (start_date, end_date)))
+@info "GLORYS parent: $PARENT_RECORDS monthly records, all held in memory; downloaded and inpainted first if missing"
 
 const PARENT_LOAD_T₀ = time()
-ocean = nested_ocean_simulation(grid, GLORYSDaily();
+ocean = nested_ocean_simulation(grid, GLORYSMonthly();
                                 dates = (start_date, end_date),
                                 dir = GLORYS_DIR,
-                                parent_time_indices_in_memory = parent_records_in_memory,
-                                parent_bottom_height = parent_seafloor(start_date))
+                                parent_time_indices_in_memory = PARENT_RECORDS)
 @info @sprintf("GLORYS parent: loaded in %.1f min", (time() - PARENT_LOAD_T₀) / 60)
 
 child = ocean.model.child
@@ -530,10 +469,10 @@ output_metadata = Dict("run_name" => RUN_NAME,
     "start_date" => string(start_date),
     "end_date" => string(end_date),
     "dataset" => "GLORYS",
-    "boundaries" => "one-way nest in GLORYS daily (NumericalEarth nested_ocean_simulation, defaults)",
+    "boundaries" => "one-way nest in GLORYS monthly (NumericalEarth nested_ocean_simulation, defaults)",
     "atmosphere" => "ERA5 (NCAR ds633.0), $(era5_pressure)",
     "sea_ice" => "ClimaSeaIce via sea_ice_simulation defaults, IncrementalRemapping advection, free-slip coasts, " *
-                 "started from GLORYS siconc/sithick, open-side bands relaxed to GLORYS ice on $(ICE_RELAXATION / hours) h",
+                 "started from GLORYS monthly siconc/sithick, open-side bands relaxed to GLORYS ice on $(ICE_RELAXATION / hours) h",
     "coastal_freshwater" => "none",
     "ice_grounding" => ICE_GROUNDING ? "LandfastBasalStress (NumericalEarth default)" : "off (basal_stress = nothing)",
     "bathymetry" => "ETOPO2022",
@@ -619,8 +558,8 @@ simulation.output_writers[:checkpointer] = Checkpointer(coupled_model;
                                                         prefix = "$(RUN_NAME)_checkpoint")
 
 # NumericalEarth's DataWrangling info lines (reading, inpainting parent data) are dropped from here on: the
-# GLORYS parent is all in memory and was inpainted by tools/prefetch_glorys.jl, so they would carry nothing,
-# and the log is the model's. Its warnings, and every other module's lines, still show.
+# GLORYS parent is all in memory, downloaded and inpainted during setup, so they would carry nothing, and
+# the log is the model's. Its warnings, and every other module's lines, still show.
 struct QuietParentData{L <: Logging.AbstractLogger} <: Logging.AbstractLogger
     logger :: L
 end
