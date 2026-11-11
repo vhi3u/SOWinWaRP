@@ -125,7 +125,7 @@ const COLUMN_REGION  = HAVE_SECT ? BoundingBox(longitude = (r2(λc[MID] - Δλ /
                                                latitude = (r2(φS), r2(φN))) : nothing
 glorys_meta(name, k, region) = Metadatum(name; dataset = GLORYSMonthly(), date = DateTime(k[1], k[2], 1),
                                          region, dir = GLORYS_DIR)
-wanted = [(n, k, SURFACE_REGION) for n in (:temperature, :salinity) for k in surf_months]
+wanted = Any[(n, k, SURFACE_REGION) for n in (:temperature, :salinity) for k in surf_months]
 HAVE_SECT && append!(wanted, [(n, k, COLUMN_REGION) for n in (:temperature, :salinity) for k in sect_months])
 missing_files = filter(w -> !isfile(metadata_path(glorys_meta(w...))), wanted)
 if !isempty(missing_files)
