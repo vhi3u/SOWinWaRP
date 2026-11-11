@@ -921,6 +921,15 @@ function DataWrangling.inpainted_metadata_path(metadata::BSOSEMetadata)
     return joinpath(bsose_temp_directory(metadata.dataset), name)
 end
 
+# NumericalEarth (#773, from d59fa0a) `read`s every file of a series' window WHOLE before loading it,
+# to warm the page cache: meant for one-record-per-file datasets. A B-SOSE file holds every month of
+# a variable, so each load pulled the whole file into RAM (compare_bsose killed under 4 GiB, the
+# 32G smoke OOM). B-SOSE reads only its slice (retrieve_data), so it skips the pre-read. Guarded:
+# NumericalEarth before #773 has no window_paths.
+if isdefined(DataWrangling, :window_paths)
+    DataWrangling.window_paths(::DataWrangling.DatasetBackend{<:Any, <:Any, <:Any, <:BSOSEMetadata}, indices) = String[]
+end
+
 function DataWrangling.all_dates(dataset::BSOSEMonthly, var)
     # Read the dates out of the file, or fail. There used to be a `catch` here that fell back
     # to a synthetic `2013-01-01:Month(1):2024-12-01` range, which meant an unreadable or
