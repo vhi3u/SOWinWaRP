@@ -929,7 +929,6 @@ end
 if isdefined(DataWrangling, :window_paths)
     DataWrangling.window_paths(::DataWrangling.DatasetBackend{<:Any, <:Any, <:Any, <:BSOSEMetadata}, indices) = String[]
 end
-include(joinpath(@__DIR__, "numericalearth_fixes.jl"))   # the same for ERA5's yearly files
 
 function DataWrangling.all_dates(dataset::BSOSEMonthly, var)
     # Read the dates out of the file, or fail. There used to be a `catch` here that fell back
