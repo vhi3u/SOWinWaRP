@@ -23,6 +23,8 @@ using Dates
 using Printf
 using CUDA
 
+include(joinpath(@__DIR__, "..", "src", "numericalearth_fixes.jl"))   # ERA5 yearly files: no whole-file pre-read
+
 const RUN_NAME = "nested_glorys_mini"
 const DATA_DIR = "/storage/scratch1/1/vnguyen480/SOWinWaRP/data"
 

@@ -49,6 +49,8 @@ using Oceanostics.ProgressMessengers: TimedMessenger
 using NCDatasets      # loads Oceananigans' NetCDFWriter
 using Dates, Printf, Logging
 
+include(joinpath(@__DIR__, "..", "src", "numericalearth_fixes.jl"))   # ERA5 yearly files: no whole-file pre-read
+
 # ── run settings: ALL hard-coded; the environment is not read (see the top) ──────────────────
 const SMOKE           = false     # true: 2 days, 6-hourly output, a checkpoint every day, as "glorys_smoke"
 const PICKUP          = false     # true: continue RUN_NAME from its latest checkpoint
