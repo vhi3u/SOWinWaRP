@@ -4,11 +4,12 @@
 # ocean AND the sea ice parent (nested_ocean_simulation + nested_sea_ice_simulation), ERA5 for the
 # atmosphere, ETOPO2022 bathymetry, and the nest's own defaults for the boundary relaxation.
 #
-#     julia --project=. examples/sowinwarp_glorys_baseline.jl               # GPU: the run itself
-#     SMOKE=1 julia --project=. examples/sowinwarp_glorys_baseline.jl       # 2 days, proves it starts
+#     julia --project=. examples/sowinwarp_glorys_baseline.jl
 #
-# RUN_NAME defaults to 2Y_nested_glorys_baseline; END_DATE is hard-coded below to 2016-06-01T12:00 (the same span
-# as the 2-year B-SOSE runs; an END_DATE in the environment is ignored), so a plain sbatch of this script is the baseline.
+# EVERY SETTING IS HARD-CODED in "run settings" below -- RUN_NAME, SMOKE, PICKUP, END_DATE, CHECKPOINT_DAYS, the
+# GPU and the data directories -- and nothing is read from the environment except the Copernicus credentials.
+# So variables exported for sowinwarp_nested.jl (RUN_NAME, END_DATE, ...) cannot reach this run: they once
+# did, and it wrote its output over 2Y_nested_seaice_fix9's. To smoke-test, set SMOKE = true below.
 #
 # WHAT IT KEEPS from examples/sowinwarp_nested.jl, so that the parent is what differs from fix7:
 #   the domain and grid (1/6 deg, B-SOSE i156's 52 static levels), ETOPO2022 with the same knobs and
@@ -48,17 +49,25 @@ using Oceanostics.ProgressMessengers: TimedMessenger
 using NCDatasets      # loads Oceananigans' NetCDFWriter
 using Dates, Printf, Logging
 
-include(joinpath(@__DIR__, "..", "src", "setup_bsose.jl"))   # only for default_bsose_directory(), where ERA5 lives
+# ── run settings: ALL hard-coded; the environment is not read (see the top) ──────────────────
+const SMOKE           = false     # true: 2 days, 6-hourly output, a checkpoint every day, as "glorys_smoke"
+const PICKUP          = false     # true: continue RUN_NAME from its latest checkpoint
+const RUN_NAME        = SMOKE ? "glorys_smoke" : "2Y_nested_glorys_baseline"
+const CHECKPOINT_DAYS = SMOKE ? 1 : 30
+const ARCH            = GPU()
 
-const SMOKE    = get(ENV, "SMOKE", "0") == "1"
-const PICKUP   = get(ENV, "PICKUP", "0") == "1"
-const ARCH     = get(ENV, "ARCH", "GPU") == "CPU" ? CPU() : GPU()
+for name in ("RUN_NAME", "SMOKE", "PICKUP", "END_DATE", "CHECKPOINT_DAYS", "ARCH", "GLORYS_DIR", "ERA5_DIR", "BSOSE_DIR")
+    haskey(ENV, name) && @warn "$name = $(ENV[name]) is set in the environment; this script ignores it (all its settings are hard-coded)"
+end
+@info "run settings: RUN_NAME = $RUN_NAME, SMOKE = $SMOKE, PICKUP = $PICKUP, CHECKPOINT_DAYS = $CHECKPOINT_DAYS"
+
 ARCH isa GPU && !CUDA.functional() &&
-    (CUDA.functional(true); error("CUDA is not functional on this node. Check the GPU allocation, or set ARCH=CPU."))
+    (CUDA.functional(true); error("CUDA is not functional on this node. Check the GPU allocation."))
 ARCH isa GPU && @info "Running on GPU: $(CUDA.name(CUDA.device()))"
 
-const DATA_DIR   = default_bsose_directory()
-const GLORYS_DIR = get(ENV, "GLORYS_DIR", joinpath(DATA_DIR, "glorys_monthly"))
+const DATA_DIR   = "/storage/scratch1/1/vnguyen480/SOWinWaRP/data"   # PACE; ERA5 is in era5/ here
+isdir(DATA_DIR) || error("$DATA_DIR not found: this run is set up for PACE (DATA_DIR is hard-coded)")
+const GLORYS_DIR = joinpath(DATA_DIR, "glorys_monthly")
 mkpath(GLORYS_DIR)
 
 @info "GLORYS monthly in $GLORYS_DIR; Copernicus credentials " *
@@ -96,9 +105,8 @@ const Nz = length(z) - 1
 # GLORYS monthly records are stamped at 00:00 on the 1st (the start of their month), so 1 June is native.
 # Noon on 1 June would match the B-SOSE runs to the hour, but would not be a GLORYS stamp.
 start_date = DateTime(2014, 6, 1)
-const END_DATE = DateTime(2016, 6, 1, 12)   # hard-coded: 2 years (not read from ENV)
+const END_DATE = DateTime(2016, 6, 1, 12)   # 2 years, as the B-SOSE runs
 end_date   = SMOKE ? DateTime(2014, 6, 3) : END_DATE
-const RUN_NAME = get(ENV, "RUN_NAME", SMOKE ? "glorys_smoke" : "2Y_nested_glorys_baseline")
 
 @info "SOWinWaRP GLORYS baseline: $(Nx)x$(Ny)x$(Nz) over $(λ₁)-$(λ₂)E, $(φ₁)-$(φ₂)S, $start_date to $end_date"
 
@@ -166,7 +174,7 @@ ocean = nested_ocean_simulation(grid, GLORYSMonthly();
 child = ocean.model.child
 
 # ── atmosphere: the same ERA5 files as sowinwarp_nested.jl ────────────────────────────────────
-era5_dir = get(ENV, "ERA5_DIR", joinpath(DATA_DIR, "era5"))
+era5_dir = joinpath(DATA_DIR, "era5")
 era5_region = BoundingBox(longitude = (λ₁ - 1.0, λ₂ + 1.0), latitude = (φ₁ - 1.0, φ₂ + 1.0))
 era5_dataset = ERA5YearlySingleLevel()
 era5_pressure = :mean_sea_level_pressure
@@ -438,7 +446,6 @@ sea_ice.output_writers[:sea_ice] = NetCDFWriter(sea_ice.model, sea_ice_outputs;
 @info "output: $(RUN_NAME)_{surface,midlon,free_surface,surface_fluxes,eke,sea_ice}.nc in $(pwd())"
 
 # ── checkpoints: as sowinwarp_nested.jl ───────────────────────────────────────────────────────
-const CHECKPOINT_DAYS = parse(Float64, get(ENV, "CHECKPOINT_DAYS", SMOKE ? "1" : "365"))
 simulation.output_writers[:checkpointer] = Checkpointer(coupled_model;
                                                         schedule = TimeInterval(CHECKPOINT_DAYS * days),
                                                         prefix = "$(RUN_NAME)_checkpoint")
