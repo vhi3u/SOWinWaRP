@@ -21,6 +21,7 @@
 #     <RUN>_surface_bias_series.png        domain-mean bias and RMS difference, month by month
 #     <RUN>_midlon_bias_T.png, _S.png      one latitude-depth panel per month, model - B-SOSE
 #     <RUN>_midlon_bias_series.png         section-mean bias and RMS, 0-200 m and 200 m-floor
+#     <RUN>_coastal_salinity_bias.png      surface ΔS south of 60S, whole run and Dec-Feb, coast outlined
 # and the same numbers on stdout, by latitude band for the surface and by layer for the section,
 # with the drift per year (last 12 months minus first 12, the seasonal cycle cancelled) for a run
 # of 24 months or more.
@@ -42,6 +43,9 @@
 #     T_LIM, S_LIM, ST_LIM, SS_LIM   colour limits for the surface / section maps (default: the
 #                  99th percentile of |Δ| over the months drawn)
 #     CHUNK        B-SOSE months regridded at once                 (default 6)
+#     COAST_CELLS  a coastal cell is within this many cells of land (default 2)
+#     COAST_SOUTH_OF  only the coast south of this latitude        (default -60)
+#     COAST_S_LIM  colour limit of the coastal map, g/kg           (default: 99th percentile)
 # ==============================================================================
 
 using Oceananigans, Oceananigans.Units, Oceananigans.Grids
@@ -248,6 +252,64 @@ if !isempty(sect_months)
             "", cell(py(cΔS, UPPER), "%+8.4f"), cell(py(cΔS, DEEP), "%+8.4f"))
 end
 println("\n  per year: (last 12 months - first 12) / their separation, so the seasonal cycle cancels (24+ months only).\n")
+
+# ── the Antarctic coast: where the surface ΔS sits ────────────────────────────────────────────
+# Coastal cells: wet in both, south of COAST_SOUTH_OF, within COAST_CELLS cells (either axis) of the model's
+# land. Offshore: the rest of the wet cells south of COAST_SOUTH_OF.
+const COAST_CELLS    = parse(Int, get(ENV, "COAST_CELLS", "2"))
+const COAST_SOUTH_OF = parse(Float64, get(ENV, "COAST_SOUTH_OF", "-60"))
+coastal = falses(Nx, Ny)
+for i in 1:Nx, j in 1:Ny
+    (surface_wet[i, j] && φc[j] < COAST_SOUTH_OF) || continue
+    near = (max(1, i - COAST_CELLS):min(Nx, i + COAST_CELLS), max(1, j - COAST_CELLS):min(Ny, j + COAST_CELLS))
+    coastal[i, j] = any(.!model_surface_wet[near...])
+end
+offshore = surface_wet .& .!coastal .& [φ < COAST_SOUTH_OF for _ in 1:Nx, φ in φc]
+masked_mean(A, m) = wmean(ifelse.(m, A, NaN), -90, 90)
+const LON_BINS = [(λ, λ + 10) for λ in 10 * floor(Int, λc[1] / 10):10:(10 * floor(Int, λc[end] / 10))]
+in_bin(i, (a, b)) = a <= λc[i] < b
+summer(k) = k[2] in (12, 1, 2)
+
+@printf("\n  SURFACE ΔS (g/kg) at the COAST: %d cells within %d of land south of %.0fS, against %d offshore cells there\n",
+        count(coastal), COAST_CELLS, -COAST_SOUTH_OF, count(offshore))
+@printf("  %-8s | %8s %8s |", "month", "coast", "offshore")
+for b in LON_BINS; @printf(" %8s", "$(b[1])-$(b[2])E"); end
+println()
+for k in surf_months
+    @printf("  %-8s | %s %s |", label(k), cell(masked_mean(sΔS[k], coastal), "%+8.3f"), cell(masked_mean(sΔS[k], offshore), "%+8.3f"))
+    for b in LON_BINS
+        m = coastal .& [in_bin(i, b) for i in 1:Nx, _ in 1:Ny]
+        print(" ", cell(any(m) ? masked_mean(sΔS[k], m) : NaN, "%+8.3f"))
+    end
+    println()
+end
+
+mean_over(ms) = isempty(ms) ? fill(NaN, Nx, Ny) : sum(sΔS[k] for k in ms) ./ length(ms)
+ΔS_all, ΔS_summer = mean_over(surf_months), mean_over(filter(summer, surf_months))
+ranked = sort([(ΔS_summer[i, j], i, j) for i in 1:Nx, j in 1:Ny if coastal[i, j] && isfinite(ΔS_summer[i, j])], rev = true)
+println("\n  The 15 coastal cells with the largest summer (Dec-Feb) ΔS, and their whole-run mean ΔS")
+@printf("  %8s %8s | %10s %10s\n", "lon", "lat", "ΔS DJF", "ΔS all")
+for (v, i, j) in ranked[1:min(15, end)]
+    @printf("  %7.2fE %7.2fS | %+10.3f %+10.3f\n", λc[i], -φc[j], v, ΔS_all[i, j])
+end
+println()
+
+!isempty(surf_months) && let
+    jsouth = findall(φ -> φ < COAST_SOUTH_OF, φc)
+    lim = haskey(ENV, "COAST_S_LIM") ? parse(Float64, ENV["COAST_S_LIM"]) :
+          max(quantile(filter(isfinite, abs.(vcat(vec(ΔS_all[:, jsouth]), vec(ΔS_summer[:, jsouth])))), 0.99), 1e-6)
+    fig = Figure(size = (1100, 640))
+    Label(fig[0, 1], "$RUN — surface S, model − B-SOSE, south of $(Int(-COAST_SOUTH_OF))S", fontsize = 18, font = :bold)
+    local hm
+    for (row, (name, D)) in enumerate((("whole run", ΔS_all), ("Dec-Feb", ΔS_summer)))
+        ax = Axis(fig[row, 1], title = "mean over $name; black: coastal cells (within $COAST_CELLS of land)",
+                  titlesize = 12, ylabel = "latitude", xlabel = row == 2 ? "longitude" : "")
+        hm = heatmap!(ax, λc, φc[jsouth], D[:, jsouth], colormap = :balance, colorrange = (-lim, lim), nan_color = :gray80)
+        contour!(ax, λc, φc[jsouth], Float64.(coastal[:, jsouth]), levels = [0.5], color = :black, linewidth = 0.8)
+    end
+    Colorbar(fig[1:2, 2], hm, label = "ΔS (g/kg); red: model too salty")
+    f = joinpath(OUTDIR, "$(RUN)_coastal_salinity_bias.png"); save(f, fig); @info "wrote $f"
+end
 
 # ── figures ───────────────────────────────────────────────────────────────────────────────────
 function colour_limit(Ds, key)
