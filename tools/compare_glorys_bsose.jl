@@ -7,13 +7,14 @@
 #     julia --project=. tools/compare_glorys_bsose.jl
 #     FIRST_MONTH=2014-06 LAST_MONTH=2016-05 S_LIM=0.5 julia --project=. tools/compare_glorys_bsose.jl
 #
-# WHAT IS COMPARED. Each month's mean of the top level: GLORYS's (0.49 m, cmems_mod_glo_phy_my_0.083deg_P1M-m,
-# stamped on the 1st of its month) and B-SOSE i156's (0-4.2 m, the record whose averaging window is that
-# month). Both are put on the domain's 1/6-degree cells the same way, by averaging the wet source points
+# WHAT IS COMPARED. Each month's mean of the top 4.2 m: B-SOSE i156's top cell (0-4.2 m, the record whose
+# averaging window is that month), and GLORYS's levels to 5 m averaged over the same 0-4.2 m, thickness-weighted
+# (cmems_mod_glo_phy_my_0.083deg_P1M-m, stamped on the 1st of its month). LAYER=top compares GLORYS's top
+# level (0.49 m, ~1 m thick) alone instead, which reads a thin summer meltwater lens as much fresher. Both are put on the domain's 1/6-degree cells the same way, by averaging the wet source points
 # inside each cell (GLORYS ~2x2 points, B-SOSE 1-3), so neither is interpolated differently from the other.
 # Cells count where both have water. Potential temperature and practical salinity in both.
 #
-# DOWNLOADS. Only GLORYS's top level, for the domain and months, through NumericalEarth's CopernicusMarine
+# DOWNLOADS. Only GLORYS's top 5 m (or, LAYER=top, its top level), for the domain and months, through NumericalEarth's CopernicusMarine
 # extension: a few MB a month, into GLORYS_DIR, with "_-1.0_0.0" (the depth range) in the names so they
 # never stand in for the full-depth files the runs use. Needs COPERNICUSMARINE_SERVICE_USERNAME and
 # _PASSWORD in the environment (source .copernicus_env). B-SOSE is read straight from its files.
@@ -21,12 +22,14 @@
 # WRITES (OUTDIR, default plots/):
 #     glorys_minus_bsose_S.png, _T.png    one surface map per month
 #     glorys_minus_bsose_mean.png         ΔT and ΔS over all months, and ΔS over Dec-Feb
+#     (with LAYER=top, the same names ending in _top)
 # and on stdout: the domain and each latitude band, month by month; the Antarctic coast (cells within
 # COAST_CELLS of land, south of COAST_SOUTH_OF) against the offshore water there, by 10-degree longitude;
 # and the 15 coastal cells where GLORYS is saltiest against B-SOSE in Dec-Feb.
 #
 # ENV
 #     FIRST_MONTH, LAST_MONTH      yyyy-mm (default 2014-06, 2016-05: the 2-year runs' span)
+#     LAYER                        "0-4.2" (default) or "top" (see above)
 #     GLORYS_DIR                   default <data>/glorys_monthly
 #     OUTDIR                       default plots
 #     COAST_CELLS, COAST_SOUTH_OF  default 2, -60
@@ -100,7 +103,16 @@ function cell_means(values, lons, lats)
 end
 
 # ── GLORYS: the top level, downloaded once ────────────────────────────────────────────────────
-const GLORYS_REGION = BoundingBox(longitude = (λW, λE), latitude = (φS, φN), z = (-1.0, 0.0))
+# LAYER = "0-4.2" (default): GLORYS's levels down to 5 m (0.49, 1.54, 2.65, 3.82 m), averaged over 0-4.2 m, the
+# depth of B-SOSE's top cell, so both are the same layer: a thin summer meltwater lens is diluted in both alike.
+# LAYER = "top": GLORYS's top level (0.49 m, ~1 m thick) alone, as this script first compared.
+const LAYER = get(ENV, "LAYER", "0-4.2")
+LAYER in ("0-4.2", "top") || error("LAYER must be \"0-4.2\" or \"top\", got $LAYER")
+const BSOSE_TOP = 4.2   # m, B-SOSE i156's top cell (BSOSE_DRF[1] in examples/sowinwarp_nested.jl)
+const GLORYS_REGION = BoundingBox(longitude = (λW, λE), latitude = (φS, φN), z = (LAYER == "top" ? -1.0 : -5.0, 0.0))
+const TAG = LAYER == "top" ? "_top" : ""
+@info LAYER == "top" ? "GLORYS: its top level (0.49 m) against B-SOSE's top cell (0-$(BSOSE_TOP) m)" :
+                       "GLORYS: averaged over 0-$(BSOSE_TOP) m, B-SOSE's top cell"
 glorys_meta(name, k) = Metadatum(name; dataset = GLORYSMonthly(), date = DateTime(k[1], k[2], 1),
                                  region = GLORYS_REGION, dir = GLORYS_DIR)
 missing_files = [metadata_path(glorys_meta(n, k)) for n in (:temperature, :salinity) for k in months
@@ -115,12 +127,32 @@ if !isempty(missing_files)
     end
 end
 
+"""
+Weights of GLORYS's levels (centres `depths`, m, positive down) in the 0-`bottom` m layer: each level's
+thickness inside it, its interfaces half-way between centres (the first at the surface).
+"""
+function layer_weights(depths, bottom)
+    edges = vcat(0.0, (depths[1:end-1] .+ depths[2:end]) ./ 2, 2depths[end] - (depths[end] + depths[max(1, end - 1)]) / 2)
+    length(depths) == 1 && (edges[end] = 2depths[1])
+    return [max(0.0, min(edges[k + 1], bottom) - edges[k]) for k in eachindex(depths)]
+end
+
 function glorys_surface(name, k)
     md = glorys_meta(name, k)
     Dataset(metadata_path(md)) do d
         v = d[dataset_variable_name(md)]
-        x = ndims(v) == 4 ? v[:, :, 1, 1] : ndims(v) == 3 ? v[:, :, 1] : v[:, :]
-        return cell_means(f64(x), f64(d["longitude"][:]), f64(d["latitude"][:]))
+        x = f64(ndims(v) == 4 ? v[:, :, :, 1] : ndims(v) == 3 ? v[:, :, :] : reshape(v[:, :], size(v)..., 1))
+        if LAYER == "top"
+            x = x[:, :, 1]
+        else
+            w = layer_weights(f64(d["depth"][:]), BSOSE_TOP)
+            # Thickness-weighted over the levels with water: a cell whose seafloor cuts the layer
+            # keeps the mean of what is there
+            num = sum(w[n] .* ifelse.(isfinite.(x[:, :, n]), x[:, :, n], 0.0) for n in eachindex(w))
+            den = sum(w[n] .* isfinite.(x[:, :, n]) for n in eachindex(w))
+            x = ifelse.(den .> 0, num ./ max.(den, eps()), NaN)
+        end
+        return cell_means(x, f64(d["longitude"][:]), f64(d["latitude"][:]))
     end
 end
 
@@ -186,7 +218,8 @@ smonths = filter(summer, months)
 mean_over(Δ, ms) = isempty(ms) ? fill(NaN, Nx, Ny) : sum(Δ[k] for k in ms) ./ length(ms)
 
 println("\n", "="^96)
-println("SURFACE, monthly means, GLORYS minus B-SOSE, $(λW)-$(λE)E $(-φS)-$(-φN)S")
+println("SURFACE, monthly means, GLORYS minus B-SOSE, $(λW)-$(λE)E $(-φS)-$(-φN)S; ",
+        LAYER == "top" ? "GLORYS's top level (0.49 m) vs B-SOSE's top cell (0-$(BSOSE_TOP) m)" : "both over 0-$(BSOSE_TOP) m")
 println("  cos(lat)-weighted over cells with water in both. Positive ΔS: GLORYS SALTIER; positive ΔT: WARMER.")
 println("="^96)
 @printf("\n  whole domain\n  %-8s | %8s %8s | %8s %8s\n", "month", "ΔT", "rms T", "ΔS", "rms S")
@@ -232,7 +265,7 @@ println()
 for (Δ, v, unit, lim) in ((ΔS, "S", "g/kg", S_LIM), (ΔT, "T", "°C", T_LIM))
     nm = length(months); ncol = min(nm, 6); nrow = cld(nm, ncol)
     fig = Figure(size = (260 * ncol + 120, 190 * nrow + 120))
-    Label(fig[0, 1:ncol], "surface $v, monthly mean, GLORYS − B-SOSE", fontsize = 18, font = :bold)
+    Label(fig[0, 1:ncol], "surface $v, monthly mean, GLORYS − B-SOSE ($(LAYER == "top" ? "GLORYS top level" : "both 0-$(BSOSE_TOP) m"))", fontsize = 18, font = :bold)
     local hm
     for (n, k) in enumerate(months)
         r, c = fldmod1(n, ncol)
@@ -243,14 +276,15 @@ for (Δ, v, unit, lim) in ((ΔS, "S", "g/kg", S_LIM), (ΔT, "T", "°C", T_LIM))
     Colorbar(fig[1:nrow, ncol + 1], hm, label = "Δ$v ($unit)")
     Label(fig[nrow + 1, 1:ncol], "red: GLORYS higher; blue: lower. Grey: land in either reanalysis. " *
           "Colour limit ±$lim $unit (set $(v)_LIM); larger values are drawn at the end colour.", fontsize = 11)
-    f = joinpath(OUTDIR, "glorys_minus_bsose_$(v).png"); save(f, fig); @info "wrote $f"
+    f = joinpath(OUTDIR, "glorys_minus_bsose_$(v)$(TAG).png"); save(f, fig); @info "wrote $f"
 end
 
 let panels = (("ΔT, all months", mean_over(ΔT, months), T_LIM, "°C"),
               ("ΔS, all months", ΔS_all, S_LIM, "g/kg"),
               ("ΔS, Dec-Feb", ΔS_summer, S_LIM, "g/kg"))
     fig = Figure(size = (900, 1050))
-    Label(fig[0, 1], "surface, GLORYS − B-SOSE, $(label(first(months)))..$(label(last(months)))", fontsize = 18, font = :bold)
+    Label(fig[0, 1], "surface, GLORYS − B-SOSE, $(label(first(months)))..$(label(last(months))) " *
+          "($(LAYER == "top" ? "GLORYS top level" : "both 0-$(BSOSE_TOP) m"))", fontsize = 18, font = :bold)
     for (r, (title, A, lim, unit)) in enumerate(panels)
         ax = Axis(fig[r, 1], title = title, xticklabelsvisible = r == length(panels))
         hm = heatmap!(ax, λc, φc, A, colormap = :balance, colorrange = (-lim, lim), nan_color = :gray80)
@@ -259,5 +293,5 @@ let panels = (("ΔT, all months", mean_over(ΔT, months), T_LIM, "°C"),
     end
     Label(fig[length(panels) + 1, 1], "red: GLORYS higher. Black outline (S panels): the coastal cells. " *
           "Colour limits ±$T_LIM °C, ±$S_LIM g/kg (T_LIM, S_LIM); larger values at the end colour.", fontsize = 11)
-    f = joinpath(OUTDIR, "glorys_minus_bsose_mean.png"); save(f, fig); @info "wrote $f"
+    f = joinpath(OUTDIR, "glorys_minus_bsose_mean$(TAG).png"); save(f, fig); @info "wrote $f"
 end
