@@ -1,6 +1,7 @@
 # nested_glorys_mini.jl -- the SOWinWaRP box nested in GLORYS, as simply as NumericalEarth's
 # examples/bouvet_nested_ocean_simulation.jl does it: `nested_ocean_model` with all its defaults, ERA5,
-# an ocean-only coupled model. Our domain, resolution, levels, bathymetry and two years; GLORYS MONTHLY.
+# an ocean-only coupled model, and the example's 40 z★ levels. Our domain, resolution, bathymetry and two
+# years; GLORYS MONTHLY; the time-step wizard of our runs.
 # No sea ice, no coastal freshwater, no penetrating shortwave, no extras: a reference for what the nest
 # does on its own.
 #
@@ -27,7 +28,10 @@ const DATA_DIR = "/storage/scratch1/1/vnguyen480/SOWinWaRP/data"
 
 arch = GPU()
 
-# ### Grid and bathymetry: 90-150E, 70-45S at 1/6ᵒ, B-SOSE i156's 52 static levels, ETOPO2022
+# ### Grid and bathymetry: 90-150E, 70-45S at 1/6ᵒ, the Bouvet example's 40 z★ levels, ETOPO2022
+#
+# The levels stretch exponentially from ~10 m at the surface (11 levels in the top 200 m) to ~510 m at
+# 5300 m; z★ lets the cells move with the free surface. Seafloor deeper than 5300 m is cut off there.
 
 λ₁, λ₂ = 90, 150
 φ₁, φ₂ = -70, -45
@@ -35,14 +39,9 @@ arch = GPU()
 Nx = 6 * (λ₂ - λ₁)
 Ny = 6 * (φ₂ - φ₁)
 
-Δz = [4.2, 5.0, 5.9, 6.9, 8.5, 9.5, 10.0, 10.0, 10.0, 10.0,
-      10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 13.0, 17.0, 20.0, 20.0,
-      20.0, 20.0, 20.0, 20.0, 22.0, 30.0, 38.0, 45.0, 50.0, 50.0,
-      53.0, 72.0, 100.0, 100.0, 100.0, 100.0, 100.0, 150.0, 200.0, 200.0,
-      200.0, 220.0, 300.0, 380.0, 400.0, 400.0, 400.0, 400.0, 400.0, 400.0,
-      400.0, 400.0]
-z = reverse(-vcat(0.0, cumsum(Δz)))
-Nz = length(Δz)
+Nz = 40
+depth = 5300meters
+z = ExponentialDiscretization(Nz, -depth, 0; scale = depth/4, mutable = true)
 
 underlying_grid = LatitudeLongitudeGrid(arch;
                                         size = (Nx, Ny, Nz),
@@ -78,18 +77,23 @@ era5 = (; dataset = ERA5YearlySingleLevel(), start_date = start_date - Hour(1), 
 atmosphere = ERA5PrescribedAtmosphere(arch; era5..., pressure = :mean_sea_level_pressure)
 radiation  = ERA5PrescribedRadiation(arch; era5...)
 
-Δt = 10minutes
-ocean = Simulation(nested; Δt)
+ocean = Simulation(nested; Δt = 1seconds)
 coupled_model = OceanOnlyModel(ocean; atmosphere, radiation)
-simulation = Simulation(coupled_model; Δt, stop_time = Dates.value(end_date - start_date) / 1000)
+simulation = Simulation(coupled_model; Δt = 1seconds, stop_time = Dates.value(end_date - start_date) / 1000)
+
+# The time-step wizard of our runs (the ice term dropped: there is no ice): from 1 s, at most 10% longer
+# each time, keeping the child's advective CFL at 0.6
+wizard = TimeStepWizard(cfl = 0.6, max_change = 1.1, min_Δt = 0.1,
+                        cell_advection_timescale = _ -> Oceananigans.Advection.cell_advection_timescale(child))
+simulation.callbacks[:wizard] = Callback(wizard, IterationInterval(10))
 
 wall_time = Ref(time_ns())
 
 function progress(sim)
     u, v, w = child.velocities
     T, S = child.tracers.T, child.tracers.S
-    @info @sprintf("time: %s, iter: %d, max|u|: (%.1e, %.1e, %.1e) m s⁻¹, T: (%.2f, %.2f) ᵒC, S: (%.2f, %.2f), wall time: %s",
-                   prettytime(sim), iteration(sim), maximum(abs, u), maximum(abs, v), maximum(abs, w),
+    @info @sprintf("time: %s, iter: %d, Δt: %s, max|u|: (%.1e, %.1e, %.1e) m s⁻¹, T: (%.2f, %.2f) ᵒC, S: (%.2f, %.2f), wall time: %s",
+                   prettytime(sim), iteration(sim), prettytime(sim.Δt), maximum(abs, u), maximum(abs, v), maximum(abs, w),
                    minimum(T), maximum(T), minimum(S), maximum(S), prettytime(1e-9 * (time_ns() - wall_time[])))
     wall_time[] = time_ns()
     return nothing
@@ -101,7 +105,8 @@ add_callback!(simulation, progress, TimeInterval(1days))
 
 outputs = (; u = child.velocities.u, v = child.velocities.v, T = child.tracers.T, S = child.tracers.S)
 attributes = Dict("run_name" => RUN_NAME, "start_date" => string(start_date), "end_date" => string(end_date),
-                  "dataset" => "GLORYS monthly", "setup" => "nested_glorys_mini.jl: nested_ocean_model defaults, ERA5, ocean only")
+                  "dataset" => "GLORYS monthly", "setup" => "nested_glorys_mini.jl: nested_ocean_model defaults, ERA5, ocean only",
+                  "vertical_coordinate" => "z-star, 40 exponential levels to 5300 m (the Bouvet example's)")
 
 ocean.output_writers[:surface] = NetCDFWriter(child, outputs;
                                               filename = "$(RUN_NAME)_surface.nc",

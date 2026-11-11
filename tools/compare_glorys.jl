@@ -11,8 +11,9 @@
 # WHAT IS COMPARED. GLORYS monthly means (cmems_mod_glo_phy_my_0.083deg_P1M-m, stamped on the 1st of the
 # month they average) against the run's daily output averaged over the same calendar month (the t = 0
 # snapshot and months with fewer than MIN_DAYS days left out).
-#     surface   the run's top cell (0-4.2 m) against GLORYS's levels to 5 m averaged over 0-4.2 m,
-#               thickness-weighted: the same layer, and the same files compare_glorys_bsose.jl downloads
+#     surface   the run's top cell (read off its levels: 0-4.2 m on B-SOSE's, ~0-10.4 m on the Bouvet
+#               example's) against GLORYS's levels averaged over that same layer, thickness-weighted (for
+#               4.2 m, the same files to 5 m that compare_glorys_bsose.jl downloads)
 #     midlon    the run's latitude-depth section (~120E) against GLORYS's points inside that column of
 #               cells, each of the run's levels taking the thickness-weighted mean of the GLORYS levels it
 #               overlaps
@@ -62,7 +63,6 @@ const SS_LIM, ST_LIM = parse(Float64, get(ENV, "SS_LIM", "0.2")), parse(Float64,
 const ZMAX = (s = get(ENV, "MIDLON_ZMAX", "1000"); s == "full" ? Inf : parse(Float64, s))
 const COAST_CELLS    = parse(Int, get(ENV, "COAST_CELLS", "2"))
 const COAST_SOUTH_OF = parse(Float64, get(ENV, "COAST_SOUTH_OF", "-60"))
-const TOP = 4.2   # m, the run's top cell (B-SOSE i156's first level)
 mkpath(OUTDIR); mkpath(GLORYS_DIR)
 
 f64(A) = Float64.(coalesce.(A, NaN))
@@ -98,6 +98,14 @@ else
     sect_times = Float64[]
 end
 
+# The run's top cell, which the surface file holds, and the GLORYS layer it is compared with: 4.2 m on
+# B-SOSE's levels (our runs), ~10.4 m on the Bouvet example's (nested_glorys_mini.jl)
+const TOP = HAVE_SECT ? zf[end] - zf[end - 1] : (@warn("no section file for the levels: taking the top cell as 4.2 m"); 4.2)
+# GLORYS levels down to SURFACE_Z: to 5 m for a 4.2 m top cell (the files compare_glorys_bsose.jl shares),
+# else a few metres past the cell, so its lowest GLORYS level is whole
+const SURFACE_Z = TOP <= 4.25 ? -5.0 : -ceil(TOP + 3)
+const TOP_LABEL = @sprintf("%.1f", TOP)
+
 function by_month(times)
     g = Dict{Tuple{Int,Int},Vector{Int}}()
     for (n, t) in enumerate(times)
@@ -120,7 +128,7 @@ label(k) = @sprintf("%d-%02d", k...)
 
 # ── GLORYS files, downloaded once ─────────────────────────────────────────────────────────────
 r2(x) = round(x, digits = 6)
-const SURFACE_REGION = BoundingBox(longitude = (r2(λW), r2(λE)), latitude = (r2(φS), r2(φN)), z = (-5.0, 0.0))
+const SURFACE_REGION = BoundingBox(longitude = (r2(λW), r2(λE)), latitude = (r2(φS), r2(φN)), z = (SURFACE_Z, 0.0))
 const COLUMN_REGION  = HAVE_SECT ? BoundingBox(longitude = (r2(λc[MID] - Δλ / 2), r2(λc[MID] + Δλ / 2)),
                                                latitude = (r2(φS), r2(φN))) : nothing
 glorys_meta(name, k, region) = Metadatum(name; dataset = GLORYSMonthly(), date = DateTime(k[1], k[2], 1),
@@ -272,7 +280,7 @@ mean_over(D, ms) = isempty(ms) ? fill(NaN, Nx, Ny) : sum(D[k] for k in ms) ./ le
 
 println("\n", "="^96)
 println("MONTHLY MEAN run minus GLORYS  ($RUN)")
-println("  surface: the run's top cell against GLORYS over 0-$(TOP) m. cos(lat)-weighted over cells wet in both.")
+println("  surface: the run's top cell against GLORYS over 0-$(TOP_LABEL) m. cos(lat)-weighted over cells wet in both.")
 println("  Positive ΔT: the run too WARM; positive ΔS: too SALTY.")
 println("="^96)
 println("\n  SURFACE, whole domain")
@@ -341,7 +349,7 @@ xticks_for(ms) = (n = length(ms); s = max(1, cld(n, 12)); (collect(1:s:n), [labe
 !isempty(surf_months) && for (D, v, unit, lim, key) in ((sΔS, "S", "g/kg", S_LIM, "S_LIM"), (sΔT, "T", "°C", T_LIM, "T_LIM"))
     nm = length(surf_months); ncol = min(nm, 6); nrow = cld(nm, ncol)
     fig = Figure(size = (260 * ncol + 120, 190 * nrow + 120))
-    Label(fig[0, 1:ncol], "$RUN — surface $v, monthly mean, run − GLORYS (0-$(TOP) m)", fontsize = 18, font = :bold)
+    Label(fig[0, 1:ncol], "$RUN — surface $v, monthly mean, run − GLORYS (0-$(TOP_LABEL) m)", fontsize = 18, font = :bold)
     local hm
     for (n, k) in enumerate(surf_months)
         r, c = fldmod1(n, ncol)
