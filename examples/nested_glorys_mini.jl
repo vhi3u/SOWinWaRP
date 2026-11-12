@@ -22,6 +22,7 @@ using NCDatasets
 using Dates
 using Printf
 using CUDA
+using Oceanostics.ProgressMessengers: TimedMessenger
 
 const RUN_NAME = "nested_glorys_mini"
 const DATA_DIR = "/storage/scratch1/1/vnguyen480/SOWinWaRP/data"
@@ -87,19 +88,19 @@ wizard = TimeStepWizard(cfl = 0.6, max_change = 1.1, min_Δt = 0.1,
                         cell_advection_timescale = _ -> Oceananigans.Advection.cell_advection_timescale(child))
 simulation.callbacks[:wizard] = Callback(wizard, IterationInterval(10))
 
-wall_time = Ref(time_ns())
-
-function progress(sim)
-    u, v, w = child.velocities
-    T, S = child.tracers.T, child.tracers.S
-    @info @sprintf("time: %s, iter: %d, Δt: %s, max|u|: (%.1e, %.1e, %.1e) m s⁻¹, T: (%.2f, %.2f) ᵒC, S: (%.2f, %.2f), wall time: %s",
-                   prettytime(sim), iteration(sim), prettytime(sim.Δt), maximum(abs, u), maximum(abs, v), maximum(abs, w),
-                   minimum(T), maximum(T), minimum(S), maximum(S), prettytime(1e-9 * (time_ns() - wall_time[])))
-    wall_time[] = time_ns()
-    return nothing
+# The progress line of our other runs (Oceanostics' TimedMessenger: iteration, time, Δt, wall time per step,
+# max |u|, advective CFL), daily. The messenger reads `sim.model`, which here is the coupled model, so it is
+# handed a view whose `model` is the child ocean.
+struct ChildView{S}
+    simulation :: S
 end
+Base.getproperty(view::ChildView, name::Symbol) =
+    name === :model ? child : getproperty(getfield(view, :simulation), name)
+Oceananigans.Simulations.iteration(view::ChildView) = iteration(getfield(view, :simulation))
+Base.time(view::ChildView) = time(getfield(view, :simulation))
 
-add_callback!(simulation, progress, TimeInterval(1days))
+progress = TimedMessenger()
+simulation.callbacks[:progress] = Callback(sim -> progress(ChildView(sim)), TimeInterval(1days))
 
 # ### Output: daily surface and mid-longitude section, as tools/compare_glorys.jl reads them
 
