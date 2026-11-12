@@ -13,6 +13,7 @@
 #     julia --project=. tools/compare_glorys.jl nested_glorys_mini
 
 using NumericalEarth
+using NumericalEarth.DataWrangling: bracketing_dates
 using NumericalEarth.DataWrangling.GLORYS: GLORYSMonthly
 using Oceananigans
 using Oceananigans.Units
@@ -66,7 +67,13 @@ start_date = DateTime(2014, 6, 1)
 end_date   = DateTime(2016, 6, 1, 12)
 dates = (start_date, end_date)
 
-nested = nested_ocean_model(grid, GLORYSMonthly(); dates, dir = joinpath(DATA_DIR, "glorys_monthly"))
+# Unlike the Bouvet example (15 days of daily records), every monthly record is held in memory, as in the
+# GLORYS baseline (27 for the two years, ~0.6 GB): with the default 2 the parent swaps records in from disk
+# as time moves on, and this run slowed from ~0.35 s to ~30 s a step within three days.
+parent_records = length(bracketing_dates(GLORYSMonthly(), :temperature, dates))
+
+nested = nested_ocean_model(grid, GLORYSMonthly(); dates, dir = joinpath(DATA_DIR, "glorys_monthly"),
+                            parent_time_indices_in_memory = parent_records)
 child = nested.child
 
 # ### Atmosphere and coupled model: ERA5 from our files (tools/download_era5_ncar.jl)
