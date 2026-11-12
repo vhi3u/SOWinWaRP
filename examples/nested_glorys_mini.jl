@@ -1,9 +1,9 @@
 # nested_glorys_mini.jl -- the SOWinWaRP box nested in GLORYS, as simply as NumericalEarth's
 # examples/bouvet_nested_ocean_simulation.jl does it: `nested_ocean_model` with all its defaults, ERA5,
-# an ocean-only coupled model, and the example's 40 z★ levels. Our domain, resolution, bathymetry and two
+# an ocean-only coupled model, and the example's 40 levels. Our domain, resolution, bathymetry and two
 # years; GLORYS MONTHLY; the time-step wizard of our runs.
 # No sea ice, no coastal freshwater, no penetrating shortwave, no extras: a reference for what the nest
-# does on its own.
+# does on its own. The levels are static (z), not the example's z★: with z★ this run slowed to minutes a step.
 #
 #     source .copernicus_env          # GLORYS files already downloaded by the GLORYS baseline are reused
 #     julia --project=. examples/nested_glorys_mini.jl
@@ -30,10 +30,11 @@ const DATA_DIR = "/storage/scratch1/1/vnguyen480/SOWinWaRP/data"
 
 arch = GPU()
 
-# ### Grid and bathymetry: 90-150E, 70-45S at 1/6ᵒ, the Bouvet example's 40 z★ levels, ETOPO2022
+# ### Grid and bathymetry: 90-150E, 70-45S at 1/6ᵒ, the Bouvet example's 40 levels (static), ETOPO2022
 #
 # The levels stretch exponentially from ~10 m at the surface (11 levels in the top 200 m) to ~510 m at
-# 5300 m; z★ lets the cells move with the free surface. Seafloor deeper than 5300 m is cut off there.
+# 5300 m. Static (mutable = false): with the example's z★ (mutable = true) the run slowed from ~1 s a step
+# on day 1 to ~2.4 minutes on day 4. Seafloor deeper than 5300 m is cut off there.
 
 λ₁, λ₂ = 90, 150
 φ₁, φ₂ = -70, -45
@@ -43,7 +44,7 @@ Ny = 6 * (φ₂ - φ₁)
 
 Nz = 40
 depth = 5300meters
-z = ExponentialDiscretization(Nz, -depth, 0; scale = depth/4, mutable = true)
+z = ExponentialDiscretization(Nz, -depth, 0; scale = depth/4, mutable = false)
 
 underlying_grid = LatitudeLongitudeGrid(arch;
                                         size = (Nx, Ny, Nz),
@@ -114,7 +115,7 @@ simulation.callbacks[:progress] = Callback(sim -> progress(ChildView(sim)), Time
 outputs = (; u = child.velocities.u, v = child.velocities.v, T = child.tracers.T, S = child.tracers.S)
 attributes = Dict("run_name" => RUN_NAME, "start_date" => string(start_date), "end_date" => string(end_date),
                   "dataset" => "GLORYS monthly", "setup" => "nested_glorys_mini.jl: nested_ocean_model defaults, ERA5, ocean only",
-                  "vertical_coordinate" => "z-star, 40 exponential levels to 5300 m (the Bouvet example's)")
+                  "vertical_coordinate" => "static z, 40 exponential levels to 5300 m (the Bouvet example's, without its z-star)")
 
 ocean.output_writers[:surface] = NetCDFWriter(child, outputs;
                                               filename = "$(RUN_NAME)_surface.nc",
