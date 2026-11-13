@@ -276,6 +276,38 @@ for (r, (name, _)) in enumerate(REGIONS), y in unique(first.(months))
             name, y, (y + 1) % 100, G, R, I, R - I, G - R, Date(eke_dates[ra]), Date(eke_dates[rb]))
 end
 
+# ── where in the column the summer fresh water goes ───────────────────────────────────────────
+# Per level, mid-November to mid-February: the region-mean salinity change, and the fresh water that level
+# gains (m), summed down from the surface. Fresh water put in at the surface (melt, icebergs, runoff) stays
+# in the summer mixed layer, the top few tens of metres; freshening spread to 100-150 m is water brought in
+# from elsewhere, or an assimilation increment.
+function level_mean(A, mask, n)
+    num = den = 0.0
+    for i in 1:Nx, j in 1:Ny
+        (mask[i, j] && both[i, j, n] && isfinite(A[i, j])) || continue
+        w = cosd(φc[j]); num += w * A[i, j]; den += w
+    end
+    return den == 0 ? NaN : num / den
+end
+println("\n  WHERE IN THE COLUMN, mid-November to mid-February: ΔS (g/kg) per level, and the fresh water gained")
+println("  from the surface down to that level (m), region means")
+for (name, m) in REGIONS, y in unique(first.(months))
+    a, b = DateTime(y, 11, 15), DateTime(y + 1, 2, 15)
+    (a >= g_dates[1] && b <= g_dates[end] && b <= eke_dates[end] + Day(16)) || continue
+    ga, gb = nearest(g_dates, a), nearest(g_dates, b)
+    ra, rb = nearest(eke_dates, a), nearest(eke_dates, b)
+    @printf("\n  %s, %d-%02d\n  %8s %7s | %8s %8s | %10s %10s\n", uppercase(name), y, (y + 1) % 100,
+            "depth", "Δz", "ΔS GLO", "ΔS run", "fresh GLO", "fresh run")
+    fg = fr = 0.0
+    for (n, k) in reverse(collect(enumerate(KS)))   # KS runs up from the deepest level: start at the top
+        dg = level_mean(gS[gb][:, :, n] .- gS[ga][:, :, n], m, n)
+        dr = level_mean(rS[rb][:, :, n] .- rS[ra][:, :, n], m, n)
+        fg += level_mean(weights[:, :, n] .* (gS[ga][:, :, n] .- gS[gb][:, :, n]) ./ gS[ga][:, :, n], m, n)
+        fr += level_mean(weights[:, :, n] .* (rS[ra][:, :, n] .- rS[rb][:, :, n]) ./ rS[ra][:, :, n], m, n)
+        @printf("  %6.1f m %5.1f m | %+8.3f %+8.3f | %+10.3f %+10.3f\n", -zc[k], zf[k + 1] - zf[k], dg, dr, fg, fr)
+    end
+end
+
 # ── plot ──────────────────────────────────────────────────────────────────────────────────────
 fig = Figure(size = (1100, 330 * length(REGIONS)))
 for (r, (name, m)) in enumerate(REGIONS)
