@@ -266,17 +266,16 @@ summers = [y for y in unique(first.(months)) if all(k -> k in months, ((y, 10), 
 if !isempty(summers)
     jj = findall(φ -> φ < -58, φc)
     fig = Figure(size = (1700, 280 * 2 * length(summers)))
-    hm = nothing
     for (s, y) in enumerate(summers)
         for (c, k) in enumerate(((y, 10), (y, 11), (y, 12), (y + 1, 1), (y + 1, 2), (y + 1, 3)))
             for (row, (A, who)) in enumerate(((gℵ, "GLORYS"), (rℵ, "run")))
                 ax = Axis(fig[2(s - 1) + row, c]; title = "$who $(label(k))", aspect = DataAspect(),
                           xticklabelsvisible = false, yticklabelsvisible = c == 1)
-                hm = heatmap!(ax, λc, φc[jj], A[k][:, jj]; colormap = :ice, colorrange = (0, 1), nan_color = :gray80)
+                heatmap!(ax, λc, φc[jj], A[k][:, jj]; colormap = :ice, colorrange = (0, 1), nan_color = :gray80)
             end
         end
     end
-    Colorbar(fig[:, 7], hm; label = "sea-ice concentration")
+    Colorbar(fig[:, 7]; colormap = :ice, colorrange = (0, 1), label = "sea-ice concentration")
     out = joinpath(OUTDIR, "$(RUN)_sea_ice_vs_glorys_summer.png")
     save(out, fig); @info "wrote $out"
 end
