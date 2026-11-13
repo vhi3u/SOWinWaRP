@@ -124,10 +124,10 @@ center(t) = start + Millisecond(round(Int, 1000t))
 eke_keep = findall(>(0), eke_times)
 eke_dates = [center(t - window / 2) for t in eke_times[eke_keep]]   # each 30-day window's centre
 first_month = (year(start), month(start))
-last_date = center(maximum(surf_times))
+run_end = center(maximum(surf_times))
 months = Tuple{Int,Int}[]
 let d = Date(first_month..., 1)
-    while Date(d) + Month(1) <= Date(last_date)
+    while Date(d) + Month(1) <= Date(run_end)
         push!(months, (year(d), month(d))); d += Month(1)
     end
 end
