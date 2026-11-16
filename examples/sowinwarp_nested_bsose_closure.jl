@@ -1,9 +1,9 @@
-# SOWinWaRP (90-150E, 70-45S, 1/6°) nested in B-SOSE, with B-SOSE's closure in place of CATKE.
+# SOWinWaRP (90-150E, 70-45S, 1/6°) nested in B-SOSE, with B-SOSE's closure: a TKE scheme under its constant backgrounds.
 #
 #     julia --project=. examples/sowinwarp_nested_bsose_closure.jl
 #
 # A fixed configuration: every setting is written below, nothing is read from the environment. Two years from
-# 2014-06-01T12:00 as 2Y_nested_bsose_conv_hj, on B-SOSE's own bathymetry and levels, with Hammond & Jones
+# 2014-06-01T12:00 as 2Y_nested_bsose_ggl_hj, on B-SOSE's own bathymetry and levels, with Hammond & Jones
 # (2016) Antarctic fresh water. Otherwise as examples/sowinwarp_nested.jl (fix9): open-boundary sea ice from
 # B-SOSE, ERA5, penetrating shortwave, no ice grounding. Writes the same NetCDF files, so every tool in tools/
 # reads it: <RUN_NAME>_{surface,midlon,free_surface,surface_fluxes,eke,sea_ice}.nc.
@@ -24,7 +24,8 @@ using Oceananigans.Diagnostics: NaNChecker
 using Oceananigans.ImmersedBoundaries: immersed_inactive_node
 using Oceananigans.BoundaryConditions: fill_halo_regions!
 using Oceananigans.OutputReaders: Clamp
-using Oceananigans.TurbulenceClosures: HorizontalScalarDiffusivity, ConvectiveAdjustmentVerticalDiffusivity
+using Oceananigans.TurbulenceClosures: HorizontalScalarDiffusivity, VerticalScalarDiffusivity
+using Oceananigans.TurbulenceClosures.TKEBasedVerticalDiffusivities: CATKEVerticalDiffusivity, CATKEMixingLength, CATKEEquation
 using Oceananigans.TimeSteppers: VerticallyImplicitTimeDiscretization
 using NCDatasets                    # loads Oceananigans' NetCDFWriter
 using Dates, Printf
@@ -35,7 +36,7 @@ include(joinpath(@__DIR__, "..", "src", "coastal_freshwater.jl"))   # coastal_fr
 # ## Run settings
 
 const SMOKE    = false      # true: 2 days, 6-hourly output
-const RUN_NAME = SMOKE ? "bsose_conv_smoke" : "2Y_nested_bsose_conv_hj"
+const RUN_NAME = SMOKE ? "bsose_ggl_smoke" : "2Y_nested_bsose_ggl_hj"
 const BDIR     = "/storage/scratch1/1/vnguyen480/SOWinWaRP/data"   # B-SOSE, its grid.nc, the 5-day ice, era5/
 const ARCH     = GPU()
 
@@ -159,11 +160,15 @@ grid = ImmersedBoundaryGrid(underlying_grid, PartialCellBottom(bottom_height; mi
 # before the first step. NumericalEarth's defaults for the open boundaries, the Flather barotropic exterior, the
 # bathymetry blend toward B-SOSE's seafloor and the 1/6-hour relaxation band.
 #
-# CLOSURE: B-SOSE's Table 1 constants alone (Verdy & Mazloff 2017: ν, κ = 10 m²/s horizontal; νz = 1e-3, κz = 1e-4
-# m²/s) with convective adjustment (1 m²/s where the column is statically unstable), no boundary-layer scheme.
-# B-SOSE itself runs these as backgrounds UNDER the GGL90 TKE scheme (Gaspar et al. 1990), which this leaves out.
-# Without it the wind's momentum stays in the 4.2 m top cell (Ekman depth √(2νz/f) ≈ 4 m): 2Y_nested_bsose_conv_hj
-# spun the surface up to 2-4.6 m/s over ~1,150 cells a day, against ~2 with CATKE. Not usable as physics.
+# CLOSURE: B-SOSE's, as Verdy & Mazloff (2017) describe it: the GGL90 mixed-layer scheme (Gaspar et al. 1990, a
+# one-equation TKE closure) over Table 1's constant backgrounds, ν, κ = 10 m²/s horizontal and νz = 1e-3, κz = 1e-4
+# m²/s vertical; no eddy parameterization. Oceananigans has no GGL90, so CATKE, the same kind of scheme, stands in,
+# built exactly as NumericalEarth's default_ocean_closure (Cᵇ = 0.01, Cᵂϵ = 1.0): against the CATKE runs, only the two
+# constant terms differ. (Those constants are the 1/3° B-SOSE's; i156 is 1/6° and may use others.) The vertical
+# background is implicit. κz = 1e-4 m²/s is ~10x the observed interior diffusivity: B-SOSE's adjoint corrects for
+# it, a free-running nest does not, so expect the thermocline to erode slowly.
+# The constants alone, without the TKE scheme (2Y_nested_bsose_conv_hj), left the wind's momentum in the 4.2 m top
+# cell (Ekman depth √(2νz/f) ≈ 4 m) and spun the surface up to 2-4.6 m/s.
 #
 # COASTAL FRESHWATER: Hammond & Jones (2016), the Antarctic ice-shelf melt, iceberg melt and runoff B-SOSE
 # prescribes (341 Gt/yr in the box, at most 2.7 m/yr), constant in time, as a virtual salt flux in the top cell
@@ -174,10 +179,11 @@ grid = ImmersedBoundaryGrid(underlying_grid, PartialCellBottom(bottom_height; mi
 dataset = BSOSEMonthly(dir = BDIR, iteration = 156)
 parent_records = length(bracketing_dates(dataset, :temperature, (start_date, end_date)))
 
-closure = (HorizontalScalarDiffusivity(ν = 10.0, κ = 10.0),
-           ConvectiveAdjustmentVerticalDiffusivity(VerticallyImplicitTimeDiscretization();
-                                                   convective_κz = 1.0, convective_νz = 1.0,
-                                                   background_κz = 1e-4, background_νz = 1e-3))
+closure = (CATKEVerticalDiffusivity(VerticallyImplicitTimeDiscretization(), Float64;
+                                    mixing_length = CATKEMixingLength(Cᵇ = 0.01),
+                                    turbulent_kinetic_energy_equation = CATKEEquation(Cᵂϵ = 1.0)),
+           HorizontalScalarDiffusivity(ν = 10.0, κ = 10.0),
+           VerticalScalarDiffusivity(VerticallyImplicitTimeDiscretization(); ν = 1e-3, κ = 1e-4))
 
 coastal_freshwater = coastal_freshwater_forcing("coastal_freshwater_hj.nc", bottom_height;
                                                 λ₁, φ₁, scaling = SCALING, arch = ARCH)
@@ -433,7 +439,7 @@ output_metadata = Dict("run_name" => RUN_NAME, "start_date" => string(start_date
                 "sea_ice" => "ClimaSeaIce, IncrementalRemapping, free-slip coasts, started from B-SOSE SIarea/SIheff, " *
                              "open sides take B-SOSE 5-day ice (nested_sea_ice_simulation open boundaries)",
                 "coastal_freshwater" => "constant, from coastal_freshwater_hj.nc (Hammond & Jones 2016)",
-                "closure" => "bsose_conv: Laplacian 10 m2/s horizontal, nu_z 1e-3 / kappa_z 1e-4, convective adjustment 1 m2/s, no CATKE",
+                "closure" => "CATKE (NumericalEarth default, for GGL90) + Laplacian 10 m2/s horizontal + nu_z 1e-3 / kappa_z 1e-4 vertical (B-SOSE Table 1)",
                 "ice_grounding" => "off (basal_stress = nothing)",
                 "bathymetry" => "B-SOSE i156 Depth (grid.nc), area-aggregated",
                 "penetrating_shortwave" => "yes: TwoColorRadiation fed by the coupler",
