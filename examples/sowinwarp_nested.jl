@@ -106,7 +106,10 @@ const BDIR  = get(ENV, "BSOSE_DIR", default_bsose_directory())
 # submission ran without its freshwater that way. The values are logged at startup and stamped on
 # every output file.
 const COASTAL_FRESHWATER      = true                            # B-SOSE's coastal freshwater; see "coastal freshwater"
-const COASTAL_FRESHWATER_FILE = "coastal_freshwater_bsose.nc"   # tools/coastal_freshwater.jl; or "coastal_freshwater_hj.nc" (tools/hammond_jones_freshwater.jl)
+const COASTAL_FRESHWATER_FILE = @isdefined(ARM_COASTAL_FRESHWATER_FILE) ? ARM_COASTAL_FRESHWATER_FILE :
+                                "coastal_freshwater_bsose.nc"   # tools/coastal_freshwater.jl; or "coastal_freshwater_hj.nc" (tools/hammond_jones_freshwater.jl)
+const CLOSURE                 = @isdefined(ARM_CLOSURE) ? ARM_CLOSURE :
+                                "default" # "default": NumericalEarth's CATKE; "bsose_conv": B-SOSE's backgrounds + convective adjustment. See "closure"
 const ICE_INIT                = "bsose"   # "bsose": start from B-SOSE's ice; "none": ice-free (up to fix3)
 const ICE_BOUNDARY            = "open"    # "open": B-SOSE ice through open boundaries (nested_sea_ice_simulation, from fix9);
                                           # "bsose": relax the open-side bands to B-SOSE's ice (fix4-fix8); "delete" (up to fix3)
@@ -120,13 +123,14 @@ ICE_BOUNDARY in ("open", "bsose", "delete") || error("ICE_BOUNDARY must be \"ope
 ICE_BOUNDARY == "open" && ICE_INIT != "bsose" &&
     error("ICE_BOUNDARY = \"open\" starts the ice from B-SOSE's (nested_sea_ice_simulation does): set ICE_INIT = \"bsose\"")
 BATHYMETRY in ("bsose", "etopo") || error("BATHYMETRY must be \"bsose\" or \"etopo\", got $BATHYMETRY")
+CLOSURE in ("default", "bsose_conv") || error("CLOSURE must be \"default\" or \"bsose_conv\", got $CLOSURE")
 for name in ("COASTAL_FRESHWATER", "COASTAL_FRESHWATER_FILE", "ICE_INIT", "ICE_BOUNDARY", "ICE_RELAXATION_HOURS",
-             "PENETRATING_SHORTWAVE", "ICE_GROUNDING", "BATHYMETRY")
+             "PENETRATING_SHORTWAVE", "ICE_GROUNDING", "BATHYMETRY", "CLOSURE")
     haskey(ENV, name) && @warn "$name is set in the environment, which this script no longer reads: set it in the switches block of examples/sowinwarp_nested.jl"
 end
 @info "switches: COASTAL_FRESHWATER = $COASTAL_FRESHWATER ($COASTAL_FRESHWATER_FILE), ICE_INIT = $ICE_INIT, " *
       "ICE_BOUNDARY = $ICE_BOUNDARY, ICE_RELAXATION_HOURS = $ICE_RELAXATION_HOURS, " *
-      "PENETRATING_SHORTWAVE = $PENETRATING_SHORTWAVE, ICE_GROUNDING = $ICE_GROUNDING, BATHYMETRY = $BATHYMETRY"
+      "PENETRATING_SHORTWAVE = $PENETRATING_SHORTWAVE, ICE_GROUNDING = $ICE_GROUNDING, BATHYMETRY = $BATHYMETRY, CLOSURE = $CLOSURE"
 
 # ── penetrating shortwave (PENETRATING_SHORTWAVE, in the switches) ────────────────────────────
 # The coupler finds the ocean's TwoColorRadiation with `get_radiative_forcing(ocean)`
@@ -169,8 +173,10 @@ const Nz = length(z) - 1
 # `all_dates` by exact match and crashes on `nothing` when it is not there. Workaround until
 # that is fixed upstream on ss/nested-ocean-model.
 start_date = DateTime(2014, 6, 1, 12)
-end_date   = SMOKE ? DateTime(2014, 6, 3) : DateTime(get(ENV, "END_DATE", "2014-08-01T00:00"))
+end_date   = SMOKE ? DateTime(2014, 6, 3) :
+             DateTime(get(ENV, "END_DATE", @isdefined(ARM_END_DATE) ? ARM_END_DATE : "2014-08-01T00:00"))
 const RUN_NAME = get(ENV, "RUN_NAME", SMOKE ? "nested_smoke" :
+                     @isdefined(ARM_RUN_NAME) ? ARM_RUN_NAME :
                      "nested_" * Dates.format(start_date, "yyyymmdd") * "_" * Dates.format(end_date, "yyyymmdd"))
 
 @info "SOWinWaRP nested: $(Nx)x$(Ny)x$(Nz) over $(λ₁)-$(λ₂)E, $(φ₁)-$(φ₂)S, $start_date to $end_date"
@@ -333,13 +339,35 @@ parent_records = length(NumericalEarth.DataWrangling.bracketing_dates(dataset, :
 # Raw oceFWflx is NOT used: it holds B-SOSE's own sea-ice freezing and melting, which our ice model does.
 include(joinpath(@__DIR__, "..", "src", "coastal_freshwater.jl"))
 
+# ── closure (CLOSURE, in the switches) ───────────────────────────────────────────────────────
+# "default" passes nothing: the nest builds NumericalEarth's default_ocean_closure (CATKE).
+# "bsose_conv" is the testbed's stand-in for B-SOSE's (src/model_testbed.jl): MITgcm runs B-SOSE with KPP,
+# which Oceananigans does not have, over Laplacian horizontal mixing and constant vertical backgrounds.
+# Here: those backgrounds (ν, κ = 10 m²/s horizontal; νz = 1e-3, κz = 1e-4 m²/s) and convective adjustment
+# (1 m²/s where the column is statically unstable), no CATKE. It brackets KPP rather than reproducing it: no
+# bulk Richardson number, no non-local flux, no wind-driven entrainment, so the wind deepens the mixed layer
+# only through resolved shear. The vertical parts are implicit in time.
+const BSOSE_NU_H, BSOSE_KAPPA_H = 10.0, 10.0
+const BSOSE_NU_Z, BSOSE_KAPPA_Z = 1e-3, 1e-4
+const BSOSE_CONV_KZ, BSOSE_CONV_NZ = 1.0, 1.0
+const CLOSURE_KW = CLOSURE == "default" ? NamedTuple() :
+    (; closure = (Oceananigans.TurbulenceClosures.HorizontalScalarDiffusivity(ν = BSOSE_NU_H, κ = BSOSE_KAPPA_H),
+                  Oceananigans.TurbulenceClosures.ConvectiveAdjustmentVerticalDiffusivity(
+                      Oceananigans.TimeSteppers.VerticallyImplicitTimeDiscretization();
+                      convective_κz = BSOSE_CONV_KZ, convective_νz = BSOSE_CONV_NZ,
+                      background_κz = BSOSE_KAPPA_Z, background_νz = BSOSE_NU_Z)))
+@info "closure: $CLOSURE" * (CLOSURE == "default" ? " (NumericalEarth's CATKE)" :
+      @sprintf(" (no CATKE: ν, κ = %g, %g m²/s horizontal; νz, κz = %g, %g m²/s; convective %g m²/s)",
+               BSOSE_NU_H, BSOSE_KAPPA_H, BSOSE_NU_Z, BSOSE_KAPPA_Z, BSOSE_CONV_KZ))
+
 ocean = nested_ocean_simulation(grid, dataset;
                                 dates = (start_date, end_date),
                                 dir = BDIR,
                                 parent_time_indices_in_memory = parent_records,
                                 forcing = COASTAL_FRESHWATER ?
                                     coastal_freshwater_forcing(COASTAL_FRESHWATER_FILE, bottom_height;
-                                                               λ₁, φ₁, scaling = SCALING, arch = ARCH) : NamedTuple())
+                                                               λ₁, φ₁, scaling = SCALING, arch = ARCH) : NamedTuple(),
+                                CLOSURE_KW...)
 
 child = ocean.model.child
 
@@ -826,6 +854,8 @@ output_metadata = Dict("run_name" => RUN_NAME,
                   ICE_BOUNDARY == "bsose" ? "open-side bands relaxed to B-SOSE ice on $(ICE_RELAXATION / hours) h" :
                                             "open-side bands ice deleted"),
     "coastal_freshwater" => COASTAL_FRESHWATER ? "constant, from $(COASTAL_FRESHWATER_FILE)" : "none",
+    "closure" => CLOSURE == "default" ? "NumericalEarth default_ocean_closure (CATKE)" :
+                 "bsose_conv: Laplacian 10 m2/s horizontal, nu_z 1e-3 / kappa_z 1e-4, convective adjustment 1 m2/s, no CATKE",
     "ice_grounding" => ICE_GROUNDING ? "LandfastBasalStress (NumericalEarth default)" : "off (basal_stress = nothing)",
     "bathymetry" => BATHYMETRY == "bsose" ? "B-SOSE i156 Depth (grid.nc), area-aggregated" : "ETOPO2022",
     "penetrating_shortwave" => PENETRATING_SHORTWAVE ? "yes: TwoColorRadiation fed by the coupler" :
