@@ -384,16 +384,16 @@ simulation.callbacks[:ice_volume] = Callback(check_ice_volume, IterationInterval
 wet_top = Array(child.grid.immersed_boundary.bottom_height[1:Nx, 1:Ny, 1]) .< 0
 centred(A) = (A = size(A, 1) == Nx + 1 ? 0.5 .* (A[1:end-1, :] .+ A[2:end, :]) : A;
               size(A, 2) == Ny + 1 ? 0.5 .* (A[:, 1:end-1] .+ A[:, 2:end]) : A)
-top(f) = Array(view(interior(f), :, :, size(interior(f), 3)))
+top_level(f) = Array(view(interior(f), :, :, size(interior(f), 3)))
 place(I) = @sprintf("%.1fE %.1fS", λ₁ + (I[1] - 0.5) / SCALING, -(φ₁ + (I[2] - 0.5) / SCALING))
 wet_extrema(A) = extrema(A[wet_top])
 
 wall_time = Ref(time_ns())
 function progress(sim)
-    S, T = top(child.tracers.S), top(child.tracers.T)
-    sₒ = ifelse.(wet_top, hypot.(centred(top(child.velocities.u)), centred(top(child.velocities.v))), 0.0)
-    sᵢ = ifelse.(wet_top, hypot.(centred(top(sea_ice.model.velocities.u)), centred(top(sea_ice.model.velocities.v))), 0.0)
-    hℵ = ifelse.(wet_top, top(sea_ice.model.ice_thickness) .* top(sea_ice.model.ice_concentration), 0.0)
+    S, T = top_level(child.tracers.S), top_level(child.tracers.T)
+    sₒ = ifelse.(wet_top, hypot.(centred(top_level(child.velocities.u)), centred(top_level(child.velocities.v))), 0.0)
+    sᵢ = ifelse.(wet_top, hypot.(centred(top_level(sea_ice.model.velocities.u)), centred(top_level(sea_ice.model.velocities.v))), 0.0)
+    hℵ = ifelse.(wet_top, top_level(sea_ice.model.ice_thickness) .* top_level(sea_ice.model.ice_concentration), 0.0)
     Iₒ, Iᵢ, Iₕ = argmax(sₒ), argmax(sᵢ), argmax(hℵ)
     @info @sprintf("day %.1f, iter %d, Δt %.1f min | surface S (%.2f, %.2f), T (%.2f, %.2f) | ocean %.2f m/s at %s, max |w| %.1e, CFL %.2f | ice %.2f m/s at %s, CFL %.2f | max h·ℵ %.2f m at %s | wall %s",
                    time(sim) / 86400, iteration(sim), sim.Δt / 60, wet_extrema(S)..., wet_extrema(T)...,
