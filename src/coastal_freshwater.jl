@@ -17,7 +17,8 @@
 # row at ~58 m/yr, the kind of hotspot the residual field has. Any other file (the B-SOSE residual,
 # whose land cells hold copies of their nearest ocean value) has its land cells zeroed, as up to fix9.
 #
-# Needs Oceananigans, NCDatasets and Printf loaded by the script.
+# Needs Oceananigans, NCDatasets and Printf loaded by the script. Oceananigans names are qualified: not all
+# are exported (on_architecture is not), and sowinwarp_glorys_baseline.jl does not load setup_bsose.jl.
 
 const COASTAL_ρ₀ = 1026.0
 
@@ -43,7 +44,7 @@ function coastal_freshwater_forcing(file, bottom_height; λ₁, φ₁, scaling, 
     attributes = Dict(ds.attrib)
     close(ds)
 
-    wet = Array(interior(bottom_height))[:, :, 1] .< 0
+    wet = Array(Oceananigans.Fields.interior(bottom_height))[:, :, 1] .< 0
     Nx, Ny = size(wet)
     λc = λ₁ .+ ((1:Nx) .- 0.5) ./ scaling
     φc = φ₁ .+ ((1:Ny) .- 0.5) ./ scaling
@@ -83,6 +84,6 @@ function coastal_freshwater_forcing(file, bottom_height; λ₁, φ₁, scaling, 
     get(attributes, "era5_precipitation_subtracted", "true") == "true" ||
         @warn "$file was made without ERA5 precipitation subtracted"
 
-    return (; S = Forcing(coastal_freshwater_dilution; discrete_form = true,
-                          parameters = (; F = on_architecture(arch, G), ρ₀ = COASTAL_ρ₀)))
+    return (; S = Oceananigans.Forcings.Forcing(coastal_freshwater_dilution; discrete_form = true,
+                          parameters = (; F = Oceananigans.Architectures.on_architecture(arch, G), ρ₀ = COASTAL_ρ₀)))
 end
