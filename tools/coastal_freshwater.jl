@@ -63,6 +63,19 @@
 #     FIELD_FILE   the field for the model            (default coastal_freshwater_bsose.nc; "" to skip)
 #     REF_KM       offshore reference band, km        (default "300,600")
 #     DIST_MAX     outer edge of the field, km        (default 300)
+#     HOT          a hotspot's time-mean residual, m/yr (default 10)
+#
+# THE HOTSPOTS. The residual reaches ~44 m/yr in a few coastal cells (96-97E and 103E, ~65.1S) where
+# Hammond & Jones, which B-SOSE is said to prescribe, never exceeds 2.7 m/yr. Three explanations,
+# told apart by how the residual moves through the year in those cells:
+#   prescribed melt, more concentrated than the published field: B-SOSE's is constant in time, so
+#                     the residual is FLAT;
+#   the ice term:     these are polynya cells, freezing tens of m/yr, and one S_ICE is fitted over
+#                     the whole domain; a wrong one leaves part of the ice's cycle behind, so the
+#                     residual FOLLOWS the ice (large in winter) and moves a lot with S_ICE;
+#   B-SOSE's adjoint adjustments to its forcing (precipitation among them), fitted to data: neither.
+# Printed for the cells whose time-mean residual is above HOT, month by month, with the S_ICE
+# sensitivity; plotted in OUTDIR/coastal_freshwater_hotspots.png.
 # ==============================================================================
 
 using NCDatasets, CairoMakie, Dates, Printf, Statistics
@@ -85,6 +98,7 @@ const OUTDIR     = get(ENV, "OUTDIR", "plots")
 const FIELD_FILE = get(ENV, "FIELD_FILE", "coastal_freshwater_bsose.nc")
 const REF_KM     = Tuple(parse.(Float64, split(get(ENV, "REF_KM", "300,600"), ",")))
 const DIST_MAX   = parse(Float64, get(ENV, "DIST_MAX", "300"))
+const HOT        = parse(Float64, get(ENV, "HOT", "10"))
 
 # The nest's grid (examples/sowinwarp_nested.jl): the field is written on it, and the nested
 # script checks the coordinates match before using it.
@@ -207,6 +221,7 @@ nb, nm = length(BANDS), length(months)
 FWb, ICEb, Pb, RESb = (fill(NaN, nb, nm) for _ in 1:4)
 REFb = fill(NaN, nm)                       # the residual over the offshore reference band, monthly
 RES_sum = zeros(length(λB), length(φB)); RES_time = zeros(length(λB), length(φB))
+FWm, ICEm, Pm = (fill(NaN, length(λB), length(φB), nm) for _ in 1:3)   # every cell, every month (the hotspots)
 println("B-SOSE: $(length(iB)) x $(length(jB)) cells over $(LON[1])-$(LON[2])E, $(-LAT[2])-$(-LAT[1])S; " *
         "S_ICE = $S_ICE g/kg; $(nm) months from $(Dates.format(first(months), "yyyy-mm"))")
 for (n, m) in enumerate(months)
@@ -217,6 +232,7 @@ for (n, m) in enumerate(months)
     for A in (FW, ICE, P, RES)
         A[.!wetB] .= NaN
     end
+    FWm[:, :, n] .= FW; ICEm[:, :, n] .= ICE; Pm[:, :, n] .= P
     REFb[n] = band_mean(RES, distB, areaB, REF_KM)
     for (b, band) in enumerate(BANDS)
         FWb[b, n], ICEb[b, n] = band_mean(FW, distB, areaB, band), band_mean(ICE, distB, areaB, band)
@@ -264,6 +280,59 @@ let w = [month_seconds(m) for m in months]
             @printf(" %12.2f", to_m_per_year(avg(FWb[b, :]) - avg(ICEb[b, :]) * S_ICE / s_ice - avg(Pb[b, :])))
         end
         println()
+    end
+end
+
+# ── the hotspots: flat (prescribed), following the ice (S_ICE), or neither ────────────────────
+let R = RES_sum ./ RES_time, w = [month_seconds(m) for m in months]
+    hot = wetB .& isfinite.(R) .& (to_m_per_year.(R) .> HOT)
+    if !any(hot)
+        println("\nNo cell has a time-mean residual above $HOT m/yr")
+    else
+        cells = findall(hot)
+        area_mean(A, n) = sum(A[I, n] * areaB[I] for I in cells) / sum(areaB[I] for I in cells)
+        fw, ice, p = ([to_m_per_year(area_mean(A, n)) for n in 1:nm] for A in (FWm, ICEm, Pm))
+        res = fw .- ice .- p
+        avg(x) = sum(x .* w) / sum(w)
+        println()
+        println("="^104)
+        @printf("THE HOTSPOTS: %d B-SOSE cells with a time-mean residual above %.0f m/yr (%.0f Gt/yr), area-weighted\n",
+                length(cells), HOT, sum(R[I] * areaB[I] for I in cells) * YEAR_SECONDS / 1e12)
+        println("  where: ", join([@sprintf("%.2fE %.2fS (%.0f)", λB[I[1]], -φB[I[2]], to_m_per_year(R[I]))
+                               for I in cells[sortperm(R[cells]; rev = true)][1:min(8, length(cells))]], "; "),
+                length(cells) > 8 ? "; ..." : "")
+        println("  m/yr      oceFWflx        ice          P   residual")
+        for n in 1:nm
+            @printf("  %s %10.1f %10.1f %10.1f %10.1f\n", Dates.format(months[n], "yyyy-mm"), fw[n], ice[n], p[n], res[n])
+        end
+        @printf("  mean    %10.1f %10.1f %10.1f %10.1f\n", avg(fw), avg(ice), avg(p), avg(res))
+        # how the residual moves with the ice, month to month
+        r̄, ī = avg(res), avg(ice)
+        cov = avg((res .- r̄) .* (ice .- ī)); sr = sqrt(avg((res .- r̄) .^ 2)); si = sqrt(avg((ice .- ī) .^ 2))
+        @printf("\n  residual: mean %.1f, monthly std %.1f m/yr (%.0f%% of the mean); correlation with the ice term %+.2f\n",
+                r̄, sr, 100 * sr / abs(r̄), cov / (sr * si))
+        @printf("  ice term: mean %.1f, monthly std %.1f m/yr\n", ī, si)
+        println("  time-mean residual against S_ICE (g/kg):")
+        for s_ice in (3.0, 3.5, S_ICE, 5.0, 6.0)
+            @printf("    %4.1f  %8.1f m/yr\n", s_ice, avg(fw .- ice .* S_ICE ./ s_ice .- p))
+        end
+        println("  READING: flat (std well under the mean) and insensitive to S_ICE: a prescribed field.")
+        println("           Large in winter, correlated with the ice, and moving a lot with S_ICE: the ice term.")
+        println("           Neither: B-SOSE's own adjustments to its forcing.")
+
+        fig = Figure(size = (1100, 450))
+        ax = Axis(fig[1, 1]; ylabel = "m/yr of fresh water (+ into the ocean)",
+                  title = @sprintf("B-SOSE's %d hotspot cells (time-mean residual > %.0f m/yr)", length(cells), HOT),
+                  xticks = (1:nm, Dates.format.(months, "yy-mm")), xticklabelrotation = π / 3)
+        for (y, label, c) in ((fw, "oceFWflx", :black), (ice, "ice = SFLUX/S_ICE", :steelblue),
+                              (p, "ERA5 P", :seagreen), (res, "residual", :firebrick))
+            lines!(ax, 1:nm, y; label, color = c, linewidth = 2)
+        end
+        hlines!(ax, [0]; color = :gray, linestyle = :dash)
+        axislegend(ax; position = :lb)
+        mkpath(OUTDIR)
+        save(joinpath(OUTDIR, "coastal_freshwater_hotspots.png"), fig)
+        @info "wrote $(joinpath(OUTDIR, "coastal_freshwater_hotspots.png"))"
     end
 end
 
