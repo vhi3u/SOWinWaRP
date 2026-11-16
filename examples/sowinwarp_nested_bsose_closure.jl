@@ -29,23 +29,22 @@ include(joinpath(@__DIR__, "..", "src", "coastal_freshwater.jl"))   # coastal_fr
 
 # ## Run settings
 
-const SMOKE    = false      # true: 2 days, 6-hourly output, a checkpoint every day
-const PICKUP   = false      # true: continue RUN_NAME from its latest checkpoint
+const SMOKE    = false      # true: 2 days, 6-hourly output
 const RUN_NAME = SMOKE ? "bsose_conv_smoke" : "2Y_nested_bsose_conv_hj"
 const BDIR     = "/storage/scratch1/1/vnguyen480/SOWinWaRP/data"   # B-SOSE, its grid.nc, the 5-day ice, era5/
 const ARCH     = GPU()
 
 start_date = DateTime(2014, 6, 1, 12)      # a native B-SOSE stamp: the nest looks the initial state up by exact date
 end_date   = SMOKE ? DateTime(2014, 6, 3, 12) : DateTime(2016, 6, 1, 12)
-Δt = 10minutes              # fixed; NumericalEarth's own estimate for 1/6°. See "Simulation"
+const Δt_max = 30minutes     # the longest step the wizard may take; sets the barotropic substeps. See "Ocean"
+const CFL    = 0.8          # the wizard's horizontal Courant number, ocean and ice
 output_interval = SMOKE ? 6hours : 1days
-checkpoint_interval = SMOKE ? 1days : 365days
 
-for name in ("RUN_NAME", "END_DATE", "SMOKE", "PICKUP", "ARCH", "BSOSE_DIR", "ERA5_DIR", "CHECKPOINT_DAYS")
+for name in ("RUN_NAME", "END_DATE", "SMOKE", "PICKUP", "ARCH", "BSOSE_DIR", "ERA5_DIR")
     haskey(ENV, name) && @warn "$name = $(ENV[name]) is set in the environment; this script ignores it"
 end
 ARCH isa GPU && !CUDA.functional() && error("CUDA is not functional on this node. Check the GPU allocation.")
-@info "$RUN_NAME: $start_date to $end_date, PICKUP = $PICKUP"
+@info "$RUN_NAME: $start_date to $end_date"
 
 # ## Grid
 #
@@ -142,12 +141,13 @@ grid = ImmersedBoundaryGrid(underlying_grid, PartialCellBottom(bottom_height; mi
 
 # ## Ocean, nested in B-SOSE
 #
-# TIME STEPPING, as PanArcticShenanigans' panarctic.jl: a fixed Δt, and the split-explicit free surface given that
-# Δt (`fixed_Δt`) so its number of barotropic substeps is set once. NumericalEarth's default sets only `cfl`, and
-# with the time-step wizard changing Δt the substep count changed with it; each new count compiles a new
-# unrolled substep loop, the likely cause of our runs' slow first ~10 days (3-12 s a step, then ~0.1 s).
-# Advection is NumericalEarth's default, already panarctic.jl's: WENO, vertically implicit where the vertical
-# Courant number passes 0.5 (AdaptiveVerticallyImplicitDiscretization), so only the horizontal CFL limits Δt.
+# BAROTROPIC SUBSTEPS, fixed once, as PanArcticShenanigans' panarctic.jl does: the split-explicit free surface is
+# given `fixed_Δt = Δt_max`, so its substep count N is the one Δt_max needs. Each substep is 2Δt/N, shorter when Δt
+# is, so any Δt up to Δt_max is stable and the wizard can still vary Δt below it. NumericalEarth's default sets
+# only `cfl`, and then the count changed with every new Δt; each new count compiles a new unrolled substep loop,
+# the likely cause of our runs' slow first ~10 days (3-12 s a step, then ~0.1 s).
+# Advection is NumericalEarth's default, as panarctic.jl's: WENO, vertically implicit where the vertical Courant
+# number passes 0.5 (AdaptiveVerticallyImplicitDiscretization), so only the horizontal Courant number limits Δt.
 #
 # nested_ocean_simulation reads B-SOSE monthly T, S, u and v on strips along the open sides (W, E, N; the south
 # is Antarctica) and starts the ocean from B-SOSE on start_date. Every parent record is held in memory, loaded
@@ -183,8 +183,8 @@ ocean = nested_ocean_simulation(grid, dataset;
                                 parent_time_indices_in_memory = parent_records,
                                 forcing = coastal_freshwater,
                                 closure,
-                                Δt,
-                                free_surface = SplitExplicitFreeSurface(grid; cfl = 0.7, fixed_Δt = Δt))
+                                Δt = 1minutes,
+                                free_surface = SplitExplicitFreeSurface(grid; cfl = 0.7, fixed_Δt = Δt_max))
 
 child = ocean.model.child   # the regional ocean; ocean.model also holds the B-SOSE parent
 
@@ -345,28 +345,27 @@ end
 
 # ## Simulation
 #
-# Fixed Δt, so nothing adapts if the flow speeds up: the run stops instead when the horizontal Courant number of
-# the ocean or the ice passes 1, measured conservatively as the fastest u and v over the smallest cell anywhere.
-# The ice matters most: incremental remapping needs an ice Courant number below one, and 2Y_nested_seaice_full's
-# ice outran its Δt and grew to 10⁶ m. A NaN anywhere stops the run, and so does ice volume h·ℵ above 50 m.
+# From 1 minute, the wizard lengthens Δt by at most 10% every 10 iterations, up to Δt_max, holding the HORIZONTAL
+# Courant number at CFL for the faster of the ocean and the ice. Horizontal only: Oceananigans' own timescale adds
+# w/Δz, which limited our earlier runs' Δt although vertical advection is implicit where it matters (w is passed as
+# a ZeroField). The ocean's is per cell; the ice's is conservative, its fastest u and v over the smallest cell
+# (incremental remapping needs an ice Courant number below one; 2Y_nested_seaice_full's ice outran Δt and grew to
+# 10⁶ m). A NaN anywhere stops the run, and so does ice volume h·ℵ above 50 m.
 
-simulation = Simulation(coupled_model; Δt, stop_time = Dates.value(end_date - start_date) / 1000)
+simulation = Simulation(coupled_model; Δt = 1minutes, stop_time = Dates.value(end_date - start_date) / 1000)
 
 Δx_min = minimum_xspacing(child.grid.underlying_grid)
 Δy_min = minimum_yspacing(child.grid.underlying_grid)
-horizontal_cfl(u, v) = Δt * (maximum(abs, u) / Δx_min + maximum(abs, v) / Δy_min)
-ocean_cfl() = horizontal_cfl(child.velocities.u, child.velocities.v)
-ice_cfl()   = horizontal_cfl(sea_ice.model.velocities.u, sea_ice.model.velocities.v)
-@info @sprintf("Δt = %.0f min; at 1 m/s the horizontal Courant number is %.2f on the smallest cell (%.1f x %.1f km)",
-               Δt / 60, Δt * (1 / Δx_min + 1 / Δy_min), Δx_min / 1e3, Δy_min / 1e3)
-
-function check_cfl(sim)
-    c, cᵢ = ocean_cfl(), ice_cfl()
-    max(c, cᵢ) > 1 && error(@sprintf("horizontal Courant number %.2f (ocean), %.2f (ice) on day %.2f with Δt = %.0f min: lower Δt",
-                                     c, cᵢ, time(sim) / 86400, Δt / 60))
-    return nothing
+ocean_timescale() = Oceananigans.Advection.cell_advection_timescale(child.grid,
+                        (child.velocities.u, child.velocities.v, Oceananigans.Fields.ZeroField()))
+function ice_timescale()
+    uᵢ, vᵢ = sea_ice.model.velocities
+    inverse = maximum(abs, uᵢ) / Δx_min + maximum(abs, vᵢ) / Δy_min
+    return inverse > 0 ? 1 / inverse : Inf
 end
-simulation.callbacks[:cfl] = Callback(check_cfl, IterationInterval(10))
+wizard = TimeStepWizard(; cfl = CFL, max_change = 1.1, max_Δt = Δt_max, min_Δt = 1,
+                        cell_advection_timescale = _ -> min(ocean_timescale(), ice_timescale()))
+simulation.callbacks[:wizard] = Callback(wizard, IterationInterval(10))
 
 simulation.callbacks[:nan_checker] =
     Callback(NaNChecker(fields = merge(child.velocities, child.tracers,
@@ -386,10 +385,10 @@ function progress(sim)
     u, v, w = child.velocities
     uᵢ, vᵢ = sea_ice.model.velocities
     hℵ = interior(sea_ice.model.ice_thickness) .* interior(sea_ice.model.ice_concentration)
-    @info @sprintf("day %.1f, iter %d | surface S (%.2f, %.2f), T (%.2f, %.2f) | max |u| %.2f, |v| %.2f, |w| %.1e m/s, CFL %.2f | ice max |u| %.2f, |v| %.2f m/s, CFL %.2f, max h·ℵ %.2f m | wall %s",
-                   time(sim) / 86400, iteration(sim), extrema(S)..., extrema(T)...,
-                   maximum(abs, u), maximum(abs, v), maximum(abs, w), ocean_cfl(),
-                   maximum(abs, uᵢ), maximum(abs, vᵢ), ice_cfl(), maximum(hℵ),
+    @info @sprintf("day %.1f, iter %d, Δt %.1f min | surface S (%.2f, %.2f), T (%.2f, %.2f) | max |u| %.2f, |v| %.2f, |w| %.1e m/s, CFL %.2f | ice max |u| %.2f, |v| %.2f m/s, CFL %.2f, max h·ℵ %.2f m | wall %s",
+                   time(sim) / 86400, iteration(sim), sim.Δt / 60, extrema(S)..., extrema(T)...,
+                   maximum(abs, u), maximum(abs, v), maximum(abs, w), sim.Δt / ocean_timescale(),
+                   maximum(abs, uᵢ), maximum(abs, vᵢ), sim.Δt / ice_timescale(), maximum(hℵ),
                    prettytime(1e-9 * (time_ns() - wall_time[])))
     wall_time[] = time_ns()
     return nothing
@@ -407,7 +406,6 @@ simulation.callbacks[:progress] = Callback(progress, TimeInterval(output_interva
 #                      (W/m², negative down). The Hammond & Jones forcing is not in them.
 #   _eke.nc            30-day means of u, v, T, S, uu, vv at cell centres, full depth
 #   _sea_ice.nc        h, ℵ, snow, ice u and v, daily
-# On a pickup the files are appended to.
 
 u, v, w = child.velocities
 T, S = child.tracers.T, child.tracers.S
@@ -430,19 +428,19 @@ ocean.output_writers[:surface] = NetCDFWriter(child, (; u, v, T, S);
                                               filename = "$(RUN_NAME)_surface.nc",
                                               schedule = TimeInterval(output_interval),
                                               indices = (:, :, Nz),
-                                              global_attributes = output_metadata, overwrite_files = !PICKUP)
+                                              global_attributes = output_metadata, overwrite_files = true)
 
 ocean.output_writers[:mid_lon] = NetCDFWriter(child, (; u, v, T, S);
                                               filename = "$(RUN_NAME)_midlon.nc",
                                               schedule = TimeInterval(output_interval),
                                               indices = (div(Nx, 2), :, :),
-                                              global_attributes = output_metadata, overwrite_files = !PICKUP)
+                                              global_attributes = output_metadata, overwrite_files = true)
 
 # η sits at (Center, Center, Face) on one level, which NetCDFWriter cannot write; averaging over that one level can
 ocean.output_writers[:free_surface] = NetCDFWriter(child, (; η = Field(Average(child.free_surface.displacement, dims = 3)));
                                                    filename = "$(RUN_NAME)_free_surface.nc",
                                                    schedule = TimeInterval(output_interval),
-                                                   global_attributes = output_metadata, overwrite_files = !PICKUP)
+                                                   global_attributes = output_metadata, overwrite_files = true)
 
 fluxes = coupled_model.interfaces.net_fluxes.ocean
 surface_fluxes = (; heat_flux = fluxes.T, ice_salt_flux = fluxes.S, freshwater_flux = fluxes.η,
@@ -456,7 +454,7 @@ ocean.output_writers[:surface_fluxes] =
                      "shortwave_in_heat_flux" => "no",
                      "salt_flux_seen_by_ocean" => "ice_salt_flux + S_top * freshwater_flux, S_top from the surface file",
                      "averaging_window_seconds" => Float64(output_interval))),
-                 overwrite_files = !PICKUP)
+                 overwrite_files = true)
 
 u_cc = @at (Center, Center, Center) u
 v_cc = @at (Center, Center, Center) v
@@ -469,7 +467,7 @@ ocean.output_writers[:eke] = NetCDFWriter(child, (; u = u_cc, v = v_cc, T, S, uu
                                               "averaging_stride" => 1,
                                               "moment_location" => "Center, Center, Center",
                                               "eke_recipe" => "EKE = 0.5*((uu - u^2) + (vv - v^2)); MKE = 0.5*(u^2 + v^2)")),
-                                          overwrite_files = !PICKUP)
+                                          overwrite_files = true)
 
 sea_ice.output_writers[:sea_ice] = NetCDFWriter(sea_ice.model,
                                                 merge((; h = sea_ice.model.ice_thickness,
@@ -478,19 +476,9 @@ sea_ice.output_writers[:sea_ice] = NetCDFWriter(sea_ice.model,
                                                       sea_ice.model.velocities);
                                                 filename = "$(RUN_NAME)_sea_ice.nc",
                                                 schedule = TimeInterval(output_interval),
-                                                global_attributes = output_metadata, overwrite_files = !PICKUP)
+                                                global_attributes = output_metadata, overwrite_files = true)
 
-# ## Checkpoints and run
-#
-# The coupled state (the child ocean, the ice, the clocks, every writer's schedule) every checkpoint_interval
-# and at the end, as <RUN_NAME>_checkpoint_iteration<N>.jld2. Set PICKUP = true to continue from the latest: it
-# replaces the initial state and sets every clock. @allowscalar as panarctic.jl: Oceananigans restores the
-# open-boundary buffers element by element into GPU arrays (small rows, so cheap).
-
-simulation.output_writers[:checkpointer] = Checkpointer(coupled_model;
-                                                        schedule = TimeInterval(checkpoint_interval),
-                                                        prefix = "$(RUN_NAME)_checkpoint")
+# ## Run (no checkpoints)
 
 @info "output: $(RUN_NAME)_{surface,midlon,free_surface,surface_fluxes,eke,sea_ice}.nc in $(pwd())"
-PICKUP && CUDA.@allowscalar set!(simulation; checkpoint = :latest)
-run!(simulation; checkpoint_at_end = true)
+run!(simulation)
