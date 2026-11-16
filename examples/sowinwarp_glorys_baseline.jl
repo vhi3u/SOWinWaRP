@@ -55,7 +55,7 @@ using Dates, Printf, Logging
 # ── run settings: ALL hard-coded; the environment is not read (see the top) ──────────────────
 const SMOKE           = false     # true: 2 days, 6-hourly output, a checkpoint every day, as "glorys_smoke"
 const PICKUP          = false     # true: continue RUN_NAME from its latest checkpoint
-const COASTAL_FRESHWATER      = false                        # true: add Hammond & Jones (2016) at the coast
+const COASTAL_FRESHWATER      = true                         # true: add Hammond & Jones (2016) at the coast, as 2Y_nested_glorys_hj; false: the baseline
 const COASTAL_FRESHWATER_FILE = "coastal_freshwater_hj.nc"   # written by tools/hammond_jones_freshwater.jl
 const RUN_NAME        = SMOKE ? "glorys_smoke" : COASTAL_FRESHWATER ? "2Y_nested_glorys_hj" : "2Y_nested_glorys_baseline"
 const CHECKPOINT_DAYS = SMOKE ? 1 : 30
