@@ -397,6 +397,9 @@ radiation  = ERA5PrescribedRadiation(ARCH; dataset = era5_dataset, start_date = 
 # (B-SOSE: ~2 m, often open). ICE_GROUNDING = false builds the same dynamics with `basal_stress =
 # nothing`. The coast condition is applied by sea_ice_simulation itself, not by the dynamics, so it
 # stays free-slip.
+# ClimaSeaIce PR #207's face transport over 0.7.2's (src/clima_sea_ice_pr207.jl), from fix10: the swept area equals
+# the C-grid face flux. It took the coastal pile at 97E from 33 to 12 m in the GLORYS run (2Y_nested_glorys_hj_pr207).
+include(joinpath(@__DIR__, "..", "src", "clima_sea_ice_pr207.jl"))
 ice_dynamics = ICE_GROUNDING ? NumericalEarth.SeaIces.sea_ice_dynamics(child.grid, ocean) :
                                NumericalEarth.SeaIces.sea_ice_dynamics(child.grid, ocean; basal_stress = nothing)
 # The sea ice itself is built below, once B-SOSE's ice is loaded: with ICE_BOUNDARY = "open" that ice is its parent.
@@ -825,7 +828,7 @@ output_metadata = Dict("run_name" => RUN_NAME,
     "dataset" => "BSOSE",
     "boundaries" => "one-way nest in B-SOSE (NumericalEarth nested_ocean_simulation)",
     "atmosphere" => "ERA5 (NCAR ds633.0), $(era5_pressure)",
-    "sea_ice" => "ClimaSeaIce, IncrementalRemapping advection, free-slip coasts, " *
+    "sea_ice" => "ClimaSeaIce, IncrementalRemapping advection with ClimaSeaIce PR #207's face transport, free-slip coasts, " *
                  (ICE_INIT == "bsose" ? "started from B-SOSE SIarea/SIheff" : "started ice-free") * ", " *
                  (ICE_BOUNDARY == "open"  ? "open sides take B-SOSE 5-day ice (nested_sea_ice_simulation open boundaries)" :
                   ICE_BOUNDARY == "bsose" ? "open-side bands relaxed to B-SOSE ice on $(ICE_RELAXATION / hours) h" :

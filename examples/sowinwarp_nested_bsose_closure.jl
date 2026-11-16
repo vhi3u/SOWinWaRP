@@ -36,7 +36,7 @@ include(joinpath(@__DIR__, "..", "src", "coastal_freshwater.jl"))   # coastal_fr
 # ## Run settings
 
 const SMOKE    = false      # true: 2 days, 6-hourly output
-const RUN_NAME = SMOKE ? "bsose_ggl_smoke" : "2Y_nested_bsose_ggl_hj"
+const RUN_NAME = SMOKE ? "bsose_ggl_smoke" : "2Y_nested_bsose_ggl_hj_pr207"
 const BDIR     = "/storage/scratch1/1/vnguyen480/SOWinWaRP/data"   # B-SOSE, its grid.nc, the 5-day ice, era5/
 const ARCH     = GPU()
 
@@ -291,6 +291,9 @@ function parent_ice(ice)
     return (; h, ℵ, u = still, v = still)
 end
 
+# ClimaSeaIce PR #207's face transport over 0.7.2's (src/clima_sea_ice_pr207.jl): the swept area equals the C-grid
+# face flux. It took the coastal pile at 97E from 33 to 12 m in the GLORYS run (2Y_nested_glorys_hj_pr207).
+include(joinpath(@__DIR__, "..", "src", "clima_sea_ice_pr207.jl"))
 ice_dynamics = NumericalEarth.SeaIces.sea_ice_dynamics(child.grid, ocean; basal_stress = nothing)
 sea_ice = nested_sea_ice_simulation(ocean, parent_ice(bsose_ice(start_date, end_date));
                                     advection = IncrementalRemapping(),
@@ -436,7 +439,7 @@ output_metadata = Dict("run_name" => RUN_NAME, "start_date" => string(start_date
                 "setup" => "examples/sowinwarp_nested_bsose_closure.jl",
                 "boundaries" => "one-way nest in B-SOSE monthly (NumericalEarth nested_ocean_simulation)",
                 "atmosphere" => "ERA5 (NCAR ds633.0), mean_sea_level_pressure",
-                "sea_ice" => "ClimaSeaIce, IncrementalRemapping, free-slip coasts, started from B-SOSE SIarea/SIheff, " *
+                "sea_ice" => "ClimaSeaIce, IncrementalRemapping with ClimaSeaIce PR #207's face transport, free-slip coasts, started from B-SOSE SIarea/SIheff, " *
                              "open sides take B-SOSE 5-day ice (nested_sea_ice_simulation open boundaries)",
                 "coastal_freshwater" => "constant, from coastal_freshwater_hj.nc (Hammond & Jones 2016)",
                 "closure" => "CATKE (NumericalEarth default, for GGL90) + Laplacian 10 m2/s horizontal + nu_z 1e-3 / kappa_z 1e-4 vertical (B-SOSE Table 1)",

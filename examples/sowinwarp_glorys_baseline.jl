@@ -71,9 +71,15 @@ const CLOSURE         = "default"
 # swept area equals the C-grid face flux instead of approximating it from corner velocities. The test of whether that
 # mismatch makes the coastal pile at 97E, 103E and 113-117E (memory: coastal-ice-pile-is-config-independent).
 const ICE_REMAPPING_PR207 = true
+# ICE_COAST: the sea ice's velocity condition on the coast. :free_slip (MITgcm's default; ours since fix2, when no-slip
+# held WENO-advected ice in the 97E corner) or :no_slip (NumericalEarth's default: zero ice velocity on the coast).
+# With remapping and PR #207 the pile at 97E still reached 12 m under free slip (2Y_nested_glorys_hj_pr207), and free
+# slip lets ice slide along the coast into its corners; :no_slip tests that.
+const ICE_COAST       = :no_slip
 const RUN_NAME        = SMOKE ? "glorys_smoke" :
                         (COASTAL_FRESHWATER ? "2Y_nested_glorys_hj" : "2Y_nested_glorys_baseline") *
-                        (CLOSURE == "default" ? "" : "_" * CLOSURE) * (ICE_REMAPPING_PR207 ? "_pr207" : "")
+                        (CLOSURE == "default" ? "" : "_" * CLOSURE) * (ICE_REMAPPING_PR207 ? "_pr207" : "") *
+                        (ICE_COAST == :no_slip ? "_noslip" : "")
 const CHECKPOINT_DAYS = SMOKE ? 1 : 30
 const ARCH            = GPU()
 
@@ -82,7 +88,8 @@ for name in ("RUN_NAME", "SMOKE", "PICKUP", "END_DATE", "CHECKPOINT_DAYS", "ARCH
 end
 @info "run settings: RUN_NAME = $RUN_NAME, SMOKE = $SMOKE, PICKUP = $PICKUP, CHECKPOINT_DAYS = $CHECKPOINT_DAYS, " *
       "COASTAL_FRESHWATER = $COASTAL_FRESHWATER" * (COASTAL_FRESHWATER ? " ($COASTAL_FRESHWATER_FILE)" : "") *
-      ", CLOSURE = $CLOSURE, ICE_REMAPPING_PR207 = $ICE_REMAPPING_PR207"
+      ", CLOSURE = $CLOSURE, ICE_REMAPPING_PR207 = $ICE_REMAPPING_PR207, ICE_COAST = $ICE_COAST"
+ICE_COAST in (:free_slip, :no_slip) || error("ICE_COAST must be :free_slip or :no_slip, got $ICE_COAST")
 CLOSURE in ("default", "half_wind_tke") || error("CLOSURE must be \"default\" or \"half_wind_tke\", got $CLOSURE")
 COASTAL_FRESHWATER && !isfile(COASTAL_FRESHWATER_FILE) &&
     error("$COASTAL_FRESHWATER_FILE not found: run tools/hammond_jones_freshwater.jl first")
@@ -260,7 +267,7 @@ sea_ice = nested_sea_ice_simulation(ocean, GLORYSMonthly();
                                     dir = GLORYS_DIR,
                                     time_indices_in_memory = PARENT_RECORDS,
                                     advection = IncrementalRemapping(),
-                                    lateral_boundary_condition = :free_slip,
+                                    lateral_boundary_condition = ICE_COAST,
                                     dynamics = ice_dynamics)
 @info "sea-ice grounding: $(ICE_GROUNDING ? "ON (LandfastBasalStress)" : "OFF")" *
       " -- basal_stress is $(nameof(typeof(sea_ice.model.dynamics.basal_stress)))"
@@ -414,7 +421,8 @@ output_metadata = Dict("run_name" => RUN_NAME,
     "boundaries" => "one-way nest in GLORYS monthly (NumericalEarth nested_ocean_simulation, defaults)",
     "atmosphere" => "ERA5 (NCAR ds633.0), $(era5_pressure)",
     "sea_ice" => "ClimaSeaIce via nested_sea_ice_simulation, IncrementalRemapping advection" *
-                 (ICE_REMAPPING_PR207 ? " with ClimaSeaIce PR #207's face transport" : "") * ", free-slip coasts, " *
+                 (ICE_REMAPPING_PR207 ? " with ClimaSeaIce PR #207's face transport" : "") *
+                 (ICE_COAST == :no_slip ? ", no-slip coasts, " : ", free-slip coasts, ") *
                  "started from GLORYS monthly siconc/sithick, open sides take GLORYS monthly ice (open boundaries)",
     "coastal_freshwater" => COASTAL_FRESHWATER ? "constant, from $(COASTAL_FRESHWATER_FILE)" : "none",
     "ice_grounding" => ICE_GROUNDING ? "LandfastBasalStress (NumericalEarth default)" : "off (basal_stress = nothing)",
