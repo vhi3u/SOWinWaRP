@@ -66,10 +66,14 @@ const COASTAL_FRESHWATER_FILE = "coastal_freshwater_hj.nc"   # written by tools/
 # "half_wind_tke" is the same CATKE with the surface shear-driven TKE flux coefficient Cᵂu★ halved
 # (3.179 -> 1.590), less TKE from the wind and nothing else changed. tools/compare_glorys_mld.jl found
 # the run mixed deeper than GLORYS offshore in every season and late to restratify at the coast in spring.
-const CLOSURE         = "half_wind_tke"
+const CLOSURE         = "default"
+# ICE_REMAPPING_PR207: true loads ClimaSeaIce PR #207's face transport over 0.7.2's (src/clima_sea_ice_pr207.jl): the
+# swept area equals the C-grid face flux instead of approximating it from corner velocities. The test of whether that
+# mismatch makes the coastal pile at 97E, 103E and 113-117E (memory: coastal-ice-pile-is-config-independent).
+const ICE_REMAPPING_PR207 = true
 const RUN_NAME        = SMOKE ? "glorys_smoke" :
                         (COASTAL_FRESHWATER ? "2Y_nested_glorys_hj" : "2Y_nested_glorys_baseline") *
-                        (CLOSURE == "default" ? "" : "_" * CLOSURE)
+                        (CLOSURE == "default" ? "" : "_" * CLOSURE) * (ICE_REMAPPING_PR207 ? "_pr207" : "")
 const CHECKPOINT_DAYS = SMOKE ? 1 : 30
 const ARCH            = GPU()
 
@@ -78,7 +82,7 @@ for name in ("RUN_NAME", "SMOKE", "PICKUP", "END_DATE", "CHECKPOINT_DAYS", "ARCH
 end
 @info "run settings: RUN_NAME = $RUN_NAME, SMOKE = $SMOKE, PICKUP = $PICKUP, CHECKPOINT_DAYS = $CHECKPOINT_DAYS, " *
       "COASTAL_FRESHWATER = $COASTAL_FRESHWATER" * (COASTAL_FRESHWATER ? " ($COASTAL_FRESHWATER_FILE)" : "") *
-      ", CLOSURE = $CLOSURE"
+      ", CLOSURE = $CLOSURE, ICE_REMAPPING_PR207 = $ICE_REMAPPING_PR207"
 CLOSURE in ("default", "half_wind_tke") || error("CLOSURE must be \"default\" or \"half_wind_tke\", got $CLOSURE")
 COASTAL_FRESHWATER && !isfile(COASTAL_FRESHWATER_FILE) &&
     error("$COASTAL_FRESHWATER_FILE not found: run tools/hammond_jones_freshwater.jl first")
@@ -248,6 +252,7 @@ radiation  = ERA5PrescribedRadiation(ARCH; dataset = era5_dataset, start_date = 
 # sithick is floe thickness, ClimaSeaIce's h, as before. Ours on top of the example's defaults: remapping
 # advection, free-slip coasts and grounding off (see sowinwarp_nested.jl, "sea ice"), and every monthly
 # record held in memory, as for the ocean.
+ICE_REMAPPING_PR207 && include(joinpath(@__DIR__, "..", "src", "clima_sea_ice_pr207.jl"))
 ice_dynamics = ICE_GROUNDING ? NumericalEarth.SeaIces.sea_ice_dynamics(child.grid, ocean) :
                                NumericalEarth.SeaIces.sea_ice_dynamics(child.grid, ocean; basal_stress = nothing)
 sea_ice = nested_sea_ice_simulation(ocean, GLORYSMonthly();
@@ -408,7 +413,8 @@ output_metadata = Dict("run_name" => RUN_NAME,
     "dataset" => "GLORYS",
     "boundaries" => "one-way nest in GLORYS monthly (NumericalEarth nested_ocean_simulation, defaults)",
     "atmosphere" => "ERA5 (NCAR ds633.0), $(era5_pressure)",
-    "sea_ice" => "ClimaSeaIce via nested_sea_ice_simulation, IncrementalRemapping advection, free-slip coasts, " *
+    "sea_ice" => "ClimaSeaIce via nested_sea_ice_simulation, IncrementalRemapping advection" *
+                 (ICE_REMAPPING_PR207 ? " with ClimaSeaIce PR #207's face transport" : "") * ", free-slip coasts, " *
                  "started from GLORYS monthly siconc/sithick, open sides take GLORYS monthly ice (open boundaries)",
     "coastal_freshwater" => COASTAL_FRESHWATER ? "constant, from $(COASTAL_FRESHWATER_FILE)" : "none",
     "ice_grounding" => ICE_GROUNDING ? "LandfastBasalStress (NumericalEarth default)" : "off (basal_stress = nothing)",
