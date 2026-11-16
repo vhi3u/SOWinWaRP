@@ -379,16 +379,26 @@ function check_ice_volume(sim)
 end
 simulation.callbacks[:ice_volume] = Callback(check_ice_volume, IterationInterval(10))
 
+# Once per output interval, on the CPU (the top level and the ice, ~2 MB): surface S and T over wet cells, and the
+# fastest surface ocean, the fastest ice and the largest h·ℵ, each with its place.
+wet_top = Array(child.grid.immersed_boundary.bottom_height[1:Nx, 1:Ny, 1]) .< 0
+centred(A) = (A = size(A, 1) == Nx + 1 ? 0.5 .* (A[1:end-1, :] .+ A[2:end, :]) : A;
+              size(A, 2) == Ny + 1 ? 0.5 .* (A[:, 1:end-1] .+ A[:, 2:end]) : A)
+top(f) = Array(view(interior(f), :, :, size(interior(f), 3)))
+place(I) = @sprintf("%.1fE %.1fS", λ₁ + (I[1] - 0.5) / SCALING, -(φ₁ + (I[2] - 0.5) / SCALING))
+wet_extrema(A) = extrema(A[wet_top])
+
 wall_time = Ref(time_ns())
 function progress(sim)
-    S, T = view(interior(child.tracers.S), :, :, Nz), view(interior(child.tracers.T), :, :, Nz)
-    u, v, w = child.velocities
-    uᵢ, vᵢ = sea_ice.model.velocities
-    hℵ = interior(sea_ice.model.ice_thickness) .* interior(sea_ice.model.ice_concentration)
-    @info @sprintf("day %.1f, iter %d, Δt %.1f min | surface S (%.2f, %.2f), T (%.2f, %.2f) | max |u| %.2f, |v| %.2f, |w| %.1e m/s, CFL %.2f | ice max |u| %.2f, |v| %.2f m/s, CFL %.2f, max h·ℵ %.2f m | wall %s",
-                   time(sim) / 86400, iteration(sim), sim.Δt / 60, extrema(S)..., extrema(T)...,
-                   maximum(abs, u), maximum(abs, v), maximum(abs, w), sim.Δt / ocean_timescale(),
-                   maximum(abs, uᵢ), maximum(abs, vᵢ), sim.Δt / ice_timescale(), maximum(hℵ),
+    S, T = top(child.tracers.S), top(child.tracers.T)
+    sₒ = ifelse.(wet_top, hypot.(centred(top(child.velocities.u)), centred(top(child.velocities.v))), 0.0)
+    sᵢ = ifelse.(wet_top, hypot.(centred(top(sea_ice.model.velocities.u)), centred(top(sea_ice.model.velocities.v))), 0.0)
+    hℵ = ifelse.(wet_top, top(sea_ice.model.ice_thickness) .* top(sea_ice.model.ice_concentration), 0.0)
+    Iₒ, Iᵢ, Iₕ = argmax(sₒ), argmax(sᵢ), argmax(hℵ)
+    @info @sprintf("day %.1f, iter %d, Δt %.1f min | surface S (%.2f, %.2f), T (%.2f, %.2f) | ocean %.2f m/s at %s, max |w| %.1e, CFL %.2f | ice %.2f m/s at %s, CFL %.2f | max h·ℵ %.2f m at %s | wall %s",
+                   time(sim) / 86400, iteration(sim), sim.Δt / 60, wet_extrema(S)..., wet_extrema(T)...,
+                   sₒ[Iₒ], place(Iₒ), maximum(abs, child.velocities.w), sim.Δt / ocean_timescale(),
+                   sᵢ[Iᵢ], place(Iᵢ), sim.Δt / ice_timescale(), hℵ[Iₕ], place(Iₕ),
                    prettytime(1e-9 * (time_ns() - wall_time[])))
     wall_time[] = time_ns()
     return nothing
