@@ -159,11 +159,11 @@ grid = ImmersedBoundaryGrid(underlying_grid, PartialCellBottom(bottom_height; mi
 # before the first step. NumericalEarth's defaults for the open boundaries, the Flather barotropic exterior, the
 # bathymetry blend toward B-SOSE's seafloor and the 1/6-hour relaxation band.
 #
-# CLOSURE: B-SOSE's, as far as Oceananigans can. MITgcm runs B-SOSE with KPP, which Oceananigans does not have,
-# over Laplacian horizontal mixing and constant vertical backgrounds. Here those backgrounds (ν, κ = 10 m²/s
-# horizontal; νz = 1e-3, κz = 1e-4 m²/s) and convective adjustment (1 m²/s where the column is statically
-# unstable), no CATKE: a bracket on KPP, not a copy. It has no bulk Richardson number, no non-local flux and no
-# wind-driven entrainment, so the wind deepens the mixed layer only through resolved shear. Vertically implicit.
+# CLOSURE: B-SOSE's Table 1 constants alone (Verdy & Mazloff 2017: ν, κ = 10 m²/s horizontal; νz = 1e-3, κz = 1e-4
+# m²/s) with convective adjustment (1 m²/s where the column is statically unstable), no boundary-layer scheme.
+# B-SOSE itself runs these as backgrounds UNDER the GGL90 TKE scheme (Gaspar et al. 1990), which this leaves out.
+# Without it the wind's momentum stays in the 4.2 m top cell (Ekman depth √(2νz/f) ≈ 4 m): 2Y_nested_bsose_conv_hj
+# spun the surface up to 2-4.6 m/s over ~1,150 cells a day, against ~2 with CATKE. Not usable as physics.
 #
 # COASTAL FRESHWATER: Hammond & Jones (2016), the Antarctic ice-shelf melt, iceberg melt and runoff B-SOSE
 # prescribes (341 Gt/yr in the box, at most 2.7 m/yr), constant in time, as a virtual salt flux in the top cell
