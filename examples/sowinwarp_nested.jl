@@ -106,7 +106,7 @@ const BDIR  = get(ENV, "BSOSE_DIR", default_bsose_directory())
 # submission ran without its freshwater that way. The values are logged at startup and stamped on
 # every output file.
 const COASTAL_FRESHWATER      = true                            # B-SOSE's coastal freshwater; see "coastal freshwater"
-const COASTAL_FRESHWATER_FILE = "coastal_freshwater_bsose.nc"   # written by tools/coastal_freshwater.jl
+const COASTAL_FRESHWATER_FILE = "coastal_freshwater_bsose.nc"   # tools/coastal_freshwater.jl; or "coastal_freshwater_hj.nc" (tools/hammond_jones_freshwater.jl)
 const ICE_INIT                = "bsose"   # "bsose": start from B-SOSE's ice; "none": ice-free (up to fix3)
 const ICE_BOUNDARY            = "open"    # "open": B-SOSE ice through open boundaries (nested_sea_ice_simulation, from fix9);
                                           # "bsose": relax the open-side bands to B-SOSE's ice (fix4-fix8); "delete" (up to fix3)
@@ -320,55 +320,26 @@ parent_records = length(NumericalEarth.DataWrangling.bracketing_dates(dataset, :
 # ── coastal freshwater (COASTAL_FRESHWATER, in the switches) ────────────────────────────────────────────────
 # Our only surface freshwater is ERA5 precipitation: no ice-shelf melt, iceberg melt or runoff.
 # B-SOSE prescribes Antarctic melt and calving (Hammond & Jones 2016, per the 2024 GMD evaluation of
-# MITgcm reanalyses), and every nested run has a salty strip along the coast that the sea-ice
-# changes of fix4 barely touched. tools/coastal_freshwater.jl measures what B-SOSE's coast gets
-# that ours does not, oceFWflx - SFLUX/S_ICE - ERA5 P, minus its offshore value, and writes it on
-# this grid to COASTAL_FRESHWATER_FILE. Run that first. Raw oceFWflx is NOT used: it holds B-SOSE's
-# own sea-ice freezing and melting, which our ice model already does.
-#
-# Applied as a virtual salt flux in the top cell, -S F / (ρ₀ Δz), the way the coupler applies the
-# rest of the freshwater, and constant in time like B-SOSE's prescribed melt. A caller's `forcing`
-# is ADDED to the nest's boundary relaxation (NestedModels/nested_ocean_model.jl), so this does not
-# displace it. The flux is concentrated: up to ~44 m/yr at the Shackleton front (96-97E 65.1-65.3S)
-# and at 103.25E 65.25S, i.e. ~1 g/kg per day in an unmixed 4.2 m top cell.
-const COASTAL_ρ₀ = 1026.0
-
-@inline function coastal_freshwater_dilution(i, j, k, grid, clock, fields, p)
-    @inbounds S = fields.S[i, j, k]
-    @inbounds F = p.F[i, j]
-    return ifelse(k == grid.Nz, -S * F / (p.ρ₀ * Δzᶜᶜᶜ(i, j, k, grid)), zero(S))
-end
-
-function coastal_freshwater_forcing()
-    COASTAL_FRESHWATER || return NamedTuple()
-    isfile(COASTAL_FRESHWATER_FILE) ||
-        error("$COASTAL_FRESHWATER_FILE not found: run tools/coastal_freshwater.jl first, or set COASTAL_FRESHWATER = false in the switches")
-    ds = NCDataset(COASTAL_FRESHWATER_FILE)
-    lon, lat = Float64.(ds["lon"][:]), Float64.(ds["lat"][:])
-    F = Float64.(coalesce.(ds["freshwater_flux"][:, :], 0.0))
-    attributes = Dict(ds.attrib)
-    close(ds)
-    λc = λ₁ .+ ((1:Nx) .- 0.5) ./ SCALING
-    φc = φ₁ .+ ((1:Ny) .- 0.5) ./ SCALING
-    (size(F) == (Nx, Ny) && maximum(abs, lon .- λc) < 1e-6 && maximum(abs, lat .- φc) < 1e-6) ||
-        error("$COASTAL_FRESHWATER_FILE is not on this grid ($(Nx)x$(Ny), $(λ₁)-$(λ₂)E, $(φ₁)-$(φ₂)S)")
-    land = Array(interior(bottom_height))[:, :, 1] .>= 0
-    F[land] .= 0
-    area = [(6.371e6 * deg2rad(1 / SCALING))^2 * cosd(φ) for _ in λc, φ in φc]
-    @info @sprintf("coastal freshwater from %s: %.0f Gt/yr, up to %.1f m/yr in a cell (%s)",
-                   COASTAL_FRESHWATER_FILE, sum(F .* area) * 365.25 * 86400 / 1e12,
-                   maximum(F) * 365.25 * 86400 / 1000, get(attributes, "method", "no method attribute"))
-    get(attributes, "era5_precipitation_subtracted", "true") == "true" ||
-        @warn "$COASTAL_FRESHWATER_FILE was made without ERA5 precipitation subtracted"
-    return (; S = Forcing(coastal_freshwater_dilution; discrete_form = true,
-                          parameters = (; F = on_architecture(ARCH, F), ρ₀ = COASTAL_ρ₀)))
-end
+# MITgcm reanalyses), and every nested run has a salty strip along the coast. COASTAL_FRESHWATER_FILE is
+# one of two fields on this grid, applied by src/coastal_freshwater.jl (a constant virtual salt flux in
+# the top cell, added to the nest's relaxation):
+#   coastal_freshwater_bsose.nc  tools/coastal_freshwater.jl: what B-SOSE's coast gets that ours does not,
+#                                oceFWflx - SFLUX/S_ICE - ERA5 P, minus its offshore value (fix5-fix9).
+#                                ~610 Gt/yr, up to ~44 m/yr at the Shackleton front (96-97E 65.1-65.3S)
+#                                and at 103.25E 65.25S, i.e. ~1 g/kg per day in an unmixed 4.2 m top cell.
+#   coastal_freshwater_hj.nc     tools/hammond_jones_freshwater.jl: the Hammond & Jones field itself.
+#                                341 Gt/yr in the box, at most 2.7 m/yr; what falls on our land is spread
+#                                over the wet cells within 6 cells.
+# Raw oceFWflx is NOT used: it holds B-SOSE's own sea-ice freezing and melting, which our ice model does.
+include(joinpath(@__DIR__, "..", "src", "coastal_freshwater.jl"))
 
 ocean = nested_ocean_simulation(grid, dataset;
                                 dates = (start_date, end_date),
                                 dir = BDIR,
                                 parent_time_indices_in_memory = parent_records,
-                                forcing = coastal_freshwater_forcing())
+                                forcing = COASTAL_FRESHWATER ?
+                                    coastal_freshwater_forcing(COASTAL_FRESHWATER_FILE, bottom_height;
+                                                               λ₁, φ₁, scaling = SCALING, arch = ARCH) : NamedTuple())
 
 child = ocean.model.child
 
@@ -854,7 +825,7 @@ output_metadata = Dict("run_name" => RUN_NAME,
                  (ICE_BOUNDARY == "open"  ? "open sides take B-SOSE 5-day ice (nested_sea_ice_simulation open boundaries)" :
                   ICE_BOUNDARY == "bsose" ? "open-side bands relaxed to B-SOSE ice on $(ICE_RELAXATION / hours) h" :
                                             "open-side bands ice deleted"),
-    "coastal_freshwater" => COASTAL_FRESHWATER ? "B-SOSE coastal excess from $(COASTAL_FRESHWATER_FILE)" : "none",
+    "coastal_freshwater" => COASTAL_FRESHWATER ? "constant, from $(COASTAL_FRESHWATER_FILE)" : "none",
     "ice_grounding" => ICE_GROUNDING ? "LandfastBasalStress (NumericalEarth default)" : "off (basal_stress = nothing)",
     "bathymetry" => BATHYMETRY == "bsose" ? "B-SOSE i156 Depth (grid.nc), area-aggregated" : "ETOPO2022",
     "penetrating_shortwave" => PENETRATING_SHORTWAVE ? "yes: TwoColorRadiation fed by the coupler" :

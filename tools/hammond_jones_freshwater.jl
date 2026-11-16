@@ -16,8 +16,8 @@
 # forcing reads either: lon, lat (the nest's cell centres) and freshwater_flux (kg m-2 s-1, + into the
 # ocean). Regridded conservatively: the nest's longitudes coincide with SOSE's and its latitudes are
 # 1/24 deg off, so each nest cell is the area-weighted mean of the SOSE cells it overlaps, and the
-# total is kept. Nothing is moved off land here: that depends on the run's bathymetry, so it is the
-# script's job; what lands on our land cells is reported below.
+# total is kept. Nothing is moved off land here: that depends on the run's bathymetry, so the scripts'
+# loader (src/coastal_freshwater.jl) does it, as the file's `on_land` attribute asks; RUN= reports how much.
 #
 # THE COMPARISON. Gt/yr by sector and latitude band, and the largest cells, against the residual
 # field the B-SOSE runs have used since fix5 (RESIDUAL_FILE, if present). A map of both is written to
@@ -122,6 +122,7 @@ NCDataset(FIELD_FILE, "c") do out
     out.attrib["source"] = "https://github.com/DaniJonesOcean/southern_fwflux; doi:10.1002/gdj3.43"
     out.attrib["period"] = "multiyear mean (2010-2015), constant in time"
     out.attrib["total_Gt_per_year"] = gt(F_myr, A)
+    out.attrib["on_land"] = "move to nearby wet cells: zero on SOSE's land, so flux on another coastline's land is real"
 end
 @info "wrote $FIELD_FILE"
 

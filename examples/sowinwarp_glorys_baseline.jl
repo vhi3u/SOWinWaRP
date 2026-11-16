@@ -18,7 +18,10 @@
 #   wizard, the 50 m ice-volume stop, the health line, and the same output files, so every tool in
 #   tools/ reads this run as it reads the B-SOSE ones.
 #   Like it, the parent is monthly and every record is held in memory (~0.6 GB for the 2 years).
-# WHAT IT DROPS: B-SOSE's coastal freshwater (derived from B-SOSE).
+# WHAT IT DROPS: B-SOSE's coastal freshwater (derived from B-SOSE). COASTAL_FRESHWATER = true (a switch below,
+#   off for the baseline) adds the Hammond & Jones field instead (tools/hammond_jones_freshwater.jl writes
+#   coastal_freshwater_hj.nc; src/coastal_freshwater.jl applies it) and runs as 2Y_nested_glorys_hj, so the
+#   baseline's own files are never written over.
 # WHAT CHANGES: the sea ice crosses the open sides as the Arctic example's does (see "sea ice"): GLORYS
 #   ice thickness and concentration are its boundary values, its normal velocity lets ice out but never
 #   pulls it in, inflowing ice carries no snow, and it starts from GLORYS' ice on start_date. That
@@ -52,14 +55,19 @@ using Dates, Printf, Logging
 # ── run settings: ALL hard-coded; the environment is not read (see the top) ──────────────────
 const SMOKE           = false     # true: 2 days, 6-hourly output, a checkpoint every day, as "glorys_smoke"
 const PICKUP          = false     # true: continue RUN_NAME from its latest checkpoint
-const RUN_NAME        = SMOKE ? "glorys_smoke" : "2Y_nested_glorys_baseline"
+const COASTAL_FRESHWATER      = false                        # true: add Hammond & Jones (2016) at the coast
+const COASTAL_FRESHWATER_FILE = "coastal_freshwater_hj.nc"   # written by tools/hammond_jones_freshwater.jl
+const RUN_NAME        = SMOKE ? "glorys_smoke" : COASTAL_FRESHWATER ? "2Y_nested_glorys_hj" : "2Y_nested_glorys_baseline"
 const CHECKPOINT_DAYS = SMOKE ? 1 : 30
 const ARCH            = GPU()
 
 for name in ("RUN_NAME", "SMOKE", "PICKUP", "END_DATE", "CHECKPOINT_DAYS", "ARCH", "GLORYS_DIR", "ERA5_DIR", "BSOSE_DIR")
     haskey(ENV, name) && @warn "$name = $(ENV[name]) is set in the environment; this script ignores it (all its settings are hard-coded)"
 end
-@info "run settings: RUN_NAME = $RUN_NAME, SMOKE = $SMOKE, PICKUP = $PICKUP, CHECKPOINT_DAYS = $CHECKPOINT_DAYS"
+@info "run settings: RUN_NAME = $RUN_NAME, SMOKE = $SMOKE, PICKUP = $PICKUP, CHECKPOINT_DAYS = $CHECKPOINT_DAYS, " *
+      "COASTAL_FRESHWATER = $COASTAL_FRESHWATER" * (COASTAL_FRESHWATER ? " ($COASTAL_FRESHWATER_FILE)" : "")
+COASTAL_FRESHWATER && !isfile(COASTAL_FRESHWATER_FILE) &&
+    error("$COASTAL_FRESHWATER_FILE not found: run tools/hammond_jones_freshwater.jl first")
 
 ARCH isa GPU && !CUDA.functional() &&
     (CUDA.functional(true); error("CUDA is not functional on this node. Check the GPU allocation."))
@@ -164,11 +172,18 @@ end
 const PARENT_RECORDS = length(bracketing_dates(GLORYSMonthly(), :temperature, (start_date, end_date)))
 @info "GLORYS parent: $PARENT_RECORDS monthly records, all held in memory; downloaded and inpainted first if missing"
 
+# Coastal freshwater (COASTAL_FRESHWATER): a constant virtual salt flux in the top cell, ADDED to the nest's
+# relaxation; what falls on our land is spread over the wet cells within 6 cells. See src/coastal_freshwater.jl.
+include(joinpath(@__DIR__, "..", "src", "coastal_freshwater.jl"))
+
 const PARENT_LOAD_T₀ = time()
 ocean = nested_ocean_simulation(grid, GLORYSMonthly();
                                 dates = (start_date, end_date),
                                 dir = GLORYS_DIR,
-                                parent_time_indices_in_memory = PARENT_RECORDS)
+                                parent_time_indices_in_memory = PARENT_RECORDS,
+                                forcing = COASTAL_FRESHWATER ?
+                                    coastal_freshwater_forcing(COASTAL_FRESHWATER_FILE, bottom_height;
+                                                               λ₁, φ₁, scaling = SCALING, arch = ARCH) : NamedTuple())
 @info @sprintf("GLORYS parent: loaded in %.1f min", (time() - PARENT_LOAD_T₀) / 60)
 
 child = ocean.model.child
@@ -367,7 +382,7 @@ output_metadata = Dict("run_name" => RUN_NAME,
     "atmosphere" => "ERA5 (NCAR ds633.0), $(era5_pressure)",
     "sea_ice" => "ClimaSeaIce via nested_sea_ice_simulation, IncrementalRemapping advection, free-slip coasts, " *
                  "started from GLORYS monthly siconc/sithick, open sides take GLORYS monthly ice (open boundaries)",
-    "coastal_freshwater" => "none",
+    "coastal_freshwater" => COASTAL_FRESHWATER ? "constant, from $(COASTAL_FRESHWATER_FILE)" : "none",
     "ice_grounding" => ICE_GROUNDING ? "LandfastBasalStress (NumericalEarth default)" : "off (basal_stress = nothing)",
     "bathymetry" => "ETOPO2022",
     "penetrating_shortwave" => PENETRATING_SHORTWAVE ? "yes: TwoColorRadiation fed by the coupler" :
