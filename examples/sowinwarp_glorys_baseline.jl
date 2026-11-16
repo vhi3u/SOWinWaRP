@@ -57,7 +57,14 @@ const SMOKE           = false     # true: 2 days, 6-hourly output, a checkpoint 
 const PICKUP          = false     # true: continue RUN_NAME from its latest checkpoint
 const COASTAL_FRESHWATER      = true                         # true: add Hammond & Jones (2016) at the coast, as 2Y_nested_glorys_hj; false: the baseline
 const COASTAL_FRESHWATER_FILE = "coastal_freshwater_hj.nc"   # written by tools/hammond_jones_freshwater.jl
-const RUN_NAME        = SMOKE ? "glorys_smoke" : COASTAL_FRESHWATER ? "2Y_nested_glorys_hj" : "2Y_nested_glorys_baseline"
+# CLOSURE: "default" is NumericalEarth's default_ocean_closure (CATKE with Cᵇ = 0.01, Cᵂϵ = 1.0);
+# "half_wind_tke" is the same CATKE with the surface shear-driven TKE flux coefficient Cᵂu★ halved
+# (3.179 -> 1.590), less TKE from the wind and nothing else changed. tools/compare_glorys_mld.jl found
+# the run mixed deeper than GLORYS offshore in every season and late to restratify at the coast in spring.
+const CLOSURE         = "half_wind_tke"
+const RUN_NAME        = SMOKE ? "glorys_smoke" :
+                        (COASTAL_FRESHWATER ? "2Y_nested_glorys_hj" : "2Y_nested_glorys_baseline") *
+                        (CLOSURE == "default" ? "" : "_" * CLOSURE)
 const CHECKPOINT_DAYS = SMOKE ? 1 : 30
 const ARCH            = GPU()
 
@@ -65,7 +72,9 @@ for name in ("RUN_NAME", "SMOKE", "PICKUP", "END_DATE", "CHECKPOINT_DAYS", "ARCH
     haskey(ENV, name) && @warn "$name = $(ENV[name]) is set in the environment; this script ignores it (all its settings are hard-coded)"
 end
 @info "run settings: RUN_NAME = $RUN_NAME, SMOKE = $SMOKE, PICKUP = $PICKUP, CHECKPOINT_DAYS = $CHECKPOINT_DAYS, " *
-      "COASTAL_FRESHWATER = $COASTAL_FRESHWATER" * (COASTAL_FRESHWATER ? " ($COASTAL_FRESHWATER_FILE)" : "")
+      "COASTAL_FRESHWATER = $COASTAL_FRESHWATER" * (COASTAL_FRESHWATER ? " ($COASTAL_FRESHWATER_FILE)" : "") *
+      ", CLOSURE = $CLOSURE"
+CLOSURE in ("default", "half_wind_tke") || error("CLOSURE must be \"default\" or \"half_wind_tke\", got $CLOSURE")
 COASTAL_FRESHWATER && !isfile(COASTAL_FRESHWATER_FILE) &&
     error("$COASTAL_FRESHWATER_FILE not found: run tools/hammond_jones_freshwater.jl first")
 
@@ -176,6 +185,19 @@ const PARENT_RECORDS = length(bracketing_dates(GLORYSMonthly(), :temperature, (s
 # relaxation; what falls on our land is spread over the wet cells within 6 cells. See src/coastal_freshwater.jl.
 include(joinpath(@__DIR__, "..", "src", "coastal_freshwater.jl"))
 
+# The vertical closure (CLOSURE). "default" passes nothing, so the nest builds NumericalEarth's own default.
+# The others rebuild that default exactly (NumericalEarth.Oceans.default_ocean_closure at 768ed1d) and change
+# one coefficient; Oceananigans' CATKE defaults are in its CATKEEquation docstring.
+using Oceananigans.TurbulenceClosures.TKEBasedVerticalDiffusivities: CATKEVerticalDiffusivity, CATKEMixingLength, CATKEEquation
+using Oceananigans.TimeSteppers: VerticallyImplicitTimeDiscretization
+const CLOSURE_KW = CLOSURE == "default" ? NamedTuple() :
+    (; closure = CATKEVerticalDiffusivity(VerticallyImplicitTimeDiscretization(), Float64;
+                                          mixing_length = CATKEMixingLength(Cᵇ = 0.01),
+                                          turbulent_kinetic_energy_equation = CATKEEquation(Cᵂϵ = 1.0,
+                                                                                            Cᵂu★ = CATKEEquation().Cᵂu★ / 2)))
+CLOSURE == "default" || @info "closure: $CLOSURE, Cᵂu★ = $(CLOSURE_KW.closure.turbulent_kinetic_energy_equation.Cᵂu★) " *
+                              "(default $(CATKEEquation().Cᵂu★))"
+
 const PARENT_LOAD_T₀ = time()
 ocean = nested_ocean_simulation(grid, GLORYSMonthly();
                                 dates = (start_date, end_date),
@@ -183,7 +205,8 @@ ocean = nested_ocean_simulation(grid, GLORYSMonthly();
                                 parent_time_indices_in_memory = PARENT_RECORDS,
                                 forcing = COASTAL_FRESHWATER ?
                                     coastal_freshwater_forcing(COASTAL_FRESHWATER_FILE, bottom_height;
-                                                               λ₁, φ₁, scaling = SCALING, arch = ARCH) : NamedTuple())
+                                                               λ₁, φ₁, scaling = SCALING, arch = ARCH) : NamedTuple(),
+                                CLOSURE_KW...)
 @info @sprintf("GLORYS parent: loaded in %.1f min", (time() - PARENT_LOAD_T₀) / 60)
 
 child = ocean.model.child
@@ -385,6 +408,8 @@ output_metadata = Dict("run_name" => RUN_NAME,
     "coastal_freshwater" => COASTAL_FRESHWATER ? "constant, from $(COASTAL_FRESHWATER_FILE)" : "none",
     "ice_grounding" => ICE_GROUNDING ? "LandfastBasalStress (NumericalEarth default)" : "off (basal_stress = nothing)",
     "bathymetry" => "ETOPO2022",
+    "closure" => CLOSURE == "default" ? "NumericalEarth default_ocean_closure (CATKE)" :
+                 "CATKE as NumericalEarth's default, Cᵂu★ halved ($CLOSURE)",
     "penetrating_shortwave" => PENETRATING_SHORTWAVE ? "yes: TwoColorRadiation fed by the coupler" :
                                                        "no: all shortwave in the top cell's heat flux",
     "vertical_coordinate" => "static z, B-SOSE i156's 52 levels")
