@@ -12,6 +12,11 @@
 # Writes nested_glorys_mini_surface.nc and _midlon.nc (daily), which tools/compare_glorys.jl reads:
 #     julia --project=. tools/compare_glorys.jl nested_glorys_mini
 
+# HDF5 file locking off, before any library opens a file: Oceananigans' NetCDFWriter reopens its files at every
+# write, and with locking on, anyone reading them meanwhile (a tool on the login node) makes that reopen fail and
+# kills the run. 2Y_nested_bsose_conv_hj stopped that way when tools/locate_ice_pile.jl read it (2026-11-16).
+ENV["HDF5_USE_FILE_LOCKING"] = "FALSE"
+
 using NumericalEarth
 using NumericalEarth.DataWrangling: bracketing_dates
 using NumericalEarth.DataWrangling.GLORYS: GLORYSMonthly

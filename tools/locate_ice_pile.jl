@@ -32,6 +32,9 @@
 #     BAND             open-side band width, cells (default 4)
 # ==============================================================================
 
+# HDF5 file locking off, so reading a run that is still writing cannot block its writer
+ENV["HDF5_USE_FILE_LOCKING"] = "FALSE"
+
 using NCDatasets, CairoMakie, Printf, Dates
 
 const RUN = length(ARGS) > 0 ? ARGS[1] : error("give the run: julia --project=. tools/locate_ice_pile.jl <RUN>")

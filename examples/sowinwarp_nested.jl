@@ -73,6 +73,11 @@
 #      z_aac; tools/compare_surface_bsose.jl reads either.
 # ==============================================================================================
 
+# HDF5 file locking off, before any library opens a file: Oceananigans' NetCDFWriter reopens its files at every
+# write, and with locking on, anyone reading them meanwhile (a tool on the login node) makes that reopen fail and
+# kills the run. 2Y_nested_bsose_conv_hj stopped that way when tools/locate_ice_pile.jl read it (2026-11-16).
+ENV["HDF5_USE_FILE_LOCKING"] = "FALSE"
+
 using CUDA            # loads Oceananigans' CUDA extension, which is what defines `GPU()`
 using CopernicusClimateDataStore    # an ERA5 backend: the ERA5 constructors always call `download`, and
                                     # without one that errors even when every file is on disk

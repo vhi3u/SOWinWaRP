@@ -8,6 +8,11 @@
 # B-SOSE, ERA5, penetrating shortwave, no ice grounding. Writes the same NetCDF files, so every tool in tools/
 # reads it: <RUN_NAME>_{surface,midlon,free_surface,surface_fluxes,eke,sea_ice}.nc.
 
+# HDF5 file locking off, before any library opens a file: Oceananigans' NetCDFWriter reopens its files at every
+# write, and with locking on, anyone reading them meanwhile (a tool on the login node) makes that reopen fail and
+# kills the run. 2Y_nested_bsose_conv_hj stopped that way when tools/locate_ice_pile.jl read it (2026-11-16).
+ENV["HDF5_USE_FILE_LOCKING"] = "FALSE"
+
 using CUDA                          # defines GPU()
 using CopernicusClimateDataStore    # an ERA5 backend: the ERA5 constructors call `download` even when the files exist
 using NumericalEarth
