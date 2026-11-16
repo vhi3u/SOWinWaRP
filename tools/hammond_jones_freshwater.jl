@@ -23,6 +23,14 @@
 # field the B-SOSE runs have used since fix5 (RESIDUAL_FILE, if present). A map of both is written to
 # OUTDIR/coastal_freshwater_hj_vs_residual.png.
 #
+# WITH RUN, on that run's coast. The residual file holds values over land too (B-SOSE land took its
+# nearest ocean value before regridding), and the scripts zero our land cells, so without RUN the
+# residual's totals include land the run never forced. With RUN, the run's bottom_height (from
+# DIR/<RUN>_surface.nc) gives its wet cells: what each field puts on that run's land is reported, and
+# every table and map after it counts wet cells only. The residual's total is then what the run's
+# startup line `coastal freshwater from ...` said. The B-SOSE runs since fix8 have B-SOSE's own
+# bathymetry; the GLORYS baseline has ETOPO2022.
+#
 # LOGIN-NODE SAFE: NCDatasets and CairoMakie only.
 #
 # ENV
@@ -30,6 +38,8 @@
 #     FIELD_FILE     the field to write    (default coastal_freshwater_hj.nc)
 #     RESIDUAL_FILE  to compare against    (default coastal_freshwater_bsose.nc; skipped if absent)
 #     OUTDIR         figures               (default plots)
+#     RUN            a run whose coast to use (default none: every cell counts)
+#     DIR            where <RUN>_surface.nc is (default .)
 # ==============================================================================
 
 using NCDatasets, CairoMakie, Printf
@@ -41,6 +51,8 @@ const HJ_FILE       = get(ENV, "HJ_FILE", joinpath(DATA_DIR, "southern_fwflux", 
 const FIELD_FILE    = get(ENV, "FIELD_FILE", "coastal_freshwater_hj.nc")
 const RESIDUAL_FILE = get(ENV, "RESIDUAL_FILE", "coastal_freshwater_bsose.nc")
 const OUTDIR        = get(ENV, "OUTDIR", "plots")
+const RUN           = get(ENV, "RUN", "")
+const DIR           = get(ENV, "DIR", ".")
 
 # The nest's grid (examples/sowinwarp_nested.jl, sowinwarp_glorys_baseline.jl), which the scripts check
 const CHILD_LON, CHILD_LAT, CHILD_SCALING = (90.0, 150.0), (-70.0, -45.0), 6
@@ -129,6 +141,25 @@ end
 fields = residual === nothing ? (("H&J", F_myr),) : (("H&J", F_myr), ("residual", residual))
 header = join([@sprintf("%10s", name) for (name, _) in fields])
 
+# ── on the run's coast ───────────────────────────────────────────────────────────────────────
+coast = "every cell"
+if !isempty(RUN)
+    surf = joinpath(DIR, "$(RUN)_surface.nc")
+    isfile(surf) || error("no $surf (set DIR)")
+    wet = NCDataset(surf) do ds
+        Float64.(coalesce.(ds["bottom_height"][:, :], 0.0)) .< 0
+    end
+    size(wet) == (Nx, Ny) || error("$surf is $(size(wet)), not the nest's $((Nx, Ny))")
+    land = .!wet
+    println("\nON $(RUN)'s LAND ($(count(land)) of $(Nx * Ny) cells), Gt/yr: what the run zeroes")
+    println("             ", header)
+    println("  on land    ", join([@sprintf("%10.1f", gt(f[land], A[land])) for (_, f) in fields]))
+    println("  at sea     ", join([@sprintf("%10.1f", gt(f[wet], A[wet])) for (_, f) in fields]))
+    fields = Tuple((name, ifelse.(wet, f, 0.0)) for (name, f) in fields)
+    coast = "$(RUN)'s wet cells"
+end
+println("\nEverything below counts $coast.")
+
 println("\nGt/yr BY SECTOR (all latitudes of the nest)")
 println("  sector     ", header)
 for a in 90:10:140
@@ -159,12 +190,12 @@ end
 mkpath(OUTDIR)
 fig = Figure(size = (1000, 330 * length(fields) + 60))
 for (n, (name, f)) in enumerate(fields)
-    ax = Axis(fig[n, 1]; title = @sprintf("%s: %.0f Gt/yr, max %.1f m/yr", name, gt(f, A), maximum(f)),
+    ax = Axis(fig[n, 1]; title = @sprintf("%s on %s: %.0f Gt/yr, max %.1f m/yr", name, coast, gt(f, A), maximum(f)),
               xlabel = "longitude", ylabel = "latitude", aspect = DataAspect())
     heatmap!(ax, λc, φc, replace(f, 0.0 => NaN); colormap = :viridis, colorrange = (0, 3), highclip = :red)
 end
 Colorbar(fig[1:length(fields), 2]; colormap = :viridis, colorrange = (0, 3), highclip = :red,
          label = "fresh water, m/yr (red: above 3)")
-out = joinpath(OUTDIR, "coastal_freshwater_hj_vs_residual.png")
+out = joinpath(OUTDIR, isempty(RUN) ? "coastal_freshwater_hj_vs_residual.png" : "$(RUN)_coastal_freshwater_hj_vs_residual.png")
 save(out, fig)
 @info "wrote $out"
