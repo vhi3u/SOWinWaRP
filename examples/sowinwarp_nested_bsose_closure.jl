@@ -40,7 +40,7 @@ const SMOKE    = false      # true: 2 days, 6-hourly output
 #   "ggl"           CATKE under B-SOSE's Table 1 constants: B-SOSE's closure as Verdy & Mazloff (2017) describe it
 #   "catke"         NumericalEarth's default CATKE alone: the control for "ggl"
 #   "half_wind_tke" that CATKE with the surface wind's TKE flux coefficient Cᵂu★ halved (3.179 -> 1.590)
-const CLOSURE  = "catke"
+const CLOSURE  = "ggl"
 CLOSURE in ("ggl", "catke", "half_wind_tke") || error("CLOSURE must be \"ggl\", \"catke\" or \"half_wind_tke\", got $CLOSURE")
 const RUN_NAME = SMOKE ? "bsose_$(CLOSURE)_smoke" : "2Y_nested_bsose_$(CLOSURE)_hj_pr207"
 const BDIR     = "/storage/scratch1/1/vnguyen480/SOWinWaRP/data"   # B-SOSE, its grid.nc, the 5-day ice, era5/
@@ -57,6 +57,8 @@ for name in ("RUN_NAME", "END_DATE", "SMOKE", "PICKUP", "ARCH", "BSOSE_DIR", "ER
 end
 ARCH isa GPU && !CUDA.functional() && error("CUDA is not functional on this node. Check the GPU allocation.")
 @info "$RUN_NAME: $start_date to $end_date"
+include(joinpath(@__DIR__, "..", "src", "run_name_guard.jl"))
+guard_run_name(RUN_NAME)   # stop if another job is writing this run's files
 
 # ## Grid
 #

@@ -91,6 +91,8 @@ end
       ", CLOSURE = $CLOSURE, ICE_REMAPPING_PR207 = $ICE_REMAPPING_PR207, ICE_COAST = $ICE_COAST"
 ICE_COAST in (:free_slip, :no_slip) || error("ICE_COAST must be :free_slip or :no_slip, got $ICE_COAST")
 CLOSURE in ("default", "half_wind_tke") || error("CLOSURE must be \"default\" or \"half_wind_tke\", got $CLOSURE")
+include(joinpath(@__DIR__, "..", "src", "run_name_guard.jl"))
+guard_run_name(RUN_NAME)   # stop if another job is writing this run's files
 COASTAL_FRESHWATER && !isfile(COASTAL_FRESHWATER_FILE) &&
     error("$COASTAL_FRESHWATER_FILE not found: run tools/hammond_jones_freshwater.jl first")
 
