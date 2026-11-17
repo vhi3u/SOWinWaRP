@@ -12,7 +12,12 @@
 #           "max h·ℵ", and the yardstick for their coastal piles (12-33 m at 97E)
 # Cell areas from the cell-centre coordinates (B-SOSE's latitude spacing is Mercator-like), so no grid file is needed.
 #
-# Reads <data>/SIArea_bsoseI156_<year>_5day.nc and SIHeff_..., the files the nested scripts read. LOGIN-NODE SAFE.
+# SURFACE T AND S. Also the top level's (the same 4.2 m cell as ours) lowest and highest temperature and salinity,
+# with where and when, from the monthly Theta and Salt: what the runs' progress line calls "surface S (min, max),
+# T (min, max)". Monthly means, so the runs' daily snapshots will reach further in both directions.
+#
+# Reads <data>/SIArea_bsoseI156_<year>_5day.nc and SIHeff_..., the files the nested scripts read, and
+# Theta_/Salt_bsoseI156_2013to2024_monthly.nc (the top level only). LOGIN-NODE SAFE.
 # ==============================================================================
 
 using NCDatasets, Dates, Printf
@@ -67,4 +72,48 @@ for m in unique(Date.(year.(first.(rows)), month.(first.(rows))))
     r = filter(t -> Date(year(t[1]), month(t[1])) == m, rows)
     @printf("  %-8s | %8.2f %8.2f %8.0f %10.2f\n", Dates.format(m, "yyyy-mm"), sum(getindex.(r, 2)) / length(r),
             sum(getindex.(r, 3)) / length(r), sum(getindex.(r, 4)) / length(r), maximum(getindex.(r, 5)))
+end
+
+# ── the top level's temperature and salinity, monthly means ──────────────────────────────────
+"B-SOSE's monthly record stamped at `stamp` averages the month before the one it is stamped in."
+averaged_month(stamp) = round(DateTime(stamp), Month) - Month(1)
+
+function surface_extremes(token, names)
+    path = joinpath(BDIR, "$(token)_bsoseI156_2013to2024_monthly.nc")
+    isfile(path) || (@warn "no $path: no surface $token"; return nothing)
+    ds = NCDataset(path)
+    x, yc = coord(ds, "XC", 1), coord(ds, "YC", 2)
+    i = findall(λ -> LON[1] < λ < LON[2], x)
+    j = findall(φ -> LAT[1] < φ < LAT[2], yc)
+    name = first_var(ds, names)
+    out = []   # (month, min, its lon, its lat, max, its lon, its lat)
+    for (n, stamp) in enumerate(ds["time"][:])
+        m = averaged_month(stamp)
+        year(m) in YEARS || continue
+        A = f64(ds[name][i, j, 1, n])
+        A[A .== 0] .= NaN                                   # B-SOSE's land is zero
+        lo = argmin(map(a -> isnan(a) ? Inf : a, A)); hi = argmax(map(a -> isnan(a) ? -Inf : a, A))
+        push!(out, (m, A[lo], x[i[lo[1]]], yc[j[lo[2]]], A[hi], x[i[hi[1]]], yc[j[hi[2]]]))
+    end
+    close(ds)
+    return out
+end
+
+for (label, token, names, unit) in (("TEMPERATURE", "Theta", ("THETA", "Theta"), "°C"), ("SALINITY", "Salt", ("SALT", "Salt"), "g/kg"))
+    r = surface_extremes(token, names)
+    (r === nothing || isempty(r)) && continue
+    println("\nB-SOSE SURFACE $label (top level, 0-4.2 m; monthly means over 90-150E, 70-45S), $unit")
+    @printf("  %-6s | %-36s | %-36s\n", "year", "lowest", "highest")
+    for y in YEARS
+        ry = filter(t -> year(t[1]) == y, r)
+        isempty(ry) && continue
+        a, b = argmin(getindex.(ry, 2)), argmax(getindex.(ry, 5))
+        @printf("  %-6d | %7.2f at %6.2fE %5.2fS in %s | %7.2f at %6.2fE %5.2fS in %s\n", y,
+                ry[a][2], ry[a][3], -ry[a][4], Dates.format(ry[a][1], "yyyy-mm"),
+                ry[b][5], ry[b][6], -ry[b][7], Dates.format(ry[b][1], "yyyy-mm"))
+    end
+    @printf("  %-8s | %8s %8s\n", "month", "lowest", "highest")
+    for t in r
+        @printf("  %-8s | %8.2f %8.2f\n", Dates.format(t[1], "yyyy-mm"), t[2], t[5])
+    end
 end
