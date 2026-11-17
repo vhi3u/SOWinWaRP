@@ -1,9 +1,9 @@
-# SOWinWaRP (90-150E, 70-45S, 1/6°) nested in B-SOSE, with B-SOSE's closure: a TKE scheme under its constant backgrounds.
+# SOWinWaRP (90-150E, 70-45S, 1/6°) nested in B-SOSE, with NumericalEarth's default CATKE: the control for the B-SOSE closure.
 #
-#     julia --project=. examples/sowinwarp_nested_bsose_closure.jl
+#     julia --project=. examples/sowinwarp_nested_bsose_catke.jl
 #
 # A fixed configuration: every setting is written below, nothing is read from the environment. Two years from
-# 2014-06-01T12:00 as 2Y_nested_bsose_<CLOSURE>_hj_pr207, on B-SOSE's own bathymetry and levels, with Hammond & Jones
+# 2014-06-01T12:00 as 2Y_nested_bsose_catke_hj_pr207, on B-SOSE's own bathymetry and levels, with Hammond & Jones
 # (2016) Antarctic fresh water. Otherwise as examples/sowinwarp_nested.jl (fix9): open-boundary sea ice from
 # B-SOSE, ERA5, penetrating shortwave, no ice grounding. Writes the same NetCDF files, so every tool in tools/
 # reads it: <RUN_NAME>_{surface,midlon,free_surface,surface_fluxes,eke,sea_ice}.nc.
@@ -36,13 +36,9 @@ include(joinpath(@__DIR__, "..", "src", "coastal_freshwater.jl"))   # coastal_fr
 # ## Run settings
 
 const SMOKE    = false      # true: 2 days, 6-hourly output
-# CLOSURE, the only setting the closure runs differ in (see "Ocean"):
-#   "ggl"           CATKE under B-SOSE's Table 1 constants: B-SOSE's closure as Verdy & Mazloff (2017) describe it
-#   "catke"         NumericalEarth's default CATKE alone: the control for "ggl"
-#   "half_wind_tke" that CATKE with the surface wind's TKE flux coefficient Cᵂu★ halved (3.179 -> 1.590)
-const CLOSURE  = "ggl"
-CLOSURE in ("ggl", "catke", "half_wind_tke") || error("CLOSURE must be \"ggl\", \"catke\" or \"half_wind_tke\", got $CLOSURE")
-const RUN_NAME = SMOKE ? "bsose_$(CLOSURE)_smoke" : "2Y_nested_bsose_$(CLOSURE)_hj_pr207"
+# One of two scripts that differ ONLY in the closure (and their run names); examples/sowinwarp_nested_bsose_ggl.jl is the same run with B-SOSE's constants under the CATKE.
+# They are separate files so that no setting changes between submissions: a job reads its script when it starts.
+const RUN_NAME = SMOKE ? "bsose_catke_smoke" : "2Y_nested_bsose_catke_hj_pr207"
 const BDIR     = "/storage/scratch1/1/vnguyen480/SOWinWaRP/data"   # B-SOSE, its grid.nc, the 5-day ice, era5/
 const ARCH     = GPU()
 
@@ -168,19 +164,10 @@ grid = ImmersedBoundaryGrid(underlying_grid, PartialCellBottom(bottom_height; mi
 # before the first step. NumericalEarth's defaults for the open boundaries, the Flather barotropic exterior, the
 # bathymetry blend toward B-SOSE's seafloor and the 1/6-hour relaxation band.
 #
-# CLOSURE (set at the top). All three build CATKE exactly as NumericalEarth's default_ocean_closure (Cᵇ = 0.01,
-# Cᵂϵ = 1.0); "half_wind_tke" halves Cᵂu★, and "ggl" adds the constant terms below. The deep mixed layers of
-# 2Y_nested_bsose_ggl_hj (10-90 m too deep at 65-45S) are what "catke" and "half_wind_tke" test: B-SOSE's constants,
-# CATKE's wind-driven mixing, or neither.
-# "ggl" is B-SOSE's closure as Verdy & Mazloff (2017) describe it: the GGL90 mixed-layer scheme (Gaspar et al. 1990, a
-# one-equation TKE closure) over Table 1's constant backgrounds, ν, κ = 10 m²/s horizontal and νz = 1e-3, κz = 1e-4
-# m²/s vertical; no eddy parameterization. Oceananigans has no GGL90, so CATKE, the same kind of scheme, stands in,
-# built exactly as NumericalEarth's default_ocean_closure (Cᵇ = 0.01, Cᵂϵ = 1.0): against the CATKE runs, only the two
-# constant terms differ. (Those constants are the 1/3° B-SOSE's; i156 is 1/6° and may use others.) The vertical
-# background is implicit. κz = 1e-4 m²/s is ~10x the observed interior diffusivity: B-SOSE's adjoint corrects for
-# it, a free-running nest does not, so expect the thermocline to erode slowly.
-# The constants alone, without the TKE scheme (2Y_nested_bsose_conv_hj), left the wind's momentum in the 4.2 m top
-# cell (Ekman depth √(2νz/f) ≈ 4 m) and spun the surface up to 2-4.6 m/s.
+# CLOSURE: NumericalEarth's default CATKE alone, built exactly as default_ocean_closure (Cᵇ = 0.01, Cᵂϵ = 1.0), with
+# none of B-SOSE's constant backgrounds. The control for examples/sowinwarp_nested_bsose_ggl.jl:
+# 2Y_nested_bsose_ggl_hj mixed 10-90 m too deep at 65-45S, and this says whether B-SOSE's constants (νz = 1e-3, κz =
+# 1e-4 m²/s, Laplacian 10 m²/s) are why, or CATKE itself.
 #
 # COASTAL FRESHWATER: Hammond & Jones (2016), the Antarctic ice-shelf melt, iceberg melt and runoff B-SOSE
 # prescribes (341 Gt/yr in the box, at most 2.7 m/yr), constant in time, as a virtual salt flux in the top cell
@@ -191,16 +178,10 @@ grid = ImmersedBoundaryGrid(underlying_grid, PartialCellBottom(bottom_height; mi
 dataset = BSOSEMonthly(dir = BDIR, iteration = 156)
 parent_records = length(bracketing_dates(dataset, :temperature, (start_date, end_date)))
 
-catke = CATKEVerticalDiffusivity(VerticallyImplicitTimeDiscretization(), Float64;
-                                 mixing_length = CATKEMixingLength(Cᵇ = 0.01),
-                                 turbulent_kinetic_energy_equation =
-                                     CATKEEquation(Cᵂϵ = 1.0, Cᵂu★ = (CLOSURE == "half_wind_tke" ? 0.5 : 1.0) * CATKEEquation().Cᵂu★))
-closure = CLOSURE == "ggl" ?
-    (catke,
-     HorizontalScalarDiffusivity(ν = 10.0, κ = 10.0),
-     VerticalScalarDiffusivity(VerticallyImplicitTimeDiscretization(); ν = 1e-3, κ = 1e-4)) : catke
-@info "closure: $CLOSURE, CATKE Cᵂu★ = $(catke.turbulent_kinetic_energy_equation.Cᵂu★)" *
-      (CLOSURE == "ggl" ? ", plus Laplacian 10 m²/s horizontal and νz, κz = 1e-3, 1e-4 m²/s" : "")
+closure = CATKEVerticalDiffusivity(VerticallyImplicitTimeDiscretization(), Float64;
+                                   mixing_length = CATKEMixingLength(Cᵇ = 0.01),
+                                   turbulent_kinetic_energy_equation = CATKEEquation(Cᵂϵ = 1.0))
+@info "closure: catke -- CATKE (NumericalEarth's default) alone"
 
 coastal_freshwater = coastal_freshwater_forcing("coastal_freshwater_hj.nc", bottom_height;
                                                 λ₁, φ₁, scaling = SCALING, arch = ARCH)
@@ -453,14 +434,13 @@ T, S = child.tracers.T, child.tracers.S
 
 output_metadata = Dict("run_name" => RUN_NAME, "start_date" => string(start_date), "end_date" => string(end_date),
                 "dataset" => "BSOSE",
-                "setup" => "examples/sowinwarp_nested_bsose_closure.jl",
+                "setup" => "examples/sowinwarp_nested_bsose_catke.jl",
                 "boundaries" => "one-way nest in B-SOSE monthly (NumericalEarth nested_ocean_simulation)",
                 "atmosphere" => "ERA5 (NCAR ds633.0), mean_sea_level_pressure",
                 "sea_ice" => "ClimaSeaIce, IncrementalRemapping with ClimaSeaIce PR #207's face transport, free-slip coasts, started from B-SOSE SIarea/SIheff, " *
                              "open sides take B-SOSE 5-day ice (nested_sea_ice_simulation open boundaries)",
                 "coastal_freshwater" => "constant, from coastal_freshwater_hj.nc (Hammond & Jones 2016)",
-                "closure" => CLOSURE == "ggl" ? "CATKE (NumericalEarth default, for GGL90) + Laplacian 10 m2/s horizontal + nu_z 1e-3 / kappa_z 1e-4 vertical (B-SOSE Table 1)" :
-                             CLOSURE == "catke" ? "CATKE (NumericalEarth default)" : "CATKE (NumericalEarth default) with Cᵂu★ halved",
+                "closure" => "CATKE (NumericalEarth default)",
                 "ice_grounding" => "off (basal_stress = nothing)",
                 "bathymetry" => "B-SOSE i156 Depth (grid.nc), area-aggregated",
                 "penetrating_shortwave" => "yes: TwoColorRadiation fed by the coupler",
