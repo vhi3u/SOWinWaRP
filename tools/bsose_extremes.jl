@@ -1,7 +1,8 @@
 # ==============================================================================
 # bsose_extremes.jl -- B-SOSE's extremes over our box (90-150E, 70-45S) through time, and where they are: the largest
 # h·ℵ in any cell, the lowest and highest surface temperature and salinity, and the ice extent, area and volume.
-# From the MONTHLY and the 5-DAY distributions, so a run's progress line has a yardstick at either cadence.
+# Surface T and S from the MONTHLY and the 5-DAY distributions; the sea ice from the 5-DAY one only (there are no
+# monthly ice files here).
 #
 #     julia --project=. tools/bsose_extremes.jl                              # 2014-06-01 to 2016-06-01, both cadences
 #     CADENCE=fiveday START_DATE=2014-06-01 END_DATE=2015-06-01 julia --project=. tools/bsose_extremes.jl
@@ -23,7 +24,7 @@
 #
 # READS (BSOSE_DIR, default the PACE data directory). Ice and surface tokens are matched whatever their case
 # (B-SOSE writes both SIArea and SIarea):
-#   monthly  SIarea, SIheff, Theta, Salt  as <token>_bsoseI156_2013to2024_monthly.nc
+#   monthly  Theta, Salt                  as <token>_bsoseI156_2013to2024_monthly.nc
 #   5-day    SIArea, SIHeff, Theta, Salt  as <token>_bsoseI156_<year>_5day.nc
 # Only the top level of Theta and Salt is read, one record at a time. LOGIN-NODE SAFE.
 #
@@ -105,14 +106,17 @@ end
 nanargmax(A) = argmax(map(a -> isnan(a) ? -Inf : a, A))
 nanargmin(A) = argmin(map(a -> isnan(a) ? Inf : a, A))
 
+has_ice(cadence) = cadence === :fiveday
+
 function extremes(cadence)
-    srcs = Dict(q => source(q, cadence) for q in (:ℵ, :V, :T, :S))
-    dates = srcs[:V].dates
-    for q in (:ℵ, :T, :S)
-        srcs[q].dates == dates || error("$(TOKENS[q]) and SIheff hold different $(cadence) records")
+    quantities = has_ice(cadence) ? (:ℵ, :V, :T, :S) : (:T, :S)
+    srcs = Dict(q => source(q, cadence) for q in quantities)
+    dates = srcs[:S].dates
+    for q in quantities
+        srcs[q].dates == dates || error("$(TOKENS[q]) and Salt hold different $(cadence) records")
     end
     # the box, and cell areas from the cell-centre coordinates (latitude spacing is Mercator-like)
-    x, yc = NCDataset(srcs[:V].paths[1]) do ds; coord(ds, "XC", 1), coord(ds, "YC", 2) end
+    x, yc = NCDataset(srcs[:S].paths[1]) do ds; coord(ds, "XC", 1), coord(ds, "YC", 2) end
     i = findall(λ -> LON[1] < λ < LON[2], x); j = findall(φ -> LAT[1] < φ < LAT[2], yc)
     i, j = first(i):last(i), first(j):last(j)
     λ, φ = x[i], yc[j]
@@ -123,16 +127,21 @@ function extremes(cadence)
     land = nothing
     @info "B-SOSE $(cadence): $(length(dates)) records from $(first(dates)) to $(last(dates))"
     for n in eachindex(dates)
-        ℵ, V, T, S = (read_record(srcs[q], n, i, j) for q in (:ℵ, :V, :T, :S))
+        T, S = read_record(srcs[:T], n, i, j), read_record(srcs[:S], n, i, j)
         land === nothing && (land = isnan.(S))
-        ℵ0, V0 = replace(ℵ, NaN => 0.0), replace(V, NaN => 0.0)
-        kv, ks, kS, kt, kT = nanargmax(V), nanargmin(S), nanargmax(S), nanargmin(T), nanargmax(T)
+        ks, kS, kt, kT = nanargmin(S), nanargmax(S), nanargmin(T), nanargmax(T)
         at(k) = (λ[k[1]], φ[k[2]])
-        push!(rows, (; date = dates[n],
-                       hv = V[kv], hv_at = at(kv),
-                       Smin = S[ks], Smin_at = at(ks), Smax = S[kS], Smax_at = at(kS),
-                       Tmin = T[kt], Tmin_at = at(kt), Tmax = T[kT], Tmax_at = at(kT),
-                       extent = sum(cell[ℵ0 .> 0.15]) / 1e12, area = sum(ℵ0 .* cell) / 1e12, volume = sum(V0 .* cell) / 1e9))
+        row = (; date = dates[n],
+                 Smin = S[ks], Smin_at = at(ks), Smax = S[kS], Smax_at = at(kS),
+                 Tmin = T[kt], Tmin_at = at(kt), Tmax = T[kT], Tmax_at = at(kT))
+        if has_ice(cadence)
+            ℵ, V = read_record(srcs[:ℵ], n, i, j), read_record(srcs[:V], n, i, j)
+            ℵ0, V0 = replace(ℵ, NaN => 0.0), replace(V, NaN => 0.0)
+            kv = nanargmax(V)
+            row = merge(row, (; hv = V[kv], hv_at = at(kv), extent = sum(cell[ℵ0 .> 0.15]) / 1e12,
+                                area = sum(ℵ0 .* cell) / 1e12, volume = sum(V0 .* cell) / 1e9))
+        end
+        push!(rows, row)
     end
     return rows, λ, φ, land
 end
@@ -147,15 +156,29 @@ function report(cadence, rows)
     for y in unique(year.(getfield.(rows, :date)))
         r = filter(t -> year(t.date) == y, rows)
         best(f, get) = r[f(get.(r))]
-        a = best(argmax, t -> t.hv); b = best(argmin, t -> t.Smin); c = best(argmax, t -> t.Smax)
-        d = best(argmin, t -> t.Tmin); e = best(argmax, t -> t.Tmax); g = best(argmax, t -> t.extent)
+        b = best(argmin, t -> t.Smin); c = best(argmax, t -> t.Smax)
+        d = best(argmin, t -> t.Tmin); e = best(argmax, t -> t.Tmax)
         println("\n  $y")
-        @printf("    max h·ℵ        %7.2f m      at %s on %s\n", a.hv, place(a.hv_at), Date(a.date))
+        if has_ice(cadence)
+            a = best(argmax, t -> t.hv)
+            @printf("    max h·ℵ        %7.2f m      at %s on %s\n", a.hv, place(a.hv_at), Date(a.date))
+        end
         @printf("    lowest S       %7.2f g/kg   at %s on %s\n", b.Smin, place(b.Smin_at), Date(b.date))
         @printf("    highest S      %7.2f g/kg   at %s on %s\n", c.Smax, place(c.Smax_at), Date(c.date))
         @printf("    lowest T       %7.2f °C     at %s on %s\n", d.Tmin, place(d.Tmin_at), Date(d.date))
         @printf("    highest T      %7.2f °C     at %s on %s\n", e.Tmax, place(e.Tmax_at), Date(e.date))
-        @printf("    max extent     %7.2f 10⁶ km² on %s (area %.2f, volume %.0f km³)\n", g.extent, Date(g.date), g.area, g.volume)
+        if has_ice(cadence)
+            g = best(argmax, t -> t.extent)
+            @printf("    max extent     %7.2f 10⁶ km² on %s (area %.2f, volume %.0f km³)\n", g.extent, Date(g.date), g.area, g.volume)
+        end
+    end
+    if !has_ice(cadence)
+        println("\n  BY MONTH")
+        @printf("  %-8s | %7s %7s | %7s %7s\n", "month", "S low", "S high", "T low", "T high")
+        for t in rows
+            @printf("  %-8s | %7.2f %7.2f | %7.2f %7.2f\n", Dates.format(t.date, "yyyy-mm"), t.Smin, t.Smax, t.Tmin, t.Tmax)
+        end
+        return
     end
     println("\n  BY MONTH (the extreme over the month's records, and where the largest h·ℵ sat)")
     @printf("  %-8s | %7s %-16s | %7s %7s | %7s %7s | %7s %6s %7s\n",
@@ -173,10 +196,13 @@ end
 function write_csv(cadence, rows)
     path = joinpath(OUTDIR, "bsose_extremes_$(cadence).csv")
     open(path, "w") do io
-        println(io, "date,max_hv_m,hv_lon,hv_lat,S_min,Smin_lon,Smin_lat,S_max,Smax_lon,Smax_lat,T_min,Tmin_lon,Tmin_lat,T_max,Tmax_lon,Tmax_lat,extent_1e6km2,area_1e6km2,volume_km3")
+        ice = has_ice(cadence)
+        println(io, "date,S_min,Smin_lon,Smin_lat,S_max,Smax_lon,Smax_lat,T_min,Tmin_lon,Tmin_lat,T_max,Tmax_lon,Tmax_lat" *
+                    (ice ? ",max_hv_m,hv_lon,hv_lat,extent_1e6km2,area_1e6km2,volume_km3" : ""))
         for t in rows
-            println(io, join((Date(t.date), t.hv, t.hv_at..., t.Smin, t.Smin_at..., t.Smax, t.Smax_at...,
-                              t.Tmin, t.Tmin_at..., t.Tmax, t.Tmax_at..., t.extent, t.area, t.volume), ","))
+            fields = (Date(t.date), t.Smin, t.Smin_at..., t.Smax, t.Smax_at..., t.Tmin, t.Tmin_at..., t.Tmax, t.Tmax_at...)
+            ice && (fields = (fields..., t.hv, t.hv_at..., t.extent, t.area, t.volume))
+            println(io, join(fields, ","))
         end
     end
     @info "wrote $path"
@@ -191,10 +217,11 @@ function plot_extremes(cadence, rows, λ, φ, land)
     ticklab = Dates.format.(ticks, "yyyy-mm")
     label = cadence === :monthly ? "monthly means" : "5-day means"
 
-    fig = Figure(size = (1700, 1150))
-    panels = ((1, "largest h·ℵ in a cell (m)", [(:hv, :black, "max h·ℵ")]),
-              (2, "surface salinity (g/kg)", [(:Smin, :steelblue, "lowest"), (:Smax, :firebrick, "highest")]),
-              (3, "surface temperature (°C)", [(:Tmin, :steelblue, "lowest"), (:Tmax, :firebrick, "highest")]))
+    ice = has_ice(cadence)
+    fig = Figure(size = (ice ? 1700 : 1200, 1150))
+    panels = ((1, "surface salinity (g/kg)", [(:Smin, :steelblue, "lowest"), (:Smax, :firebrick, "highest")]),
+              (2, "surface temperature (°C)", [(:Tmin, :steelblue, "lowest"), (:Tmax, :firebrick, "highest")]))
+    ice && (panels = (panels..., (3, "largest h·ℵ in a cell (m)", [(:hv, :black, "max h·ℵ")])))
     for (col, title, lines) in panels
         ax = Axis(fig[1, col]; title = "B-SOSE $title, $label", xticks = (tickpos, ticklab), xticklabelrotation = π / 4)
         for (f, c, l) in lines
@@ -204,9 +231,9 @@ function plot_extremes(cadence, rows, λ, φ, land)
     end
 
     # where: the land as a grey background, each record's extreme coloured by date (▲ highest, ▼ lowest)
-    maps = ((1, "where the largest h·ℵ sat", [(:hv_at, :utriangle)]),
-            (2, "where the lowest (▼) and highest (▲) S sat", [(:Smin_at, :dtriangle), (:Smax_at, :utriangle)]),
-            (3, "where the lowest (▼) and highest (▲) T sat", [(:Tmin_at, :dtriangle), (:Tmax_at, :utriangle)]))
+    maps = ((1, "where the lowest (▼) and highest (▲) S sat", [(:Smin_at, :dtriangle), (:Smax_at, :utriangle)]),
+            (2, "where the lowest (▼) and highest (▲) T sat", [(:Tmin_at, :dtriangle), (:Tmax_at, :utriangle)]))
+    ice && (maps = (maps..., (3, "where the largest h·ℵ sat", [(:hv_at, :utriangle)])))
     for (col, title, marks) in maps
         ax = Axis(fig[2, col]; title, aspect = DataAspect(), xlabel = "longitude", ylabel = "latitude",
                   limits = (LON..., LAT...))
@@ -217,7 +244,7 @@ function plot_extremes(cadence, rows, λ, φ, land)
                      marker, markersize = 12, strokewidth = 0.5, strokecolor = :black)
         end
     end
-    Colorbar(fig[2, 4]; colormap = :viridis, colorrange = extrema(days), ticks = (tickpos, ticklab), label = "date")
+    Colorbar(fig[2, length(maps) + 1]; colormap = :viridis, colorrange = extrema(days), ticks = (tickpos, ticklab), label = "date")
     path = joinpath(OUTDIR, "bsose_extremes_$(cadence).png")
     save(path, fig)
     @info "wrote $path"
