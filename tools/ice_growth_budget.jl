@@ -85,6 +85,8 @@ bandsum(F, b) = sum(F[bandmask[b]] .* A[bandmask[b]])
 datetime(t) = start + Millisecond(round(Int, 1000t))
 window_month(t) = (d = datetime(t - 43200); (year(d), month(d)))   # the daily window's centre
 months = unique(window_month.(tf[keep]))
+# whole months only: a month the run covers in part is not comparable with B-SOSE's whole-month change
+filter!(ym -> count(n -> window_month(tf[n]) == ym, keep) >= daysinmonth(Date(ym...)) - 1, months)
 
 const KM3 = 1e9
 terms = (:total, :thermo, :air, :ocean, :frazil, :drift, :air_check)
