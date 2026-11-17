@@ -428,6 +428,7 @@ simulation.callbacks[:progress] = Callback(progress, TimeInterval(output_interva
 #                      (W/m², negative down). The Hammond & Jones forcing is not in them.
 #   _eke.nc            30-day means of u, v, T, S, uu, vv at cell centres, full depth
 #   _sea_ice.nc        h, ℵ, snow, ice u and v, daily
+#   _sea_ice_fluxes.nc the sea ice heat and mass budget, daily means (below)
 
 u, v, w = child.velocities
 T, S = child.tracers.T, child.tracers.S
@@ -478,6 +479,40 @@ ocean.output_writers[:surface_fluxes] =
                      "averaging_window_seconds" => Float64(output_interval))),
                  overwrite_files = true)
 
+# The sea ice's heat and mass budget, daily means, for tools/ice_growth_budget.jl: what grows and melts the ice, the
+# air above or the ocean below. Every heat flux is W/m², POSITIVE UPWARD (ClimaSeaIce's convention: the slab's
+# volume tendency is (top - bottom)/(ρᵢ L), so a positive top flux grows ice and a positive bottom flux melts it).
+#   top_heat         net air-ice flux the slab sees, sensible + latent + longwave + absorbed shortwave, × ℵ (per cell area)
+#   sensible_heat, latent_heat                  its turbulent parts, per ICE area (not × ℵ)
+#   upwelling_longwave, absorbed_longwave, absorbed_shortwave   its radiative parts, per ICE area (absorbed ones < 0)
+#   interface_heat   ocean -> ice at the ice base, × ℵ (> 0 melts the ice from below)
+#   frazil_heat      heat the ice takes from water cooled below freezing, per cell area (< 0: frazil ice forms)
+#   ice_mass_tendency    ρᵢ ∂(h ℵ)/∂t from thermodynamics alone, kg m⁻² s⁻¹ per cell area (the advection is NOT in it)
+#   snow_mass_tendency   the same for snow;  snowfall  the snowfall the ice receives, kg m⁻² s⁻¹
+# All but the mass tendencies are the coupler's own fields; the mass tendencies are ClimaSeaIce's.
+ice_ocean = coupled_model.interfaces.sea_ice_ocean_interface.fluxes
+air_ice   = coupled_model.interfaces.atmosphere_sea_ice_interface.fluxes
+ice_top   = coupled_model.interfaces.net_fluxes.sea_ice.top
+ice_radiation = coupled_model.radiation.interface_fluxes.sea_ice
+ice_mass  = sea_ice.model.mass_fluxes
+sea_ice_fluxes = (; top_heat = ice_top.heat,
+                    sensible_heat = air_ice.sensible_heat, latent_heat = air_ice.latent_heat,
+                    upwelling_longwave = ice_radiation.upwelling_longwave,
+                    absorbed_longwave = ice_radiation.downwelling_longwave,
+                    absorbed_shortwave = ice_radiation.downwelling_shortwave,
+                    interface_heat = ice_ocean.interface_heat, frazil_heat = ice_ocean.frazil_heat,
+                    ice_mass_tendency = ice_mass.thermodynamics.ice, snow_mass_tendency = ice_mass.thermodynamics.snow,
+                    snowfall = ice_top.snowfall)
+ocean.output_writers[:sea_ice_fluxes] =
+    NetCDFWriter(child, sea_ice_fluxes;
+                 filename = "$(RUN_NAME)_sea_ice_fluxes.nc",
+                 schedule = AveragedTimeInterval(output_interval, window = output_interval),
+                 global_attributes = merge(output_metadata, Dict(
+                     "flux_convention" => "heat W/m2 positive UPWARD; top_heat, interface_heat x concentration, frazil_heat and mass tendencies per cell area; turbulent and radiative parts per ice area",
+                     "ice_density" => 900.0, "latent_heat_of_fusion" => 334e3,
+                     "averaging_window_seconds" => Float64(output_interval))),
+                 overwrite_files = true)
+
 u_cc = @at (Center, Center, Center) u
 v_cc = @at (Center, Center, Center) v
 ocean.output_writers[:eke] = NetCDFWriter(child, (; u = u_cc, v = v_cc, T, S, uu = u_cc^2, vv = v_cc^2);
@@ -502,5 +537,5 @@ sea_ice.output_writers[:sea_ice] = NetCDFWriter(sea_ice.model,
 
 # ## Run (no checkpoints)
 
-@info "output: $(RUN_NAME)_{surface,midlon,free_surface,surface_fluxes,eke,sea_ice}.nc in $(pwd())"
+@info "output: $(RUN_NAME)_{surface,midlon,free_surface,surface_fluxes,eke,sea_ice,sea_ice_fluxes}.nc in $(pwd())"
 run!(simulation)
