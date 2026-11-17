@@ -8,6 +8,8 @@
 #   extent  the area of cells with concentration above 0.15 (10⁶ km²), the usual definition
 #   area    Σ ℵ · cell area (10⁶ km²), what the runs' startup line calls "area"
 #   volume  Σ SIheff · cell area (km³); SIheff is ice volume per unit cell area
+#   max h·ℵ the largest SIheff in any one cell (m), with where and when: what the runs' progress line calls
+#           "max h·ℵ", and the yardstick for their coastal piles (12-33 m at 97E)
 # Cell areas from the cell-centre coordinates (B-SOSE's latitude spacing is Mercator-like), so no grid file is needed.
 #
 # Reads <data>/SIArea_bsoseI156_<year>_5day.nc and SIHeff_..., the files the nested scripts read. LOGIN-NODE SAFE.
@@ -24,7 +26,7 @@ f64(A) = Float64.(coalesce.(A, NaN))
 coord(ds, name, dim) = (v = f64(ds[name][:]); ndims(v) == 1 ? v : dim == 1 ? v[:, 1] : v[1, :])
 first_var(ds, names) = first(filter(n -> haskey(ds, n), names))
 
-rows = []   # (date, extent, area, volume)
+rows = []   # (date, extent, area, volume, max h·ℵ, its lon, its lat)
 for y in YEARS
     fa, fh = joinpath(BDIR, "SIArea_bsoseI156_$(y)_5day.nc"), joinpath(BDIR, "SIHeff_bsoseI156_$(y)_5day.nc")
     isfile(fa) || (@warn "no $fa; skipping $y"; continue)
@@ -40,26 +42,29 @@ for y in YEARS
     for n in eachindex(times)
         ℵ = replace(f64(da[ℵname][i, j, n]), NaN => 0.0)
         V = replace(f64(dh[hname][i, j, n]), NaN => 0.0)
-        push!(rows, (times[n], sum(cell[ℵ .> 0.15]) / 1e12, sum(ℵ .* cell) / 1e12, sum(V .* cell) / 1e9))
+        k = argmax(V)
+        push!(rows, (times[n], sum(cell[ℵ .> 0.15]) / 1e12, sum(ℵ .* cell) / 1e12, sum(V .* cell) / 1e9,
+                     V[k], x[i[k[1]]], yc[j[k[2]]]))
     end
     close(da); close(dh)
 end
 isempty(rows) && error("no B-SOSE 5-day ice files found in $BDIR")
 
 println("\nB-SOSE SEA ICE over 90-150E, 70-45S (5-day means, dated at the window centre)")
-@printf("  %-6s | %-24s | %-24s | %-22s\n", "year", "max extent (10⁶ km²)", "min extent (10⁶ km²)", "max volume (km³)")
+@printf("  %-6s | %-24s | %-24s | %-22s | %-34s\n", "year", "max extent (10⁶ km²)", "min extent (10⁶ km²)", "max volume (km³)", "max h·ℵ in a cell (m)")
 for y in YEARS
     r = filter(t -> year(t[1]) == y, rows)
     isempty(r) && continue
-    kx, kn, kv = argmax(getindex.(r, 2)), argmin(getindex.(r, 2)), argmax(getindex.(r, 4))
-    @printf("  %-6d | %5.2f on %s       | %5.2f on %s       | %6.0f on %s\n", y,
+    kx, kn, kv, kh = argmax(getindex.(r, 2)), argmin(getindex.(r, 2)), argmax(getindex.(r, 4)), argmax(getindex.(r, 5))
+    @printf("  %-6d | %5.2f on %s       | %5.2f on %s       | %6.0f on %s     | %5.2f at %.2fE %.2fS on %s\n", y,
             r[kx][2], Dates.format(r[kx][1], "yyyy-mm-dd"), r[kn][2], Dates.format(r[kn][1], "yyyy-mm-dd"),
-            r[kv][4], Dates.format(r[kv][1], "yyyy-mm-dd"))
+            r[kv][4], Dates.format(r[kv][1], "yyyy-mm-dd"),
+            r[kh][5], r[kh][6], -r[kh][7], Dates.format(r[kh][1], "yyyy-mm-dd"))
 end
 println("\n  MONTHLY MEANS")
-@printf("  %-8s | %8s %8s %8s\n", "month", "extent", "area", "volume")
+@printf("  %-8s | %8s %8s %8s %10s\n", "month", "extent", "area", "volume", "max h·ℵ")
 for m in unique(Date.(year.(first.(rows)), month.(first.(rows))))
     r = filter(t -> Date(year(t[1]), month(t[1])) == m, rows)
-    @printf("  %-8s | %8.2f %8.2f %8.0f\n", Dates.format(m, "yyyy-mm"), sum(getindex.(r, 2)) / length(r),
-            sum(getindex.(r, 3)) / length(r), sum(getindex.(r, 4)) / length(r))
+    @printf("  %-8s | %8.2f %8.2f %8.0f %10.2f\n", Dates.format(m, "yyyy-mm"), sum(getindex.(r, 2)) / length(r),
+            sum(getindex.(r, 3)) / length(r), sum(getindex.(r, 4)) / length(r), maximum(getindex.(r, 5)))
 end
