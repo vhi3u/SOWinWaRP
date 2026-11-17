@@ -36,3 +36,6 @@ run_testbed
 
 # tools/update_numericalearth.jl backs up the Manifest before each update
 Manifest.toml.*.bak
+
+# run-name locks (src/run_name_guard.jl)
+*.lock/
