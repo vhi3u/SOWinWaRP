@@ -140,7 +140,15 @@ function main()
     end
 
     # ── B-SOSE: 5-day records, nearest cell to each run cell, matching levels ────────────────
-    years = year(first(windows)[1]):year(last(windows)[2])
+    # A year counts only if its Theta, Salt and SIarea files all open: a truncated download (an "HDF error" on
+    # opening) drops that year's windows with a warning instead of stopping the whole comparison.
+    opens(path) = try NCDataset(_ -> true, path) catch; false end
+    years = filter(year(first(windows)[1]):year(last(windows)[2])) do y
+        bad = [t for t in ("Theta", "Salt", "SIarea") if !(try opens(bsose_file(t, y)) catch; false end)]
+        isempty(bad) || @warn "B-SOSE $y skipped: $(join(bad, ", ")) 5-day file missing or unreadable (truncated download?)"
+        isempty(bad)
+    end
+    isempty(years) && error("no year with all of B-SOSE's 5-day Theta, Salt and SIarea readable in $BSOSE_DIR")
     Trecs = bsose_records("Theta", ("THETA", "Theta"), years)
     Srecs = bsose_records("Salt", ("SALT", "Salt"), years)
     Arecs = bsose_records("SIarea", ("SIarea", "SIArea", "SIAREA"), years)
