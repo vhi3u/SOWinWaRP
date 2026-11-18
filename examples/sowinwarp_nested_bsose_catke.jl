@@ -38,7 +38,7 @@ include(joinpath(@__DIR__, "..", "src", "coastal_freshwater.jl"))   # coastal_fr
 const SMOKE    = false      # true: 2 days, 6-hourly output
 # One of two scripts that differ ONLY in the closure (and their run names); examples/sowinwarp_nested_bsose_ggl.jl is the same run with B-SOSE's constants under the CATKE.
 # They are separate files so that no setting changes between submissions: a job reads its script when it starts.
-const RUN_NAME = SMOKE ? "bsose_catke_smoke" : "2Y_nested_bsose_catke_hj_pr207"
+const RUN_NAME = SMOKE ? "bsose_catke_smoke" : "2Y_nested_bsose_catke_hj_pr207_icevel"
 const BDIR     = "/storage/scratch1/1/vnguyen480/SOWinWaRP/data"   # B-SOSE, its grid.nc, the 5-day ice, era5/
 const ARCH     = GPU()
 
@@ -210,8 +210,16 @@ end
 # thickness and concentration on inflow, ice let out but never pulled in, no snow brought in; it starts from
 # B-SOSE's ice on start_date. B-SOSE's ice is its 5-day SIarea (ℵ) and SIheff (volume h·ℵ per cell area), placed at
 # each window's centre (stamp − 2.5 days), regridded once: B-SOSE land takes its nearest B-SOSE ocean value within
-# 6 cells (the coastlines differ), then bilinear. h = SIheff/SIarea; ℵ below 0.01 is open water. The parent's ice
-# velocity is zero, so at the boundary the ice drifts with the nest's surface ocean.
+# 6 cells (the coastlines differ), then bilinear. h = SIheff/SIarea; ℵ below 0.01 is open water.
+#
+# The parent's ice VELOCITY is B-SOSE's 5-day SIuice/SIvice (C-grid faces averaged to cell centres, then regridded
+# the same way). NumericalEarth's boundary uses it to decide whether ice is entering or leaving at each boundary
+# face (boundary_ice_velocity, NestedModels/sea_ice_open_boundaries.jl); where it is zero it falls back on the
+# nest's surface ocean velocity. Until 2026-11-17 we passed zero, so the ocean decided, and the ice that B-SOSE
+# drifts INTO the domain was mostly shut out: over two years 2Y_nested_bsose_ggl_hj_pr207 took in ~120 km³ through
+# the west side against B-SOSE's ~580, and ~1150 through the east against ~1770, and lost 1079 km³ net through
+# its sides against B-SOSE's 523 (tools/ice_side_transport.jl). The inflow SPEED is still the nest's own ice
+# velocity on the first interior face; only the in/out decision comes from B-SOSE.
 #
 # Incremental remapping moves ℵ and volume together, so h stays bounded where ℵ is small (WENO inflated h at the
 # 97E corner in fix2). Free-slip coasts, MITgcm's default. No grounding: NumericalEarth turns on ClimaSeaIce's
@@ -257,15 +265,30 @@ function bsose_ice(first_date, last_date)
     years = [y for y in year(first_date)-1:year(last_date)+1
              if year(first_date) <= y <= year(last_date) || isfile(ice_file("SIArea", y))]
     dates, ℵs, Vs = DateTime[], Matrix{Float64}[], Matrix{Float64}[]
+    Us, Vels = Matrix{Float64}[], Matrix{Float64}[]
     for y in years, (token, names, out) in (("SIArea", ("SIarea", "SIArea", "SIAREA"), ℵs),
-                                             ("SIHeff", ("SIheff", "SIHeff", "SIHEFF"), Vs))
+                                             ("SIHeff", ("SIheff", "SIHeff", "SIHEFF"), Vs),
+                                             ("SIuice", ("SIuice", "SIUICE"), Us),
+                                             ("SIvice", ("SIvice", "SIVICE"), Vels))
         ds = NCDataset(ice_file(token, y))
         name = first(filter(n -> haskey(ds, n), names))
-        A = Float64.(coalesce.(ds[name][iB, jB, :], 0.0))
+        # MITgcm C grid: SIuice[i] is on the west face of cell i and SIvice[j] on the south face of cell j, so a
+        # cell's centre value is the mean of its two faces (one more face read on the east / north side)
+        A = if token == "SIuice"
+            Uf = Float64.(coalesce.(ds[name][first(iB):last(iB)+1, jB, :], 0.0))
+            0.5 .* (Uf[1:end-1, :, :] .+ Uf[2:end, :, :])
+        elseif token == "SIvice"
+            Vf = Float64.(coalesce.(ds[name][iB, first(jB):last(jB)+1, :], 0.0))
+            0.5 .* (Vf[:, 1:end-1, :] .+ Vf[:, 2:end, :])
+        else
+            Float64.(coalesce.(ds[name][iB, jB, :], 0.0))
+        end
         token == "SIArea" && append!(dates, DateTime.(ds["time"][:]) .- Hour(60))
         close(ds)
         append!(out, [regrid(A[:, :, n]) for n in axes(A, 3)])
     end
+    length(Us) == length(Vels) == length(dates) ||
+        error("B-SOSE ice: $(length(dates)) SIarea records but $(length(Us)) SIuice and $(length(Vels)) SIvice")
     (first(dates) <= first_date && last(dates) >= last_date) ||
         error("B-SOSE ice covers $(first(dates)) to $(last(dates)), not $first_date to $last_date")
 
@@ -273,7 +296,7 @@ function bsose_ice(first_date, last_date)
     open_water = .!(ℵ .>= 0.01)
     ℵ[open_water] .= 0; V[open_water] .= 0
     clamp!(ℵ, 0, 1); V .= max.(V, 0)
-    return (; dates, ℵ, V)
+    return (; dates, ℵ, V, u = stack(Us), v = stack(Vels))
 end
 
 function parent_ice(ice)
@@ -285,8 +308,12 @@ function parent_ice(ice)
         set!(ℵ[n], reshape(ℵⁿ, Nx, Ny, 1))
         set!(h[n], reshape(map((a, v) -> a >= 0.01 ? v / a : 0.0, ℵⁿ, Vⁿ), Nx, Ny, 1))
     end
-    still = series([first(times), last(times)])
-    return (; h, ℵ, u = still, v = still)
+    u, v = series(times), series(times)
+    for n in eachindex(times)
+        set!(u[n], reshape(ice.u[:, :, n], Nx, Ny, 1))
+        set!(v[n], reshape(ice.v[:, :, n], Nx, Ny, 1))
+    end
+    return (; h, ℵ, u, v)
 end
 
 # ClimaSeaIce PR #207's face transport over 0.7.2's (src/clima_sea_ice_pr207.jl): the swept area equals the C-grid
@@ -438,7 +465,7 @@ output_metadata = Dict("run_name" => RUN_NAME, "start_date" => string(start_date
                 "setup" => "examples/sowinwarp_nested_bsose_catke.jl",
                 "boundaries" => "one-way nest in B-SOSE monthly (NumericalEarth nested_ocean_simulation)",
                 "atmosphere" => "ERA5 (NCAR ds633.0), mean_sea_level_pressure",
-                "sea_ice" => "ClimaSeaIce, IncrementalRemapping with ClimaSeaIce PR #207's face transport, free-slip coasts, started from B-SOSE SIarea/SIheff, " *
+                "sea_ice" => "ClimaSeaIce, IncrementalRemapping with ClimaSeaIce PR #207's face transport, free-slip coasts, started from B-SOSE SIarea/SIheff; B-SOSE SIuice/SIvice decide inflow at the open sides, " *
                              "open sides take B-SOSE 5-day ice (nested_sea_ice_simulation open boundaries)",
                 "coastal_freshwater" => "constant, from coastal_freshwater_hj.nc (Hammond & Jones 2016)",
                 "closure" => "CATKE (NumericalEarth default)",
