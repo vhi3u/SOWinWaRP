@@ -119,8 +119,10 @@ else
     if isempty(years)
         @warn "no B-SOSE year readable: model only"
     else
-        # coordinates from the SIvice file, else from the monthly surfTflx file ice_side_transport.jl uses
-        geom = NCDataset(d -> haskey(d, "XC"), bfile("SIvice", first(years))) ? bfile("SIvice", first(years)) :
+        # cell-centre XC, YC from the SIheff file (SIvice's file carries the face coordinate, not YC; and
+        # grid.nc's XG/YG are corrupt in i156), else from the monthly surfTflx file ice_side_transport.jl uses
+        has_xy(p) = NCDataset(d -> haskey(d, "XC") && haskey(d, "YC"), p)
+        geom = has_xy(bfile("SIheff", first(years))) ? bfile("SIheff", first(years)) :
                joinpath(BSOSE_DIR, "surfTflx_bsoseI156_2013to2024_monthly.nc")
         xc, yc = NCDataset(geom) do d
             g(d["XC"][:]), g(d["YC"][:])
@@ -139,6 +141,8 @@ else
             dv, dh = NCDataset(bfile("SIvice", y)), NCDataset(bfile("SIheff", y))
             pick(d, names) = d[first(k for k in names if haskey(d, k))]
             Vv, Hv = pick(dv, ("SIvice", "SIVICE")), pick(dh, ("SIheff", "SIHeff", "SIHEFF"))
+            size(Vv)[1:2] == size(Hv)[1:2] == (length(xc), length(yc)) ||
+                error("SIvice $(size(Vv)), SIheff $(size(Hv)), XC×YC ($(length(xc)), $(length(yc))): not the C-grid layout assumed")
             for n in eachindex(dv["time"][:])
                 push!(cent, DateTime(dv["time"][n]) - Hour(60))
                 for l in 1:nl
