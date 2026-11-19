@@ -12,9 +12,12 @@
 # HOW. Flux through each y-face on the line = v × upwind h·ℵ × face length, km³ per month,
 # POSITIVE NORTHWARD, summed along the line and by longitude sector.
 #   model    <RUN>_sea_ice.nc daily SNAPSHOTS of v, h, ℵ; upwind cell from the sign of v.
-#   B-SOSE   SIvice (on the SOUTH face of cell j) and SIheff, 5-day means; the face nearest the
-#            line; upwind SIheff. A record counts toward the month holding its centre (stamp - 60 h).
-#            A product of means: an estimate, low where ice and velocity covary within 5 days.
+#   B-SOSE   SIvheff, B-SOSE's own meridional ice volume transport per metre (m²/s, on the SOUTH
+#            face of cell j), accumulated every time step, so exact; on the face nearest the line.
+#            Without SIvheff files for every year, falls back (with a warning) to SIvice × upwind SIheff,
+#            a product of 5-day means, low where ice and velocity covary within 5 days; with them,
+#            that estimate is printed beside the exact value. h·ℵ and v come from SIheff and SIvice.
+#            A record counts toward the month holding its centre (stamp - 60 h).
 # The line's face is the nearest one in each grid; both latitudes are printed.
 # Also per month: the line-mean h·ℵ and v (to tell "less ice reaches the line" from "it moves
 # slower"), and the northward transport as fresh water spread over the band from the line to the
@@ -119,6 +122,8 @@ else
     if isempty(years)
         @warn "no B-SOSE year readable: model only"
     else
+        exact = all(y -> opens(bfile("SIvheff", y)), years)
+        exact || @warn "no SIvheff 5-day file for every year in $(collect(years)): B-SOSE flux is SIvice × upwind SIheff (an estimate)"
         # cell-centre XC, YC from the SIheff file (SIvice's file carries YG, not YC; and
         # grid.nc's XG/YG are corrupt in i156), else from the monthly surfTflx file ice_side_transport.jl uses
         has_xy(p) = !isempty(p) && NCDataset(d -> haskey(d, "XC") && haskey(d, "YC"), p)
@@ -135,7 +140,7 @@ else
         φb = [(yc[j-1] + yc[j]) / 2 for j in jb]
         dxb = [R * cosd(p) * deg2rad(dλB) for p in φb]
         bsec = [sector_of(x) for x in xc[Ir]]
-        cent = DateTime[]; bflux = [Vector{Vector{Float64}}() for _ in 1:nl]
+        cent = DateTime[]; bflux = [Vector{Vector{Float64}}() for _ in 1:nl]; bprod = [Vector{Vector{Float64}}() for _ in 1:nl]
         bhA = [Vector{Vector{Float64}}() for _ in 1:nl]; bv = [Vector{Vector{Float64}}() for _ in 1:nl]
         for y in years
             dv, dh = NCDataset(bfile("SIvice", y)), NCDataset(bfile("SIheff", y))
@@ -153,21 +158,35 @@ else
                         error(@sprintf("SIvice's YG[%d] = %.4f is not the face between YC %.4f and %.4f", jb[l], yg[jb[l]], yc[jb[l]-1], yc[jb[l]]))
                 end
             end
+            dq = exact ? NCDataset(bfile("SIvheff", y)) : nothing
+            Q = exact ? pick(dq, ("SIvheff", "SIVHEFF")) : nothing
+            if exact
+                (size(Q, 1) == length(xc) && size(Q, 2) >= length(yc)) ||
+                    error("SIvheff $(size(Q)) against XC×YC ($(length(xc)), $(length(yc))): not the C-grid layout assumed")
+                DateTime.(dq["time"][:]) == DateTime.(dv["time"][:]) || error("SIvheff and SIvice $y hold different records")
+                if haskey(dq, "YG")
+                    yq = g(dq["YG"][:])
+                    all(l -> abs(yq[jb[l]] - φb[l]) < 0.01, 1:nl) || error("SIvheff's YG at the lines is not the faces between YC")
+                end
+            end
             for n in eachindex(dv["time"][:])
                 push!(cent, DateTime(dv["time"][n]) - Hour(60))
                 for l in 1:nl
                     v = z(g(Vv[Ir, jb[l], n])); H = z(g(Hv[Ir, jb[l]-1:jb[l], n]))
-                    push!(bflux[l], v .* ifelse.(v .> 0, H[:, 1], H[:, 2]) .* dxb[l])
+                    prod = v .* ifelse.(v .> 0, H[:, 1], H[:, 2]) .* dxb[l]
+                    push!(bprod[l], prod)
+                    push!(bflux[l], exact ? z(g(Q[Ir, jb[l], n])) .* dxb[l] : prod)
                     push!(bhA[l], (H[:, 1] .+ H[:, 2]) ./ 2); push!(bv[l], v)
                 end
             end
-            close(dv); close(dh)
+            close(dv); close(dh); exact && close(dq)
         end
         brecs = [[n for n in eachindex(cent) if (year(cent[n]), month(cent[n])) == ym] for ym in months]
         wb = [n for n in eachindex(cent) if month(cent[n]) in WINTER]
-        F = [reduce(hcat, bflux[l]) for l in 1:nl]; HA = [reduce(hcat, bhA[l]) for l in 1:nl]; VV = [reduce(hcat, bv[l]) for l in 1:nl]
+        F = [reduce(hcat, bflux[l]) for l in 1:nl]; P = [reduce(hcat, bprod[l]) for l in 1:nl]; HA = [reduce(hcat, bhA[l]) for l in 1:nl]; VV = [reduce(hcat, bv[l]) for l in 1:nl]
         nIr = length(Ir)
-        B = (; net = [km3(F[l], 1:nIr, brecs[k], months[k]) for l in 1:nl, k in 1:nm],
+        B = (; exact, net = [km3(F[l], 1:nIr, brecs[k], months[k]) for l in 1:nl, k in 1:nm],
+               est = [km3(P[l], 1:nIr, brecs[k], months[k]) for l in 1:nl, k in 1:nm],
                sec = [km3(F[l], findall(==(s), bsec), brecs[k], months[k]) for l in 1:nl, s in 1:ns, k in 1:nm],
                hA  = [isempty(brecs[k]) ? NaN : mean(HA[l][:, brecs[k]]) for l in 1:nl, k in 1:nm],
                v   = [iced_mean(VV[l], HA[l], 1:nIr, brecs[k]) for l in 1:nl, k in 1:nm],
@@ -180,7 +199,8 @@ end
 bar = "="^140
 println("\n", bar)
 println("SEA ICE VOLUME CROSSING LATITUDE LINES, $RUN -- km³ per month, + = NORTHWARD")
-println("  model: daily snapshots, v × upwind h·ℵ; B-SOSE: 5-day SIvice × upwind SIheff. h·ℵ: line mean (m); v: mean over iced faces (cm/s)")
+println("  model: daily snapshots, v × upwind h·ℵ; B-SOSE: ", B !== nothing && B.exact ? "SIvheff (its own time-step transport; 'v×h est' = 5-day SIvice × upwind SIheff, for comparison)" : "5-day SIvice × upwind SIheff (an estimate: no SIvheff)",
+        ". h·ℵ: line mean (m); v: mean over iced faces (cm/s)")
 println("  fresh water: the month's net northward ice, melted (ice salinity $(S_ICE) g/kg), spread over the band north of the line, cm")
 println(bar)
 tot(x) = (y = filter(!isnan, x); isempty(y) ? NaN : sum(y))
@@ -190,17 +210,17 @@ for l in 1:nl
     A = band_area(lo, hi, λ[1] - Δλ/2, λ[end] + Δλ/2)
     @printf("\n  %s   (model face %.3f, B-SOSE face %s; fresh water over %.0f-%.0fS, %.2e km²)\n", lname(l), φm[l],
             B === nothing ? "-" : @sprintf("%.3f", B.φ[l]), -lo, -hi, A / 1e6)
-    print("  month    |  net model  B-SOSE |  h·ℵ model B-SOSE |   v model B-SOSE | fresh cm model B-SOSE |")
+    print("  month    |  net model  B-SOSE  v×h est |  h·ℵ model B-SOSE |   v model B-SOSE | fresh cm model B-SOSE |")
     foreach(s -> @printf(" %s model B-SOSE |", sname(s)), 1:ns); println()
     for k in 1:nm
-        @printf("  %s  | %9.1f %7.1f |  %8.3f  %6.3f | %7.2f  %6.2f |   %8.1f  %7.1f |", label(months[k]),
-                M.net[l, k], bget(:net, l, k), M.hA[l, k], bget(:hA, l, k), 100 * M.v[l, k], 100 * bget(:v, l, k),
+        @printf("  %s  | %9.1f %7.1f %8.1f |  %8.3f  %6.3f | %7.2f  %6.2f |   %8.1f  %7.1f |", label(months[k]),
+                M.net[l, k], bget(:net, l, k), bget(:est, l, k), M.hA[l, k], bget(:hA, l, k), 100 * M.v[l, k], 100 * bget(:v, l, k),
                 100 * fresh(M.net[l, k] * KM3) / A, 100 * fresh(bget(:net, l, k) * KM3) / A)
         foreach(s -> @printf(" %15.1f %7.1f |", M.sec[l, s, k], bget(:sec, l, s, k)), 1:ns); println()
     end
     wk = [k for k in 1:nm if months[k][2] in WINTER]
-    @printf("  months %s, all years: model %.0f km³, B-SOSE %.0f km³ northward (fresh water %.1f vs %.1f cm)\n",
-            join(WINTER, ','), tot(M.net[l, wk]), B === nothing ? NaN : tot(B.net[l, wk]),
+    @printf("  months %s, all years: model %.0f km³, B-SOSE %.0f km³ (v×h est %.0f) northward (fresh water %.1f vs %.1f cm)\n",
+            join(WINTER, ','), tot(M.net[l, wk]), B === nothing ? NaN : tot(B.net[l, wk]), B === nothing ? NaN : tot(B.est[l, wk]),
             100 * fresh(tot(M.net[l, wk]) * KM3) / A, B === nothing ? NaN : 100 * fresh(tot(B.net[l, wk]) * KM3) / A)
 end
 println()

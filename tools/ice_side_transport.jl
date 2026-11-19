@@ -21,8 +21,10 @@
 #            Faces placed from XC, YC (grid.nc's XG/YG are corrupt in i156). Upwind SIheff from
 #            the cell on the upstream side, which B-SOSE has on both sides of our boundary.
 #            A record counts toward the month holding its window's centre (stamp - 60 h).
-#   A product of 5-day means is not the 5-day mean of the product, so B-SOSE's flux is an
-#   estimate too, low where ice and velocity vary together within 5 days.
+#   With SIuheff/SIvheff 5-day files for every year (B-SOSE's own ice volume transport per metre,
+#   m²/s, on the same faces, accumulated every time step) those are used and B-SOSE's flux is exact.
+#   Without them, a product of 5-day means is used, with a warning: not the 5-day mean of the
+#   product, so an estimate, low where ice and velocity vary together within 5 days.
 #
 # WRITES (OUTDIR, default plots/):
 #   <RUN>_ice_side_transport.png          monthly net flux per side, model and B-SOSE
@@ -138,6 +140,9 @@ if !isempty(BSOSE_DIR)
         @info @sprintf("B-SOSE faces: west %.3fE, east %.3fE, north %.3fS, south %.3fS",
                        xc[iW] - dλB/2, xc[iE] - dλB/2, -(yc[jN-1] + yc[jN]) / 2, -(yc[jS-1] + yc[jS]) / 2)
         up(u, Vup, Vdn) = u > 0 ? u * Vup : u * Vdn          # upwind along the + direction
+        exact = all(y -> isfile(file("SIuheff", y)) && isfile(file("SIvheff", y)), years)
+        exact || @warn "no SIuheff/SIvheff 5-day files for every year: B-SOSE flux is velocity × upwind SIheff (an estimate)"
+        @info exact ? "B-SOSE flux: SIuheff/SIvheff (exact)" : "B-SOSE flux: SIuice/SIvice × upwind SIheff (estimate)"
         centres = DateTime[]
         bf = Dict(s => Vector{Vector{Float64}}() for s in sides)
         for y in years
@@ -147,18 +152,35 @@ if !isempty(BSOSE_DIR)
             Hv = dh[pick(dh, ("SIheff", "SIHeff", "SIHEFF"))]
             size(U(du))[1:2] == size(depth) || error("SIuice is $(size(U(du))), XC×YC is $(size(depth)): not the layout assumed")
             stamps = [DateTime(s) for s in du["time"][:]]
+            # i156's SIvice (and SIvheff) carry 630 YG rows: rows 1:588 are the cells' south faces, the rest
+            # run past the domain; SIuice/SIuheff are XG × YC
+            size(Vv(dv), 1) == size(depth, 1) && size(Vv(dv), 2) >= size(depth, 2) ||
+                error("SIvice is $(size(Vv(dv))), XC×YC is $(size(depth)): not the layout assumed")
+            dqu = exact ? NCDataset(file("SIuheff", y)) : nothing; dqv = exact ? NCDataset(file("SIvheff", y)) : nothing
+            QU = exact ? dqu[pick(dqu, ("SIuheff", "SIUHEFF"))] : nothing
+            QV = exact ? dqv[pick(dqv, ("SIvheff", "SIVHEFF"))] : nothing
+            if exact
+                size(QU)[1:2] == size(depth) || error("SIuheff is $(size(QU)), XC×YC is $(size(depth))")
+                size(QV, 1) == size(depth, 1) && size(QV, 2) >= size(depth, 2) || error("SIvheff is $(size(QV)), XC×YC is $(size(depth))")
+                DateTime.(dqu["time"][:]) == stamps == DateTime.(dqv["time"][:]) || error("SIuheff/SIvheff $y records differ from SIuice's")
+            end
             for n in eachindex(stamps)
                 push!(centres, stamps[n] - Hour(60))
                 uW = z(g(U(du)[iW, Jr, n])); uE = z(g(U(du)[iE, Jr, n]))
                 vN = z(g(Vv(dv)[Ir, jN, n])); vS = z(g(Vv(dv)[Ir, jS, n]))
                 HW = z(g(Hv[iW-1:iW, Jr, n])); HE = z(g(Hv[iE-1:iE, Jr, n]))
                 HN = z(g(Hv[Ir, jN-1:jN, n])); HS = z(g(Hv[Ir, jS-1:jS, n]))
-                push!(bf[:west],  [bwet[iW, j] ? up(uW[k], HW[1, k], HW[2, k]) * dyB[j] : 0.0 for (k, j) in enumerate(Jr)])
-                push!(bf[:east],  [bwet[iE-1, j] ? -up(uE[k], HE[1, k], HE[2, k]) * dyB[j] : 0.0 for (k, j) in enumerate(Jr)])
-                push!(bf[:north], [bwet[i, jN-1] ? -up(vN[k], HN[k, 1], HN[k, 2]) * dxB(jN) : 0.0 for (k, i) in enumerate(Ir)])
-                push!(bf[:south], [bwet[i, jS] ? up(vS[k], HS[k, 1], HS[k, 2]) * dxB(jS) : 0.0 for (k, i) in enumerate(Ir)])
+                # per-metre transport on each face: B-SOSE's own (exact) or velocity × upwind SIheff
+                qW = exact ? z(g(QU[iW, Jr, n])) : [up(uW[k], HW[1, k], HW[2, k]) for k in eachindex(Jr)]
+                qE = exact ? z(g(QU[iE, Jr, n])) : [up(uE[k], HE[1, k], HE[2, k]) for k in eachindex(Jr)]
+                qN = exact ? z(g(QV[Ir, jN, n])) : [up(vN[k], HN[k, 1], HN[k, 2]) for k in eachindex(Ir)]
+                qS = exact ? z(g(QV[Ir, jS, n])) : [up(vS[k], HS[k, 1], HS[k, 2]) for k in eachindex(Ir)]
+                push!(bf[:west],  [bwet[iW, j] ? qW[k] * dyB[j] : 0.0 for (k, j) in enumerate(Jr)])
+                push!(bf[:east],  [bwet[iE-1, j] ? -qE[k] * dyB[j] : 0.0 for (k, j) in enumerate(Jr)])
+                push!(bf[:north], [bwet[i, jN-1] ? -qN[k] * dxB(jN) : 0.0 for (k, i) in enumerate(Ir)])
+                push!(bf[:south], [bwet[i, jS] ? qS[k] * dxB(jS) : 0.0 for (k, i) in enumerate(Ir)])
             end
-            close(du); close(dv); close(dh)
+            close(du); close(dv); close(dh); exact && (close(dqu); close(dqv))
         end
         bmonth(c) = (year(c), month(c))
         Bnet = Dict(s => [monthly(reduce(hcat, bf[s]), [n for n in eachindex(centres) if bmonth(centres[n]) == ym], daysinmonth(Date(ym...))) for ym in months] for s in sides)
