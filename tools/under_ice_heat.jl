@@ -30,8 +30,12 @@
 # PRINTS, per band and window: the cells; mean ℵ, run and B-SOSE; the top cell's T - Tf; the heat above
 # freezing ρ₀cₚ∫(T - Tf)dz over 0-HC_DEPTH m (columns at least that deep, wet in both), MJ/m², run and
 # B-SOSE, and the difference split at SPLIT m (above / below), with the difference as the ice it
-# could melt (1 MJ/m² melts 0.33 cm).
-# WRITES OUTDIR/<RUN>_under_ice_heat.png: per band, the 0-HC_DEPTH heat of both, and run - B-SOSE
+# could melt (1 MJ/m² melts 0.33 cm). Then, over the columns wet to DEEP_DEPTH in both (a subset: the
+# shelf drops out), the 0-HC_DEPTH difference again and the HC_DEPTH-DEEP_DEPTH heat of both and their
+# difference: a run short above HC_DEPTH but warm below it keeps its deep heat down (too little mixing);
+# short in both lacks the heat itself (sides, or drift from the initial state).
+# WRITES OUTDIR/<RUN>_under_ice_heat.png: per band, the 0-HC_DEPTH heat of both; run - B-SOSE heat by
+#   layer (0-SPLIT, SPLIT-HC_DEPTH, HC_DEPTH-DEEP_DEPTH, the last on the deep columns); and run - B-SOSE
 #   (T - Tf) against depth and time to PROFILE_ZMAX.
 #
 # LOGIN-NODE SAFE: NCDatasets and CairoMakie only; B-SOSE is read one record at a time, the box and the
@@ -39,7 +43,7 @@
 #
 # ENV: DIR (run files, default .), OUTDIR (plots), BSOSE_DIR (required), START (default: the file's
 #      start_date), BANDS (-70,-65,-60,-55), ICE_MIN (0.15), HC_DEPTH (100), SPLIT (40),
-#      PROFILE_ZMAX (300), MIN_RECORDS (B-SOSE records per window, default 4)
+#      DEEP_DEPTH (default: the bottom of the deepest level within PROFILE_ZMAX), PROFILE_ZMAX (300), MIN_RECORDS (B-SOSE records per window, default 4)
 # ==============================================================================================
 
 using NCDatasets, CairoMakie, Dates, Printf, Statistics
@@ -126,6 +130,12 @@ function main()
     upper = [-zf[k] <= SPLIT + 1e-6 for k in ks]
     abs(sum(Δz[in_hc]) - HC_DEPTH) > 0.5 &&
         @warn @sprintf("the levels make 0-%.1f m, not 0-%.0f m (HC_DEPTH)", sum(Δz[in_hc]), HC_DEPTH)
+    deep_depth = haskey(ENV, "DEEP_DEPTH") ? parse(Float64, ENV["DEEP_DEPTH"]) : -zf[ks[end]]
+    in_deep = [!in_hc[m] && -zf[ks[m]] <= deep_depth + 1e-6 for m in 1:nk]
+    any(in_deep) || error(@sprintf("no level between HC_DEPTH %.0f m and DEEP_DEPTH %.0f m", HC_DEPTH, deep_depth))
+    deep_bot = -zf[ks[findlast(in_deep)]]
+    abs(deep_bot - deep_depth) > 0.5 &&
+        @warn @sprintf("the levels make %.0f-%.1f m, not %.0f-%.0f m (DEEP_DEPTH)", HC_DEPTH, deep_bot, HC_DEPTH, deep_depth)
     # Wet in the run, top-down: Oceananigans' k counts up from the floor
     wet_run = [kbot[i, j] !== nothing && ks[m] >= kbot[i, j] for i in 1:Nx, j in 1:Ny, m in 1:nk]
 
@@ -187,7 +197,8 @@ function main()
     nb, nw = length(EDGES) - 1, length(windows)
     band_of = [findfirst(b -> EDGES[b] <= φ[j] < EDGES[b+1], 1:nb) for j in 1:Ny]
     wlat = cosd.(φ)
-    keys_ = (:cells, :ℵ_run, :ℵ_bsose, :sst_run, :sst_bsose, :hc_run, :hc_bsose, :Δhc_upper, :Δhc_lower, :S_bsose)
+    keys_ = (:cells, :ℵ_run, :ℵ_bsose, :sst_run, :sst_bsose, :hc_run, :hc_bsose, :Δhc_upper, :Δhc_lower, :S_bsose,
+             :deep_cells, :Δhc_sub, :dhc_run, :dhc_bsose)
     res = Dict(k => fill(NaN, nb, nw) for k in keys_)
     prof_run, prof_bsose = fill(NaN, nb, nw, nk), fill(NaN, nb, nw, nk)
 
@@ -230,6 +241,16 @@ function main()
                 res[:hc_bsose][b, w] = dm((i, j) -> hc(Xb, i, j, in_hc))
                 res[:Δhc_upper][b, w] = dm((i, j) -> hc(Xr, i, j, in_hc .& upper) - hc(Xb, i, j, in_hc .& upper))
                 res[:Δhc_lower][b, w] = dm((i, j) -> hc(Xr, i, j, in_hc .& .!upper) - hc(Xb, i, j, in_hc .& .!upper))
+                # Below HC_DEPTH: the columns wet to DEEP_DEPTH in both, with their own 0-HC_DEPTH difference
+                both_deep = [(i, j) for (i, j) in deep if all(m -> isfinite(Xr[i, j, m]) && isfinite(Xb[i, j, m]), findall(in_deep))]
+                if !isempty(both_deep)
+                    Wb = [wlat[j] for (i, j) in both_deep]
+                    bm = f -> sum(Wb .* [f(i, j) for (i, j) in both_deep]) / sum(Wb)
+                    res[:deep_cells][b, w] = length(both_deep)
+                    res[:Δhc_sub][b, w]   = bm((i, j) -> hc(Xr, i, j, in_hc) - hc(Xb, i, j, in_hc))
+                    res[:dhc_run][b, w]   = bm((i, j) -> hc(Xr, i, j, in_deep))
+                    res[:dhc_bsose][b, w] = bm((i, j) -> hc(Xb, i, j, in_deep))
+                end
             end
             for m in 1:nk
                 both = [(i, j) for (i, j) in cells if isfinite(Xr[i, j, m]) && isfinite(Xb[i, j, m])]
@@ -250,19 +271,23 @@ function main()
     println("HEAT ABOVE FREEZING UNDER B-SOSE'S ICE (30-day mean SIarea >= $ICE_MIN), $RUN against B-SOSE")
     println("  T - Tf, each against its own model's freezing point; heat = ρ₀cₚ∫(T - Tf)dz over 0-$(Int(HC_DEPTH)) m, MJ/m²")
     println("  Δ = run - B-SOSE, split at $(Int(SPLIT)) m; 1 MJ/m² melts $(round(1e6 / ρᵢL * 100, digits = 2)) cm of ice")
+    D0, D1 = Int(HC_DEPTH), round(Int, deep_bot)
+    println("  right of ||: columns wet to $D1 m in both (deep cols), their Δ 0-$D0, the $D0-$D1 m heat of both and Δ $D0-$D1")
     println(bar)
     for b in 1:nb
         all(isnan, res[:cells][b, :]) && continue
         Sm = mean(filter(isfinite, res[:S_bsose][b, :]))
         @printf("\n  %s   (freezing points at S = %.2f: run %.3f, B-SOSE %.3f °C)\n", band_name(b), Sm, Tf_run(Sm), Tf_bsose(Sm))
-        println("  window centre | cells |  ℵ run  B-SOSE | top-cell T-Tf run  B-SOSE |   heat run  B-SOSE |  Δ 0-$(Int(SPLIT))  Δ $(Int(SPLIT))-$(Int(HC_DEPTH))   Δ as ice")
+        println("  window centre | cells |  ℵ run  B-SOSE | top-cell T-Tf run  B-SOSE |   heat run  B-SOSE |  Δ 0-$(Int(SPLIT))  Δ $(Int(SPLIT))-$(Int(HC_DEPTH))   Δ as ice || deep cols | Δ 0-$D0 | $D0-$D1 run  B-SOSE |  Δ $D0-$D1")
         for w in 1:nw
             isnan(res[:cells][b, w]) && continue
             Δ = res[:hc_run][b, w] - res[:hc_bsose][b, w]
-            @printf("  %s    | %5d |  %5.2f   %5.2f |         %6.3f  %6.3f |  %6.2f   %6.2f |   %+6.2f    %+6.2f   %+6.1f cm\n",
+            @printf("  %s    | %5d |  %5.2f   %5.2f |         %6.3f  %6.3f |  %6.2f   %6.2f |   %+6.2f    %+6.2f   %+6.1f cm || %9s | %+7.2f |   %7.2f  %7.2f |  %+7.2f\n",
                     label(centre(w)), res[:cells][b, w], res[:ℵ_run][b, w], res[:ℵ_bsose][b, w],
                     res[:sst_run][b, w], res[:sst_bsose][b, w], res[:hc_run][b, w], res[:hc_bsose][b, w],
-                    res[:Δhc_upper][b, w], res[:Δhc_lower][b, w], Δ * 1e6 / ρᵢL * 100)
+                    res[:Δhc_upper][b, w], res[:Δhc_lower][b, w], Δ * 1e6 / ρᵢL * 100,
+                    isnan(res[:deep_cells][b, w]) ? "-" : string(Int(res[:deep_cells][b, w])), res[:Δhc_sub][b, w],
+                    res[:dhc_run][b, w], res[:dhc_bsose][b, w], res[:dhc_run][b, w] - res[:dhc_bsose][b, w])
         end
     end
 
@@ -273,8 +298,8 @@ function main()
     ticks = (x[1:3:end], [Dates.format(centre(w), "yyyy-mm") for w in 1:3:nw])
     Δprof = prof_run .- prof_bsose
     lim = let v = filter(isfinite, abs.(Δprof)); isempty(v) ? 1.0 : max(quantile(v, 0.98), 0.05) end
-    fig = Figure(size = (1500, 380 * length(bands)))
-    Label(fig[0, 1:3], "$RUN: water under B-SOSE's ice, above each model's freezing point"; fontsize = 18, font = :bold)
+    fig = Figure(size = (2000, 380 * length(bands)))
+    Label(fig[0, 1:4], "$RUN: water under B-SOSE's ice, above each model's freezing point"; fontsize = 18, font = :bold)
     local hm
     for (r, b) in enumerate(bands)
         ax1 = Axis(fig[r, 1]; title = "$(band_name(b)): heat above freezing, 0-$(Int(HC_DEPTH)) m",
@@ -282,11 +307,19 @@ function main()
         lines!(ax1, x, res[:hc_run][b, :]; color = :royalblue, linewidth = 2, label = "run")
         lines!(ax1, x, res[:hc_bsose][b, :]; color = :black, linestyle = :dash, linewidth = 2, label = "B-SOSE")
         r == 1 && axislegend(ax1; position = :lc, backgroundcolor = (:white, 0.8))
-        ax2 = Axis(fig[r, 2]; title = "$(band_name(b)): run - B-SOSE, T - Tf (°C)", ylabel = "depth (m)",
+        axd = Axis(fig[r, 2]; title = "$(band_name(b)): run - B-SOSE heat by layer", ylabel = "MJ/m²",
+                   xticks = ticks, xticklabelrotation = π / 6)
+        hlines!(axd, 0; color = :gray, linewidth = 1)
+        lines!(axd, x, res[:Δhc_upper][b, :]; color = :darkorange, linewidth = 2, label = "0-$(Int(SPLIT)) m")
+        lines!(axd, x, res[:Δhc_lower][b, :]; color = :seagreen, linewidth = 2, label = "$(Int(SPLIT))-$(Int(HC_DEPTH)) m")
+        lines!(axd, x, res[:dhc_run][b, :] .- res[:dhc_bsose][b, :]; color = :purple, linewidth = 2,
+               label = "$(Int(HC_DEPTH))-$(round(Int, deep_bot)) m (deep cols)")
+        r == 1 && axislegend(axd; position = :lb, backgroundcolor = (:white, 0.8))
+        ax2 = Axis(fig[r, 3]; title = "$(band_name(b)): run - B-SOSE, T - Tf (°C)", ylabel = "depth (m)",
                    xticks = ticks, xticklabelrotation = π / 6, yreversed = true)
         hm = heatmap!(ax2, x, depth, Δprof[b, :, :]; colormap = :balance, colorrange = (-lim, lim))
     end
-    Colorbar(fig[1:length(bands), 3], hm; label = "Δ(T - Tf), °C")
+    Colorbar(fig[1:length(bands), 4], hm; label = "Δ(T - Tf), °C")
     out = joinpath(OUTDIR, "$(RUN)_under_ice_heat.png")
     save(out, fig)
     @info "wrote $out"
