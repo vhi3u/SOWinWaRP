@@ -128,13 +128,26 @@ end
 # ── ERA5: hourly 10 m wind at each line ─────────────────────────────────────────────────────────
 "ERA5 yearly files holding `short` (u10/v10), by year"
 function era5_files(short)
-    out = Dict{Int, String}()
+    # several files can hold the same year (a short smoke-test download beside the full year): take, per
+    # year, the one with the most hours whose box covers the domain's longitudes and the lines
+    cand = Dict{Int, Vector{Tuple{Int, String}}}()
     isdir(ERA5_DIR) || error("ERA5_DIR $ERA5_DIR not found")
     for f in readdir(ERA5_DIR; join = true)
         endswith(f, ".nc") || continue
         NCDataset(f) do d
-            haskey(d, short) && (out[year(first(d["valid_time"][:]))] = f)
+            haskey(d, short) || return
+            lo, la = g(d["longitude"][:]), g(d["latitude"][:])
+            (minimum(lo) <= λ[1] && maximum(lo) >= λ[end] && minimum(la) <= minimum(LINES) && maximum(la) >= maximum(LINES)) || return
+            tt = d["valid_time"][:]
+            push!(get!(cand, year(first(tt)), Tuple{Int, String}[]), (length(tt), f))
         end
+    end
+    out = Dict{Int, String}()
+    for (y, c) in cand
+        sort!(c; rev = true)
+        out[y] = c[1][2]
+        length(c) > 1 && @warn "ERA5 $short $y: $(length(c)) files; using $(basename(c[1][2])) ($(c[1][1]) h), not " *
+                               join(["$(basename(f)) ($n h)" for (n, f) in c[2:end]], ", ")
     end
     return out
 end
@@ -162,6 +175,13 @@ for y in eyears
         eτx[l] = hcat(eτx[l], first.(τ)); eτy[l] = hcat(eτy[l], last.(τ))
     end
     close(du); close(dv)
+end
+for k in 1:nm, l in 1:nl
+    need = 24 * daysinmonth(Date(months[k]...))
+    if wu[l, k].n < 0.9need
+        l == 1 && wu[l, k].n > 0 && @warn "ERA5 has $(wu[l, k].n) of $need hours in $(label(months[k])): its winds left out"
+        wu[l, k] = Acc(); wv[l, k] = Acc()
+    end
 end
 
 # ── B-SOSE ─────────────────────────────────────────────────────────────────────────────────────
@@ -222,7 +242,7 @@ for y in byears
             Hf, Af = (H[:, 1] .+ H[:, 2]) ./ 2, (A[:, 1] .+ A[:, 2]) ./ 2
             v = g(Vv[Ir, j, n]); U = g(Uv[Ir, j-1:j, n]); uc = (U[:, 1] .+ U[:, 2]) ./ 2
             foreach(i -> (add!(iv_b[l, k], v[i]); add!(iu_b[l, k], uc[i])), findall((Hf .> ICED) .& bwet[l]))
-            isempty(hrs) && continue
+            length(hrs) < 108 && continue                 # ERA5 must cover at least 90% of the 5 days
             ty = g(Ty[Ir, j, n]); X = g(Tx[Ir, j-1:j, n]); tx = (X[:, 1] .+ X[:, 2]) ./ 2
             ex = vec(mean(eτx[l][:, hrs], dims = 2)); ey = vec(mean(eτy[l][:, hrs], dims = 2))
             for (cls, sel) in ((:open, Af .< 0.05), (:compact, Af .> 0.8))
