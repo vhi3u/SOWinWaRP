@@ -34,6 +34,13 @@
 # shelf drops out), the 0-HC_DEPTH difference again and the HC_DEPTH-DEEP_DEPTH heat of both and their
 # difference: a run short above HC_DEPTH but warm below it keeps its deep heat down (too little mixing);
 # short in both lacks the heat itself (sides, or drift from the initial state).
+# STRATIFICATION, on the same deep columns: the density step from the top cell down to the
+# HC_DEPTH-DEEP_DEPTH layer mean, linearised: Δσ = ∂ρ/∂T·ΔT + ∂ρ/∂S·ΔS, with the
+# TEOS-10 sensitivities (SeawaterPolynomials) at each column's mid T, S and mid depth, so the run - B-SOSE
+# difference splits exactly into a temperature part and a salinity part. Larger = harder for winter
+# mixing to reach the warm water below; the top-cell and deep salinities of both are printed with it.
+# B-SOSE's θ and practical S go through the same TEOS-10 formula: the ~0.16 g/kg Sᴬ - Sₚ offset is
+# common to both layers and drops out of ΔS.
 # WRITES OUTDIR/<RUN>_under_ice_heat.png: per band, the 0-HC_DEPTH heat of both; run - B-SOSE heat by
 #   layer (0-SPLIT, SPLIT-HC_DEPTH, HC_DEPTH-DEEP_DEPTH, the last on the deep columns); and run - B-SOSE
 #   (T - Tf) against depth and time to PROFILE_ZMAX.
@@ -47,6 +54,8 @@
 # ==============================================================================================
 
 using NCDatasets, CairoMakie, Dates, Printf, Statistics
+using SeawaterPolynomials: thermal_sensitivity, haline_sensitivity
+using SeawaterPolynomials.TEOS10: TEOS10EquationOfState
 
 ENV["HDF5_USE_FILE_LOCKING"] = "FALSE"   # safe on a run that is still writing
 include(joinpath(@__DIR__, "model_grid.jl"))   # file_levels, file_kbot
@@ -69,6 +78,13 @@ const ρ₀, cₚ = 1026.0, 3991.9            # J/m³/K: ρ₀cₚ ≈ 4.1e6
 const ρᵢL    = 900.0 * 334e3             # J/m³ of ice
 Tf_run(S)   = -0.0542 * S
 Tf_bsose(S) = 0.0901 - 0.0575 * S
+const EOS = TEOS10EquationOfState()
+
+"Density step (kg/m³) from (T₁, S₁) at depth d₁ down to (T₂, S₂) at d₂, linearised about the midpoint: (T part, S part)."
+function density_step(T₁, S₁, d₁, T₂, S₂, d₂)
+    T, S, Z = (T₁ + T₂) / 2, (S₁ + S₂) / 2, -(d₁ + d₂) / 2
+    return (-thermal_sensitivity(T, S, Z, EOS) * (T₂ - T₁), haline_sensitivity(T, S, Z, EOS) * (S₂ - S₁))
+end
 
 f64(A) = Float64.(coalesce.(A, NaN))
 coord(ds, name, dim) = (v = f64(ds[name][:]); ndims(v) == 1 ? v : dim == 1 ? v[:, 1] : v[1, :])
@@ -198,7 +214,8 @@ function main()
     band_of = [findfirst(b -> EDGES[b] <= φ[j] < EDGES[b+1], 1:nb) for j in 1:Ny]
     wlat = cosd.(φ)
     keys_ = (:cells, :ℵ_run, :ℵ_bsose, :sst_run, :sst_bsose, :hc_run, :hc_bsose, :Δhc_upper, :Δhc_lower, :S_bsose,
-             :deep_cells, :Δhc_sub, :dhc_run, :dhc_bsose)
+             :deep_cells, :Δhc_sub, :dhc_run, :dhc_bsose,
+             :σ_run, :σ_bsose, :Δσ_T, :Δσ_S, :Stop_run, :Stop_bsose, :Sdeep_run, :Sdeep_bsose)
     res = Dict(k => fill(NaN, nb, nw) for k in keys_)
     prof_run, prof_bsose = fill(NaN, nb, nw, nk), fill(NaN, nb, nw, nk)
 
@@ -250,6 +267,21 @@ function main()
                     res[:Δhc_sub][b, w]   = bm((i, j) -> hc(Xr, i, j, in_hc) - hc(Xb, i, j, in_hc))
                     res[:dhc_run][b, w]   = bm((i, j) -> hc(Xr, i, j, in_deep))
                     res[:dhc_bsose][b, w] = bm((i, j) -> hc(Xb, i, j, in_deep))
+                    # Stratification: top cell against the deep-layer mean, each model
+                    md = findall(in_deep)
+                    ddeep = sum(depth[m] * Δz[m] for m in md) / sum(Δz[m] for m in md)
+                    lay = (X, i, j) -> sum(X[i, j, m] * Δz[m] for m in md) / sum(Δz[m] for m in md)
+                    step = (T, S, i, j) -> density_step(T[i, j, 1], S[i, j, 1], depth[1], lay(T, i, j), lay(S, i, j), ddeep)
+                    sr = Dict((i, j) => step(Tr, Sr, i, j) for (i, j) in both_deep)
+                    sb = Dict((i, j) => step(Tb, Sb, i, j) for (i, j) in both_deep)
+                    res[:σ_run][b, w]   = bm((i, j) -> sum(sr[(i, j)]))
+                    res[:σ_bsose][b, w] = bm((i, j) -> sum(sb[(i, j)]))
+                    res[:Δσ_T][b, w]    = bm((i, j) -> sr[(i, j)][1] - sb[(i, j)][1])
+                    res[:Δσ_S][b, w]    = bm((i, j) -> sr[(i, j)][2] - sb[(i, j)][2])
+                    res[:Stop_run][b, w]    = bm((i, j) -> Sr[i, j, 1])
+                    res[:Stop_bsose][b, w]  = bm((i, j) -> Sb[i, j, 1])
+                    res[:Sdeep_run][b, w]   = bm((i, j) -> lay(Sr, i, j))
+                    res[:Sdeep_bsose][b, w] = bm((i, j) -> lay(Sb, i, j))
                 end
             end
             for m in 1:nk
@@ -288,6 +320,23 @@ function main()
                     res[:Δhc_upper][b, w], res[:Δhc_lower][b, w], Δ * 1e6 / ρᵢL * 100,
                     isnan(res[:deep_cells][b, w]) ? "-" : string(Int(res[:deep_cells][b, w])), res[:Δhc_sub][b, w],
                     res[:dhc_run][b, w], res[:dhc_bsose][b, w], res[:dhc_run][b, w] - res[:dhc_bsose][b, w])
+        end
+    end
+
+    println("\n", bar)
+    println("STRATIFICATION on the deep columns: density step from the top cell to the $D0-$D1 m mean (kg/m³, linearised TEOS-10)")
+    println("  Δ = run - B-SOSE, split into its temperature and salinity parts; larger = winter mixing reaches the warm water less easily")
+    println(bar)
+    for b in 1:nb
+        all(isnan, res[:σ_run][b, :]) && continue
+        @printf("\n  %s\n", band_name(b))
+        println("  window centre | deep cols |  step run  B-SOSE |   Δ from T  from S |  top S run  B-SOSE | $D0-$D1 S run  B-SOSE")
+        for w in 1:nw
+            isnan(res[:σ_run][b, w]) && continue
+            @printf("  %s    | %9d |   %6.3f  %6.3f |    %+6.3f  %+6.3f |   %7.3f  %7.3f |      %7.3f  %7.3f\n",
+                    label(centre(w)), res[:deep_cells][b, w], res[:σ_run][b, w], res[:σ_bsose][b, w],
+                    res[:Δσ_T][b, w], res[:Δσ_S][b, w], res[:Stop_run][b, w], res[:Stop_bsose][b, w],
+                    res[:Sdeep_run][b, w], res[:Sdeep_bsose][b, w])
         end
     end
 
