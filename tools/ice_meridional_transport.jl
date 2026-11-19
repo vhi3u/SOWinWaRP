@@ -119,9 +119,9 @@ else
     if isempty(years)
         @warn "no B-SOSE year readable: model only"
     else
-        # cell-centre XC, YC from the SIheff file (SIvice's file carries the face coordinate, not YC; and
+        # cell-centre XC, YC from the SIheff file (SIvice's file carries YG, not YC; and
         # grid.nc's XG/YG are corrupt in i156), else from the monthly surfTflx file ice_side_transport.jl uses
-        has_xy(p) = NCDataset(d -> haskey(d, "XC") && haskey(d, "YC"), p)
+        has_xy(p) = !isempty(p) && NCDataset(d -> haskey(d, "XC") && haskey(d, "YC"), p)
         geom = has_xy(bfile("SIheff", first(years))) ? bfile("SIheff", first(years)) :
                joinpath(BSOSE_DIR, "surfTflx_bsoseI156_2013to2024_monthly.nc")
         xc, yc = NCDataset(geom) do d
@@ -141,8 +141,18 @@ else
             dv, dh = NCDataset(bfile("SIvice", y)), NCDataset(bfile("SIheff", y))
             pick(d, names) = d[first(k for k in names if haskey(d, k))]
             Vv, Hv = pick(dv, ("SIvice", "SIVICE")), pick(dh, ("SIheff", "SIHeff", "SIHEFF"))
-            size(Vv)[1:2] == size(Hv)[1:2] == (length(xc), length(yc)) ||
+            # i156's SIvice files carry 630 YG rows against 588 cells: rows 1:588 are the cells' south faces
+            # (YG[1] = -78.0, YC[1] = -77.98), the extra 42 run past the domain to ~2N. Use the cell rows only,
+            # and check each line's face against its neighbouring centres.
+            (size(Hv)[1:2] == (length(xc), length(yc)) && size(Vv, 1) == length(xc) && size(Vv, 2) >= length(yc)) ||
                 error("SIvice $(size(Vv)), SIheff $(size(Hv)), XC×YC ($(length(xc)), $(length(yc))): not the C-grid layout assumed")
+            if haskey(dv, "YG")
+                yg = g(dv["YG"][:])
+                for l in 1:nl
+                    abs(yg[jb[l]] - φb[l]) < 0.01 ||
+                        error(@sprintf("SIvice's YG[%d] = %.4f is not the face between YC %.4f and %.4f", jb[l], yg[jb[l]], yc[jb[l]-1], yc[jb[l]]))
+                end
+            end
             for n in eachindex(dv["time"][:])
                 push!(cent, DateTime(dv["time"][n]) - Hour(60))
                 for l in 1:nl
