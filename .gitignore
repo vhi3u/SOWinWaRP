@@ -39,3 +39,4 @@ Manifest.toml.*.bak
 
 # run-name locks (src/run_name_guard.jl)
 *.lock/
+run_single_column
