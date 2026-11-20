@@ -19,9 +19,10 @@
 #                Run: −(ice_mass_tendency + snow_mass_tendency) − snowfall (<RUN>_sea_ice_fluxes.nc;
 #                NumericalEarth's ice-to-ocean fresh water is exactly −(Eᵢ + Eₛ)/ρ₀, and ClimaSeaIce's
 #                snow tendency leaves out the snowfall the ice absorbs, which `snowfall` carries).
-# The run's `snowfall` is taken as the snowfall the ice absorbs; it is ClimaSeaIce's top snowfall
-# flux, so where the ice takes less than it is offered the run's atmosphere term is a little high
-# and its ice term a little low, by the same amount (their sum, into ocean, is exact).
+# The run's `snowfall` is ClimaSeaIce's top snowfall over the WHOLE cell; the ice absorbs
+# snowfall × ℵ (thermodynamic_time_step.jl: Psᵃᵇˢ = ρs Gs⁺ ℵⁿ⁺¹). ℵ is the mean of the <RUN>_sea_ice.nc
+# snapshots bracketing each daily mean, so the absorbed snowfall is mean(snowfall)·mean(ℵ), not the
+# mean of the product; the split moves by that covariance only (into ocean is exact).
 # Band means are area-weighted over the run's wet cells; B-SOSE at the nearest cell. B-SOSE 5-day
 # records go to the month holding their centre (stamp − 60 h); the run's daily means to the month
 # of their middle.
@@ -68,21 +69,30 @@ bandsum(F) = [sum(W[:, band_of .== b] .* z(F[:, band_of .== b])) / sum(W[:, band
 rd(ds, name, n) = (v = ds[name]; g(ndims(v) == 4 ? v[:, :, 1, n] : v[:, :, n]))
 # per band and month: sums and day counts of (into ocean, ice to ocean, snowfall)
 acc = Dict{Tuple{Int, Int}, Vector{Float64}}(); days = Dict{Tuple{Int, Int}, Int}()
-sf, si = NCDataset(sf_path), NCDataset(si_path)
-tf, ti = g(sf["time"][:]), g(si["time"][:])
+sf, si, sic = NCDataset(sf_path), NCDataset(si_path), NCDataset(ice_path)
+tf, ti, tc = g(sf["time"][:]), g(si["time"][:]), g(sic["time"][:])
+# ice concentration over the day ending at t: mean of the snapshots at t − 1 day and t (either alone if one is missing)
+function aleph_day(t)
+    ks = [k for k in (findfirst(s -> abs(s - (t - 86400)) < 60, tc), findfirst(s -> abs(s - t) < 60, tc)) if k !== nothing]
+    isempty(ks) && return nothing
+    return sum(clamp.(z(rd(sic, "ℵ", k)), 0, 1) for k in ks) ./ length(ks)
+end
+nmiss = 0
 for (n, t) in enumerate(tf)
     t <= 0 && continue
     m = findfirst(s -> abs(s - t) < 60, ti); m === nothing && continue
     ym = ym_of(start + Millisecond(round(Int, 1000t)) - Hour(12))
     into = bandsum(rd(sf, "freshwater_flux", n) .* RHO0)
     ice = bandsum(-(rd(si, "ice_mass_tendency", m) .+ z(rd(si, "snow_mass_tendency", m))))
-    snow = haskey(si, "snowfall") ? bandsum(rd(si, "snowfall", m)) : zeros(nb)
+    ℵd = aleph_day(ti[m]); ℵd === nothing && (global nmiss += 1; continue)
+    snow = haskey(si, "snowfall") ? bandsum(z(rd(si, "snowfall", m)) .* ℵd) : zeros(nb)
     for b in 1:nb
         a = get!(acc, (b, ym[1] * 100 + ym[2]), zeros(3)); a .+= (into[b], ice[b], snow[b])
     end
     days[(0, ym[1] * 100 + ym[2])] = get(days, (0, ym[1] * 100 + ym[2]), 0) + 1
 end
-close(sf); close(si)
+close(sf); close(si); close(sic)
+nmiss > 0 && @warn "$nmiss daily records skipped: no ℵ snapshot at either end of the day in $(basename(ice_path))"
 keys_ym = sort(unique(k[2] for k in keys(days)))
 months = [(div(k, 100), k % 100) for k in keys_ym if days[(0, k)] >= daysinmonth(Date(div(k, 100), k % 100)) - 1]
 nm = length(months)
