@@ -550,8 +550,53 @@ function do_column(col, recs, stamps, XC, YC, RF)
     end
     any(n -> !all(isfinite, results[n][1][:, nr]), CLOSURES) && println("  † stopped early: its last finite window")
 
+    # ── compact summary, collected per box and printed again at the end of the run ──
+    sm = String[]
+    push!(sm, @sprintf("[%s] %.2f-%.2fE %.2f-%.2fS, %d B-SOSE cells, column %.0f m, LATERAL=%s", col.name, XC[first(I)],
+                       XC[last(I)], -YC[last(J)], -YC[first(J)], length(I) * length(J), H, LATERAL))
+    if bud !== nothing
+        closure_res(t, n, sfc) = sum(t.tend[:, n]) - sum(t.hadv[:, n]) - sum(t.hdif[:, n]) - (t.R[nk+1, n] - t.R[1, n]) -
+                                 (t.D[nk+1, n] - t.D[1, n]) - sfc
+        sT, sS = ρB * cpB / bud.A[1], ρB * 86400 / bud.A[1]
+        push!(sm, @sprintf("B-SOSE closure, worst month: heat |res| %.1f W/m² (|TOTTTEND| up to %.0f); salt |res| %.1f g/m²/day (|TOTSTEND| up to %.0f)",
+                           maximum(n -> abs(sT * closure_res(bud.TH, n, bud.sfc["surfTflx"][n] / (ρB * cpB))), 1:nm),
+                           maximum(n -> abs(sT * sum(bud.TH.tend[:, n])), 1:nm),
+                           maximum(n -> abs(sS * closure_res(bud.SLT, n, bud.sfc["surfSflx"][n] / ρB)), 1:nm),
+                           maximum(n -> abs(sS * sum(bud.SLT.tend[:, n])), 1:nm)))
+    end
+    ymc(r) = (c = stamps[r] - Hour(60); (Dates.year(c), Dates.month(c)))
+    push!(sm, "MLD (m), monthly mean of the 5-day values; [n] = windows mixed to the column floor")
+    push!(sm, @sprintf("  %-8s %5s %7s %6s", "month", "ice", "B-SOSE", "diag") * join(@sprintf(" %10s", n) for n in CLOSURES))
+    for (y, m) in unique(ymc.(2:nr))
+        rs = [r for r in 2:nr if ymc(r) == (y, m)]
+        mm(v) = (x = filter(isfinite, first.(v[rs])); nfl = count(last.(v[rs]));
+                 isempty(x) ? "--" : @sprintf("%.0f", mean(x)) * (nfl > 0 ? "[$nfl]" : ""))
+        icem, dm = filter(isfinite, ice[rs]), filter(isfinite, mdiag[rs])
+        push!(sm, @sprintf("  %04d-%02d %5s %7s %6s", y, m, isempty(icem) ? "--" : @sprintf("%.2f", mean(icem)), mm(hb),
+                           isempty(dm) ? "--" : @sprintf("%.0f", mean(dm))) * join(@sprintf(" %10s", mm(hm[n])) for n in CLOSURES))
+    end
+    let r = nr
+        dHb, dSb = HC(Tb[:, r]) - HC(Tb[:, 1]), SC(Sb[:, r]) - SC(Sb[:, 1])
+        Fh, Fs = fwd(Qtot, r) / 1e6, fwd(salt_in, r) / 1e3
+        Ah = ρ₀ * cₚ * sum(piecewise_integral(tl, LT, centre(1), centre(r)) .* Δz) / 1e6
+        As = ρ₀ * sum(piecewise_integral(tl, LS, centre(1), centre(r)) .* Δz) / 1e3
+        Tr, Sr = results[ref]
+        push!(sm, @sprintf("column budget to %s: heat MJ/m² B-SOSE %.1f, forcing %.1f, lateral %.1f, applied %.1f, %s-chk %.1f",
+                           Dates.format(stamps[r], "yyyy-mm-dd"), dHb, Fh, dHb - Fh, Ah, ref, HC(Tr[:, r]) - HC(Tr[:, 1]) - Fh - Ah))
+        push!(sm, @sprintf("                              salt kg/m² B-SOSE %.2f, forcing %.2f, lateral %.2f, applied %.2f, %s-chk %.3f",
+                           dSb, Fs, dSb - Fs, As, ref, SC(Sr[:, r]) - SC(Sr[:, 1]) - Fs - As))
+    end
+    push!(sm, "last window minus B-SOSE (B-SOSE row: its own change): ΔT °C 0-100 | 100-300 | 300-floor || ΔS g/kg same layers")
+    lrow(T, S) = join(@sprintf(" %7.3f", lmean(T, l)) for l in layers) * " ||" * join(@sprintf(" %7.4f", lmean(S, l)) for l in layers)
+    push!(sm, @sprintf("  %-11s", "B-SOSE") * lrow(Tb[:, nr] .- Tb[:, 1], Sb[:, nr] .- Sb[:, 1]))
+    for n in CLOSURES
+        Tr, Sr = results[n]
+        rl = findlast(r -> all(isfinite, Tr[:, r]), 1:nr)
+        push!(sm, @sprintf("  %-11s", n * (rl == nr ? "" : "†")) * lrow(Tr[:, rl] .- Tb[:, rl], Sr[:, rl] .- Sb[:, rl]))
+    end
+
     # ── figure ──
-    colors = Dict(zip(CLOSURES, ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300"]))
+    colors =Dict(zip(CLOSURES, ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300"]))
     days = [Dates.value(s - stamps[1]) / 86_400_000 for s in stamps]
     fig = Figure(size = (1400, 1150))
     Label(fig[0, 1:4], @sprintf("%s: one column under B-SOSE's surface fluxes (%.1f-%.1fE, %.1f-%.1fS, 0-%.0f m)",
@@ -598,7 +643,7 @@ function do_column(col, recs, stamps, XC, YC, RF)
     out = joinpath(OUTDIR, "single_column_$(col.name).png")
     save(out, fig); @info "wrote $out"
 
-    bud === nothing && return
+    bud === nothing && return sm
     # ── vertical mixing flux: B-SOSE's DFrI against each scheme's ──
     # A scheme's flux on the top face of level k (positive up), over window r, is what its tendency needs beyond
     # the sources below that face: F(k) = F(k+1) + Δz (source - dT/dt), from F = 0 on the column floor. The top
@@ -625,7 +670,7 @@ function do_column(col, recs, stamps, XC, YC, RF)
     end
     inmonth(r, n) = (c = stamps[r] - Hour(60); (Dates.year(c), Dates.month(c)) == months[n])   # window centre in month n
     shown = [n for n in 1:nm if count(r -> r >= 2 && inmonth(r, n), 1:nr) >= 3][1:min(end, 6)]
-    isempty(shown) && return
+    isempty(shown) && return sm
     zface = RF[1:nk]                                                            # top faces, top down
     Hscale, Sscale = ρ₀ * cₚ, ρ₀ * 86400                                        # → W/m², g m⁻² day⁻¹
     println("\nVERTICAL MIXING FLUX, column mean over 0-$(round(Int, min(H, 300))) m, W/m² (heat) and g m⁻² day⁻¹ (salt), + = up")
@@ -640,12 +685,19 @@ function do_column(col, recs, stamps, XC, YC, RF)
     end
     upper = [2 <= k <= nk && -zface[k] <= 300 for k in 1:nk]
     bsose_flux(which, n) = [k == 1 ? 0.0 : (which === :T ? bud.TH : bud.SLT).D[k, n] / bud.A[k] for k in 1:nk]
+    push!(sm, "vertical mixing flux, mean over faces 0-300 m, + = up: heat W/m² | salt g m⁻² day⁻¹")
+    push!(sm, @sprintf("  %-8s %8s", "month", "B-SOSE") * join(@sprintf(" %8s", n) for n in CLOSURES) *
+              @sprintf(" | %8s", "B-SOSE") * join(@sprintf(" %8s", n) for n in CLOSURES))
     for n in shown
         @printf("  %-8s %10.1f", mlabel(n), Hscale * mean(bsose_flux(:T, n)[upper]))
         foreach(nme -> @printf(" %10.1f", Hscale * mean(flux[(nme, :T, n)][upper])), CLOSURES)
         @printf(" | %10.2f", Sscale * mean(bsose_flux(:S, n)[upper]))
         foreach(nme -> @printf(" %10.2f", Sscale * mean(flux[(nme, :S, n)][upper])), CLOSURES)
         @printf("   (%s)\n", join([@sprintf("%.1f", Hscale * flux[(nme, :T, n)][1]) for nme in CLOSURES], ", "))
+        push!(sm, @sprintf("  %-8s %8.1f", mlabel(n), Hscale * mean(bsose_flux(:T, n)[upper])) *
+                  join(@sprintf(" %8.1f", Hscale * mean(flux[(nme, :T, n)][upper])) for nme in CLOSURES) *
+                  @sprintf(" | %8.2f", Sscale * mean(bsose_flux(:S, n)[upper])) *
+                  join(@sprintf(" %8.2f", Sscale * mean(flux[(nme, :S, n)][upper])) for nme in CLOSURES))
     end
 
     zlim = min(H, 600.0)
@@ -666,6 +718,7 @@ function do_column(col, recs, stamps, XC, YC, RF)
     end
     outf = joinpath(OUTDIR, "single_column_$(col.name)_mixing_flux.png")
     save(outf, figf); @info "wrote $outf"
+    return sm
 end
 
 function main()
@@ -683,9 +736,16 @@ function main()
     end
     @info "$(length(stamps)) 5-day records, $(Dates.format(stamps[1], "yyyy-mm-dd")) to " *
           "$(Dates.format(stamps[end], "yyyy-mm-dd")); schemes $(join(CLOSURES, ", ")); Δt $(DT) s; MLD_DT $MLD_DT"
+    summary = String[]
     for col in COLUMNS
-        do_column(col, recs, stamps, XC, YC, RF)
+        append!(summary, do_column(col, recs, stamps, XC, YC, RF)); push!(summary, "")
     end
+    commit = try readchomp(`git -C $(@__DIR__) rev-parse --short HEAD`) catch; "?" end
+    println("\n", "#"^34, " SUMMARY: copy from here ", "#"^34)
+    println("single_column_bsose $commit | ", Dates.format(stamps[1], "yyyy-mm-dd"), " to ", Dates.format(stamps[end], "yyyy-mm-dd"),
+            " | LATERAL=$LATERAL | ZMAX=$ZMAX | DT=$DT | MLD_DT=$MLD_DT")
+    foreach(println, summary)
+    println("#"^36, " END SUMMARY ", "#"^45)
 end
 
 main()
