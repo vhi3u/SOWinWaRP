@@ -12,6 +12,8 @@
 # TERMS, all FRESH WATER, kg m⁻² s⁻¹ shown as cm per month (1 cm = 10 kg/m²), + = INTO the ocean or cell:
 #   into ocean   B-SOSE oceFWflx; run freshwater_flux (<RUN>_surface_fluxes.nc, m/s) × ρ₀ (RHO0, 1020,
 #                NumericalEarth's default). Both include the ice exchange.
+#   (run)        into ocean also holds the coastal forcing (COASTAL, Hammond & Jones), which the run applies as a
+#                separate salinity forcing outside freshwater_flux.
 #   atmosphere   what the atmosphere (and land) delivers to the CELL, ice and ocean together:
 #                B-SOSE SIatmFW (MITgcm seaice_growth.F: all precipitation, open-water evaporation,
 #                runoff, sublimation). Run: into ocean − ice-to-ocean + snowfall on the ice.
@@ -28,7 +30,8 @@
 # of their middle.
 #
 # WRITES OUTDIR/<RUN>_surface_freshwater.png: per band, monthly atmosphere and ice terms of both.
-# ENV: DIR, OUTDIR, BSOSE_DIR (required), BANDS (-70,-65,-60,-55,-50,-45), RHO0 (1020), WINTER (6,7,8,9,10)
+# ENV: DIR, OUTDIR, BSOSE_DIR (required), BANDS (-70,-65,-60,-55,-50,-45), RHO0 (1020), WINTER (6,7,8,9,10),
+#      COASTAL (coastal_freshwater_hj.nc; "" for none), REACH (6)
 # ==============================================================================================
 
 using NCDatasets, CairoMakie, Dates, Printf, Statistics
@@ -44,6 +47,8 @@ isempty(BSOSE_DIR) && error("set BSOSE_DIR")
 EDGES     = parse.(Float64, split(get(ENV, "BANDS", "-70,-65,-60,-55,-50,-45"), ','))
 RHO0      = parse(Float64, get(ENV, "RHO0", "1020"))
 WINTER    = parse.(Int, split(get(ENV, "WINTER", "6,7,8,9,10"), ','))
+COASTAL   = get(ENV, "COASTAL", "coastal_freshwater_hj.nc")   # "" = none (runs before the coastal forcing)
+REACH     = parse(Int, get(ENV, "REACH", "6"))
 
 g(A) = Float64.(coalesce.(A, NaN))
 z(A) = replace(A, NaN => 0.0)
@@ -65,6 +70,38 @@ Nx, Ny = length(λ), length(φ)
 band_of = [findfirst(b -> EDGES[b] <= φ[j] < EDGES[b+1], 1:nb) for j in 1:Ny]
 W = [wet[i, j] && band_of[j] !== nothing ? cosd(φ[j]) : 0.0 for i in 1:Nx, j in 1:Ny]
 bandsum(F) = [sum(W[:, band_of .== b] .* z(F[:, band_of .== b])) / sum(W[:, band_of .== b]) for b in 1:nb]
+
+# The coastal fresh water (ice-shelf melt, icebergs, runoff) goes in as a separate salinity forcing, not through
+# freshwater_flux, so it is added here: the field src/coastal_freshwater.jl applies, kg m⁻² s⁻¹, constant in
+# time, with a "move" file's land cells spread evenly over the wet cells within REACH cells as there.
+# B-SOSE's SIatmFW includes its runoff, so it counts on the atmosphere side.
+coastal = zeros(nb)
+if !isempty(COASTAL)
+    isfile(COASTAL) || error("$COASTAL not found; run from the repo root, set COASTAL to the file the run used, or COASTAL=\"\" for a run without one")
+    F, lon, lat, move = NCDataset(COASTAL) do d
+        g(d["freshwater_flux"][:, :]), g(d["lon"][:]), g(d["lat"][:]), startswith(lowercase(get(d.attrib, "on_land", "")), "move")
+    end
+    F = z(F)
+    (size(F) == (Nx, Ny) && maximum(abs, lon .- λ) < 1e-6 && maximum(abs, lat .- φ) < 1e-6) ||
+        error("$COASTAL is not on the run's grid")
+    area = [cosd(φ[j]) for i in 1:Nx, j in 1:Ny]
+    G = ifelse.(wet, F, 0.0)
+    if move
+        for I in CartesianIndices(F)
+            (wet[I] || F[I] <= 0) && continue
+            i, j = Tuple(I)
+            ts = [(ii, jj) for di in -REACH:REACH, dj in -REACH:REACH for (ii, jj) in ((i + di, j + dj),)
+                  if 1 <= ii <= Nx && 1 <= jj <= Ny && wet[ii, jj] && (di * cosd(φ[j]))^2 + dj^2 <= REACH^2]
+            isempty(ts) && continue
+            ΔF = F[I] * area[I] / sum(area[t...] for t in ts)
+            for t in ts; G[t...] += ΔF; end
+        end
+    end
+    gt = sum(G .* area) * (6.371e6 * deg2rad(λ[2] - λ[1])) * (6.371e6 * deg2rad(φ[2] - φ[1])) * 365.25 * 86400 / 1e12
+    global coastal = bandsum(G)
+    @info @sprintf("coastal fresh water from %s: %.0f Gt/yr on the run's wet cells (%s); added to the run's into-ocean and atmosphere terms",
+                   COASTAL, gt, move ? "land cells spread within $REACH cells" : "land cells zeroed")
+end
 
 rd(ds, name, n) = (v = ds[name]; g(ndims(v) == 4 ? v[:, :, 1, n] : v[:, :, n]))
 # per band and month: sums and day counts of (into ocean, ice to ocean, snowfall)
@@ -100,6 +137,7 @@ R = Dict(q => fill(NaN, nb, nm) for q in (:into, :atm, :ice))
 for (k, ym) in enumerate(months), b in 1:nb
     key = ym[1] * 100 + ym[2]; a = acc[(b, key)] ./ days[(0, key)]
     into, ice_oc, snow = a
+    into += coastal[b]
     R[:into][b, k] = into
     R[:ice][b, k] = ice_oc - snow                 # cell convention: snow kept on the ice is taken from the atmosphere's share
     R[:atm][b, k] = into - R[:ice][b, k]
