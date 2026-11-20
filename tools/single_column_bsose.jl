@@ -17,7 +17,12 @@
 #   forcing   B-SOSE's 5-day records, held constant over each 5-day window (the window means):
 #               heat   TFLUX - oceQsw at the top; oceQsw absorbed with MITgcm's swfrac jwtype 2
 #                      (0.62, 0.6 m, 20 m), the rest of it in the bottom cell
-#               salt   SFLUX - S * oceFWflx (virtual salt flux, S the column's own top cell)
+#               salt   SFLUX, plus -S * oceFWflx (virtual salt flux, S the column's own top cell) ONLY when
+#                      LATERAL=none: B-SOSE's monthly snapshots show its salinity tendency (TOTSTEND) closes with
+#                      the advective + diffusive terms + SFLUX alone, i.e. its fresh water and brine reach the
+#                      salinity THROUGH the advective terms (the inflow replacing water removed at the surface).
+#                      With those terms applied, adding -S*oceFWflx counts it twice (86c2b9c did: 65S too salty,
+#                      52S too fresh).
 #               stress oceTAUX, oceTAUY (under ice: B-SOSE's ice-ocean + air-ocean stress)
 #             as the run: flux = -X / rho0 (tracers also / cp), rho0 1020, cp 3991.868, TEOS-10
 #   Coriolis  f-plane at the box's centre latitude
@@ -288,7 +293,7 @@ end
 @inline window_index(p, t) = clamp(searchsortedlast(p.ts, t), 1, length(p.ts))
 @inline Jᵀ(i, j, grid, clock, f, p) = (n = window_index(p, clock.time); -(p.Qtot[n] - p.Qsw[n]) / (p.ρ₀ * p.cₚ))
 @inline Jˢ(i, j, grid, clock, f, p) = (n = window_index(p, clock.time);
-                                       -(p.SF[n] - @inbounds(f.S[i, j, grid.Nz]) * p.FW[n]) / p.ρ₀)
+                                       -(p.SF[n] - p.dilute * @inbounds(f.S[i, j, grid.Nz]) * p.FW[n]) / p.ρ₀)
 @inline Jᵘ(i, j, grid, clock, f, p) = (n = window_index(p, clock.time); -p.τx[n] / p.ρ₀)
 @inline Jᵛ(i, j, grid, clock, f, p) = (n = window_index(p, clock.time); -p.τy[n] / p.ρ₀)
 @inline swfrac(z, p) = p.R * exp(z / p.ζ1) + (1 - p.R) * exp(z / p.ζ2)
@@ -437,7 +442,8 @@ function do_column(col, recs, stamps, XC, YC, RF)
     end
     LT = bud === nothing ? zeros(nk, nm) : lateral_source(bud.TH)
     LS = bud === nothing ? zeros(nk, nm) : lateral_source(bud.SLT)
-    p = (; ts, Qtot, Qsw, SF, FW, τx, τy, zf, ρ₀, cₚ, R = SWR, ζ1 = SWζ1, ζ2 = SWζ2, tl, LT, LS)
+    dilute = LATERAL == "none" ? 1.0 : 0.0         # see the header: B-SOSE's advective terms already carry the dilution
+    p = (; ts, Qtot, Qsw, SF, FW, τx, τy, zf, ρ₀, cₚ, R = SWR, ζ1 = SWζ1, ζ2 = SWζ2, tl, LT, LS, dilute)
 
     mlabel(n) = @sprintf("%04d-%02d", months[n]...)
     if bud !== nothing
@@ -454,7 +460,7 @@ function do_column(col, recs, stamps, XC, YC, RF)
             @printf("  %-8s %9.1f %9.1f %9.1f %9.1f %9.1f %9.1f %9.1f | %9.1f\n", mlabel(n), s * tot, s * ha, s * hd,
                     s * va, s * df, s * sf, s * (tot - ha - hd - va - df - sf + b.R[1, n]), -s * b.R[1, n])
         end
-        println("  salt, g m⁻² day⁻¹; surface = SFLUX, dilution = -S·oceFWflx (residual shown without and with it)")
+        println("  salt, g m⁻² day⁻¹; surface = SFLUX, dilution = -S·oceFWflx. B-SOSE closes WITHOUT the dilution (res, not res+dil;\n  checked against its monthly snapshots, Jun-Oct 2014): its advective terms already carry it, so the column omits it.")
         @printf("  %-8s %9s %9s %9s %9s %9s %9s %9s %9s %9s | %9s\n", "month", "TOTSTEND", "h-adv", "h-diff", "ADVr@flr",
                 "DFrI@flr", "surface", "dilution", "res", "res+dil", "ADVr@sfc")
         s = ρB * 86400 / A1
@@ -501,7 +507,7 @@ function do_column(col, recs, stamps, XC, YC, RF)
 
     # ── budget: change since record 1 against the forcing between the two window centres ──
     fwd(x, r) = r == 1 ? 0.0 : 5 * 86400 * (x[1] / 2 + sum(x[2:r-1]; init = 0.0) + x[r] / 2)
-    salt_in = SF .- Sb[1, :] .* FW                                  # g m⁻² s⁻¹, B-SOSE's top-cell S
+    salt_in = SF .- dilute .* Sb[1, :] .* FW                                  # g m⁻² s⁻¹, as the column applies it
     HC(T) = ρ₀ * cₚ * sum(T .* Δz) / 1e6                            # MJ m⁻²
     SC(S) = ρ₀ * sum(S .* Δz) / 1e3                                 # kg salt m⁻²
     ref = first(CLOSURES)
@@ -608,7 +614,7 @@ function do_column(col, recs, stamps, XC, YC, RF)
             src[1] += (Qtot[r] - Qsw[r]) / (ρ₀ * cₚ * Δz[1])
         else
             Stop = (Xs[1, r] + Xs[1, r+1]) / 2
-            src[1] += (SF[r] - Stop * FW[r]) / (ρ₀ * Δz[1])
+            src[1] += (SF[r] - dilute * Stop * FW[r]) / (ρ₀ * Δz[1])
         end
         dXdt = (Xs[:, r+1] .- Xs[:, r]) ./ Δt
         F = zeros(nk + 1)
