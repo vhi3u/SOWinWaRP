@@ -40,9 +40,31 @@
 # start against the surface forcing integrated over the same time, and the remainder ("lateral"). A
 # remainder comparable to the forcing means B-SOSE's MLD there is not a 1-D target, and the comparison
 # is between schemes only. The model's own remainder should be ~0 (a conservation check).
+# (First run, 2014: at 52.5-53S the lateral salt was 14-21 kg/m² against 3-11 from the surface; at 65S every
+# scheme convected to 700-800 m against B-SOSE's 200-240.)
+#
+# LATERAL=monthly (default) PUTS THAT SUPPLY BACK, from B-SOSE's own MONTHLY budget diagnostics (the 5-day ones
+# are listed on the server but are dead links). Per level of the box, per calendar month:
+#   horizontal  ADVx/ADVy + DFxE/DFyE through the box's four sides (MITgcm: x flux on the cell's west face, y on
+#               its south face, positive east/north, tracer·m³/s)
+#   vertical    ADVr through the level faces inside the column and at its floor, DFrI at its floor (positive up,
+#               on each level's TOP face); ADVr at the sea surface is NOT applied (the column has its own surface
+#               forcing) but is printed
+# divided by the box's B-SOSE volume and added as a tendency, constant through each month. What is left to the
+# column is its vertical mixing and the surface. It is B-SOSE's supply, so it does not respond if the column
+# drifts from B-SOSE: fine for months, not for years.
+# Checked first, per month and over the column: TOTTTEND/TOTSTEND against the sum of the terms (CLOSURE table;
+# the salt surface term is shown with and without -S*oceFWflx, since B-SOSE's real freshwater flux makes that
+# split ambiguous). A large residual means the supply is not B-SOSE's whole story.
+# Then B-SOSE's own vertical mixing flux DFrI (GGL90 + backgrounds, implicit) against each scheme's, the scheme's
+# from its 5-day snapshots: flux at each face = what its tendency needs beyond the sources below it.
+# Files: <token>_bsoseI156_2013to2024_monthly.nc from BSOSE_DIR if present, else read over the network from
+# BUDGET_URL with NetCDF byte ranges (~8 s per term per box; nothing is downloaded). Cached per box and months in
+# OUTDIR/.single_column_budget_*.jls.
 #
 # WRITES OUTDIR/single_column_<column>.png: MLD against time (B-SOSE, B-SOSE's diagnostic, each scheme),
-# B-SOSE's ice concentration, and S and T profiles at four times.
+# B-SOSE's ice concentration, and S and T profiles at four times; with LATERAL=monthly also
+# OUTDIR/single_column_<column>_mixing_flux.png, B-SOSE's DFrI against each scheme's mixing flux, by month.
 #
 # ENV
 #   BSOSE_DIR  (required) B-SOSE's 5-day files: Theta, Salt, surfTflx, surfSflx, oceFWflx, oceQsw, oceTAUX,
@@ -52,12 +74,15 @@
 #   CLOSURES   (default catke,catke_bare,kepsilon,ri)
 #   ZMAX       deepest level, m (default 1000)    DT  time step, s (default 600)
 #   OUTDIR     (default plots)                    MLD_DT (default 0.03 kg/m³, read by mld.jl)
+#   LATERAL    monthly | none                      (default monthly)
+#   BUDGET_URL (default https://sose.ucsd.edu/SO6/ITER156/MONTHLY/)
+#   RHO_BSOSE  B-SOSE's reference density for its own budget check, kg/m³ (default 1035; cp 3994)
 # ==============================================================================================
 
 using Oceananigans
 using Oceananigans.TurbulenceClosures.TKEBasedVerticalDiffusivities: CATKEMixingLength, CATKEEquation
 using SeawaterPolynomials.TEOS10: TEOS10EquationOfState
-using NCDatasets, CairoMakie, Dates, Printf, Statistics
+using NCDatasets, CairoMakie, Dates, Printf, Statistics, Serialization
 
 ENV["HDF5_USE_FILE_LOCKING"] = "FALSE"
 include(joinpath(@__DIR__, "mld.jl"))          # mld, MLD_DT
@@ -73,6 +98,11 @@ const CLOSURES = String.(split(get(ENV, "CLOSURES", "catke,catke_bare,kepsilon,r
 const ρ₀, cₚ   = 1020.0, 3991.86795711963      # the run's (NumericalEarth's) reference density, heat capacity
 const SWR, SWζ1, SWζ2 = 0.62, 0.6, 20.0        # MITgcm swfrac, jwtype 2
 const WINDOW   = Day(5)
+const LATERAL  = get(ENV, "LATERAL", "monthly")
+LATERAL in ("monthly", "none") || error("LATERAL must be monthly or none, got $LATERAL")
+const BUDGET_URL = get(ENV, "BUDGET_URL", "https://sose.ucsd.edu/SO6/ITER156/MONTHLY/")
+const ρB       = parse(Float64, get(ENV, "RHO_BSOSE", "1035"))
+const cpB      = 3994.0
 
 struct Column
     name::String
@@ -133,6 +163,127 @@ function records(token, years)
     return out
 end
 
+# ── B-SOSE's monthly budget, on the box (LATERAL=monthly) ─────────────────────────────────────────────
+const MONTHLY_SPAN = "2013to2024_monthly"
+const SURFACE_NAMES = Dict("surfTflx" => ("TFLUX",), "oceQsw" => ("oceQsw",), "surfSflx" => ("SFLUX",),
+                           "oceFWflx" => ("oceFWflx",), "Salt" => ("SALT", "Salt"))
+
+function monthly_path(token)
+    want = lowercase("$(token)_bsoseI156_$(MONTHLY_SPAN).nc")
+    hits = filter(f -> lowercase(f) == want, readdir(BSOSE_DIR))
+    isempty(hits) || return joinpath(BSOSE_DIR, first(hits))
+    return BUDGET_URL * "$(token)_bsoseI156_$(MONTHLY_SPAN).nc#mode=bytes"
+end
+
+"(year, month) a monthly record averages: its stamp is the END of the month and drifts by hours."
+monthkey(s) = (d = DateTime(s) - Day(14); (Dates.year(d), Dates.month(d)))
+fill0(A) = (B = f64(A); B[.!isfinite.(B)] .= 0; B)
+
+"NCDataset(f, path), retried for a remote file: one stalled byte-range read must not end a run."
+function open_monthly(f, path)
+    for attempt in 1:3
+        try
+            return NCDataset(f, path)
+        catch e
+            (attempt == 3 || !endswith(path, "#mode=bytes")) && rethrow()
+            @warn "reading $path failed (attempt $attempt of 3); retrying in 30 s" exception = e
+            sleep(30)
+        end
+    end
+end
+
+function month_range(ds, months, path)
+    have = monthkey.(ds["time"][:])
+    idx = [findfirst(==(m), have) for m in months]
+    any(isnothing, idx) && error("$path has no record for $(months[findfirst(isnothing, idx)])")
+    idx == collect(first(idx):last(idx)) || error("$path: the monthly records are not consecutive")
+    return first(idx):last(idx)
+end
+
+"Sum over a face (or the box) of a monthly 3-D term: levels × months."
+function face_sum(token, is, js, levels, months)
+    path = monthly_path(token)
+    open_monthly(path) do ds
+        m = month_range(ds, months, path)
+        X = fill0(ds[token][is, js, levels, m])
+        return dropdims(sum(X, dims = (1, 2)), dims = (1, 2))
+    end
+end
+
+"""
+B-SOSE's monthly heat and salt budget of the box `I × J`, levels 1:nk (top down), for the (year, month) keys
+`months`. Every 3-D term is a box total in tracer·m³/s.
+"""
+function read_budget(I, J, nk, months, XCref, YCref)
+    nk + 1 <= 52 || error("the budget needs the face below level $nk; lower ZMAX")
+    i0, i1, j0, j1 = first(I), last(I), first(J), last(J)
+    t0 = time()
+    rA, h, drF = open_monthly(monthly_path("TOTTTEND")) do ds
+        xc, yc = coord(ds, "XC", 1), coord(ds, "YC", 2)
+        (abs(xc[i0] - XCref[i0]) < 1e-3 && abs(yc[j0] - YCref[j0]) < 1e-3) ||
+            error("the monthly budget files are not on the 5-day files' grid")
+        fill0(ds["rA"][I, J]), fill0(ds["hFacC"][I, J, 1:nk]), f64(ds["drF"][1:nk])
+    end
+    cellV = rA .* h .* reshape(drF, 1, 1, nk)
+    V = [sum(cellV[:, :, k]) for k in 1:nk]
+    A = [sum(rA .* (h[:, :, k] .> 0)) for k in 1:nk]
+    surf = h[:, :, 1] .> 0
+
+    tracer = Dict{String, Any}()
+    for (tr, tot) in (("TH", "TOTTTEND"), ("SLT", "TOTSTEND"))
+        path = monthly_path(tot)
+        tend = open_monthly(path) do ds
+            m = month_range(ds, months, path)
+            X = fill0(ds[tot][I, J, 1:nk, m])
+            [sum(X[:, :, k, n] .* cellV[:, :, k]) / 86400 for k in 1:nk, n in 1:length(m)]
+        end
+        hadv = face_sum("ADVx_$tr", i0:i0, J, 1:nk, months) .- face_sum("ADVx_$tr", i1+1:i1+1, J, 1:nk, months) .+
+               face_sum("ADVy_$tr", I, j0:j0, 1:nk, months) .- face_sum("ADVy_$tr", I, j1+1:j1+1, 1:nk, months)
+        hdif = face_sum("DFxE_$tr", i0:i0, J, 1:nk, months) .- face_sum("DFxE_$tr", i1+1:i1+1, J, 1:nk, months) .+
+               face_sum("DFyE_$tr", I, j0:j0, 1:nk, months) .- face_sum("DFyE_$tr", I, j1+1:j1+1, 1:nk, months)
+        R = face_sum("ADVr_$tr", I, J, 1:nk+1, months)       # on each level's top face, positive up
+        D = face_sum("DFrI_$tr", I, J, 1:nk+1, months)
+        tracer[tr] = (; tend, hadv, hdif, R, D)
+    end
+    sfc = Dict{String, Vector{Float64}}()
+    for tok in ("surfTflx", "oceQsw", "surfSflx", "oceFWflx", "Salt")
+        path = monthly_path(tok)
+        sfc[tok] = open_monthly(path) do ds
+            m = month_range(ds, months, path)
+            v = ds[data_var(ds, SURFACE_NAMES[tok], path)]
+            X = fill0(ndims(v) == 4 ? v[I, J, 1, m] : v[I, J, m])
+            tok == "Salt" ? [mean(X[:, :, n][surf]) for n in 1:length(m)] :      # box-mean top S
+                            [sum(X[:, :, n] .* rA .* surf) for n in 1:length(m)]  # box total
+        end
+    end
+    @info @sprintf("B-SOSE monthly budget for the box read in %.0f s", time() - t0)
+    return (; months, V, A, TH = tracer["TH"], SLT = tracer["SLT"], sfc)
+end
+
+"Box budget, cached in OUTDIR so a re-run (other schemes, other dates inside the months) is not another download."
+function box_budget(name, I, J, nk, months, XC, YC)
+    mkpath(OUTDIR)
+    key = @sprintf("%s_i%d-%d_j%d-%d_k%d_%04d%02d-%04d%02d", name, first(I), last(I), first(J), last(J), nk,
+                   months[1]..., months[end]...)
+    path = joinpath(OUTDIR, ".single_column_budget_$key.jls")
+    isfile(path) && (@info "budget from cache $path"; return deserialize(path))
+    b = read_budget(I, J, nk, months, XC, YC)
+    serialize(path, b)
+    return b
+end
+
+"∫ₐᵇ of a piecewise-constant series (segment n from starts[n]; the first extends back, the last forward)."
+function piecewise_integral(starts, vals::AbstractMatrix, a, b)
+    out = zeros(size(vals, 1))
+    for n in eachindex(starts)
+        lo = n == 1 ? -Inf : starts[n]
+        hi = n == length(starts) ? Inf : starts[n+1]
+        dt = max(0.0, min(b, hi) - max(a, lo))
+        dt > 0 && (out .+= dt .* view(vals, :, n))
+    end
+    return out
+end
+
 # ── single-column model pieces ────────────────────────────────────────────────────────────────────
 @inline window_index(p, t) = clamp(searchsortedlast(p.ts, t), 1, length(p.ts))
 @inline Jᵀ(i, j, grid, clock, f, p) = (n = window_index(p, clock.time); -(p.Qtot[n] - p.Qsw[n]) / (p.ρ₀ * p.cₚ))
@@ -147,6 +298,11 @@ end
     below = k == 1 ? zero(ztop) : swfrac(zbot, p)          # the bottom cell keeps what reaches it
     return p.Qsw[n] * (swfrac(ztop, p) - below) / (p.ρ₀ * p.cₚ * (ztop - zbot))
 end
+# B-SOSE's lateral supply: p.LT, p.LS are levels (TOP DOWN) × months, constant from each p.tl (month start)
+@inline month_index(p, t) = clamp(searchsortedlast(p.tl, t), 1, length(p.tl))
+@inline lateral_S(i, j, k, grid, clock, f, p) = @inbounds p.LS[grid.Nz - k + 1, month_index(p, clock.time)]
+@inline T_sources(i, j, k, grid, clock, f, p) =
+    shortwave_heating(i, j, k, grid, clock, f, p) + @inbounds(p.LT[grid.Nz - k + 1, month_index(p, clock.time)])
 
 function build_closure(name)
     background = VerticalScalarDiffusivity(VerticallyImplicitTimeDiscretization(); ν = 1e-3, κ = 1e-4)
@@ -160,7 +316,10 @@ function build_closure(name)
     error("unknown closure '$name' (catke, catke_bare, kepsilon, ri)")
 end
 
-"""Run one scheme; return its window-mean T and S (top-down, nk × nr; record 1 is the start)."""
+"""
+Run one scheme; return its window-mean T and S (top-down, nk × nr; record 1 is the start) and its T and S
+snapshots at the run's edges (nk × nr+1: the start, then the end of each window).
+"""
 function run_column(name, zf, Tinit, Sinit, φc, p, edges)
     nk, nr = length(Tinit), length(edges) - 1
     grid = RectilinearGrid(CPU(); size = nk, z = zf, topology = (Flat, Flat, Bounded))
@@ -172,13 +331,17 @@ function run_column(name, zf, Tinit, Sinit, φc, p, edges)
                 buoyancy = SeawaterBuoyancy(equation_of_state = TEOS10EquationOfState(reference_density = ρ₀)),
                 coriolis = FPlane(latitude = φc), closure = build_closure(name), tracers = (:T, :S),
                 boundary_conditions = bcs,
-                forcing = (; T = Forcing(shortwave_heating; discrete_form = true, parameters = p)))
+                forcing = (T = Forcing(T_sources; discrete_form = true, parameters = p),
+                           S = Forcing(lateral_S; discrete_form = true, parameters = p)))
     set!(model, T = reshape(reverse(Tinit), 1, 1, nk), S = reshape(reverse(Sinit), 1, 1, nk))
     haskey(model.tracers, :e) && set!(model, e = 1e-6)
     haskey(model.tracers, :ϵ) && set!(model, ϵ = 1e-9)
 
     Tm, Sm = fill(NaN, nk, nr), fill(NaN, nk, nr)
     Tm[:, 1], Sm[:, 1] = Tinit, Sinit
+    Ts, Ss = fill(NaN, nk, nr + 1), fill(NaN, nk, nr + 1)
+    snap!(c) = (Ts[:, c] = reverse(vec(interior(model.tracers.T))); Ss[:, c] = reverse(vec(interior(model.tracers.S))))
+    snap!(1)
     accT, accS, count = zeros(nk), zeros(nk), Ref(0)
     function accumulate!(sim)
         accT .+= reverse(vec(interior(sim.model.tracers.T)))
@@ -189,6 +352,7 @@ function run_column(name, zf, Tinit, Sinit, φc, p, edges)
     add_callback!(sim, accumulate!, TimeInterval(3600.0))
     t0 = time()
     run!(sim)                                   # centre of record 1 to the end of its window
+    snap!(2)
     for r in 2:nr
         accT .= 0; accS .= 0; count[] = 0
         sim.stop_time = edges[r+1]
@@ -198,9 +362,10 @@ function run_column(name, zf, Tinit, Sinit, φc, p, edges)
             break
         end
         Tm[:, r], Sm[:, r] = accT ./ count[], accS ./ count[]
+        snap!(r + 1)
     end
     @info @sprintf("%s: %d steps, %.0f s wall", name, iteration(sim), time() - t0)
-    return Tm, Sm
+    return Tm, Sm, Ts, Ss
 end
 
 # ── one column ────────────────────────────────────────────────────────────────────────────────────
@@ -251,9 +416,63 @@ function do_column(col, recs, stamps, XC, YC, RF)
     ts = [secs(s - WINDOW) for s in stamps]                 # forcing window starts (ts[1] < 0)
     edges = [0.0; [secs(s) for s in stamps]]                # run 0 -> end of window 1, then window by window
     zf = reverse(RF[1:nk+1]) .+ 0.0                         # bottom to top
-    p = (; ts, Qtot, Qsw, SF, FW, τx, τy, zf, ρ₀, cₚ, R = SWR, ζ1 = SWζ1, ζ2 = SWζ2)
 
-    results = Dict{String, Tuple{Matrix{Float64}, Matrix{Float64}}}()
+    # ── B-SOSE's lateral supply, by calendar month ──
+    first_month, last_month = Date(stamps[1] - WINDOW), Date(stamps[end])
+    months = Tuple{Int, Int}[]
+    d = Date(Dates.year(first_month), Dates.month(first_month), 1)
+    while d <= last_month
+        push!(months, (Dates.year(d), Dates.month(d))); d += Month(1)
+    end
+    tl = [secs(DateTime(y, m, 1)) for (y, m) in months]
+    nm = length(months)
+    bud = LATERAL == "monthly" ? box_budget(col.name, I, J, nk, months, XC, YC) : nothing
+    function lateral_source(b)       # tracer/s per level (top down) × month: what the column gets from outside
+        L = zeros(nk, nm)
+        for n in 1:nm, k in 1:nk
+            vert = b.R[k+1, n] - (k == 1 ? 0.0 : b.R[k, n]) + (k == nk ? b.D[nk+1, n] : 0.0)
+            L[k, n] = (b.hadv[k, n] + b.hdif[k, n] + vert) / bud.V[k]
+        end
+        return L
+    end
+    LT = bud === nothing ? zeros(nk, nm) : lateral_source(bud.TH)
+    LS = bud === nothing ? zeros(nk, nm) : lateral_source(bud.SLT)
+    p = (; ts, Qtot, Qsw, SF, FW, τx, τy, zf, ρ₀, cₚ, R = SWR, ζ1 = SWζ1, ζ2 = SWζ2, tl, LT, LS)
+
+    mlabel(n) = @sprintf("%04d-%02d", months[n]...)
+    if bud !== nothing
+        A1 = bud.A[1]
+        println("\nB-SOSE'S OWN BUDGET OF THE BOX, 0-$(round(Int, H)) m, monthly (does it close?)")
+        println("  heat, W/m² of box surface (ρ cp = $(ρB) x $(cpB)); + = into the column")
+        @printf("  %-8s %9s %9s %9s %9s %9s %9s %9s | %9s\n", "month", "TOTTTEND", "h-adv", "h-diff", "ADVr@flr",
+                "DFrI@flr", "surface", "residual", "ADVr@sfc")
+        s = ρB * cpB / A1
+        for n in 1:nm
+            b = bud.TH
+            tot, ha, hd = sum(b.tend[:, n]), sum(b.hadv[:, n]), sum(b.hdif[:, n])
+            va, df, sf = b.R[nk+1, n], b.D[nk+1, n] - b.D[1, n], bud.sfc["surfTflx"][n] / (ρB * cpB)
+            @printf("  %-8s %9.1f %9.1f %9.1f %9.1f %9.1f %9.1f %9.1f | %9.1f\n", mlabel(n), s * tot, s * ha, s * hd,
+                    s * va, s * df, s * sf, s * (tot - ha - hd - va - df - sf + b.R[1, n]), -s * b.R[1, n])
+        end
+        println("  salt, g m⁻² day⁻¹; surface = SFLUX, dilution = -S·oceFWflx (residual shown without and with it)")
+        @printf("  %-8s %9s %9s %9s %9s %9s %9s %9s %9s %9s | %9s\n", "month", "TOTSTEND", "h-adv", "h-diff", "ADVr@flr",
+                "DFrI@flr", "surface", "dilution", "res", "res+dil", "ADVr@sfc")
+        s = ρB * 86400 / A1
+        for n in 1:nm
+            b = bud.SLT
+            tot, ha, hd = sum(b.tend[:, n]), sum(b.hadv[:, n]), sum(b.hdif[:, n])
+            va, df = b.R[nk+1, n], b.D[nk+1, n] - b.D[1, n]
+            sf, dil = bud.sfc["surfSflx"][n] / ρB, -bud.sfc["Salt"][n] * bud.sfc["oceFWflx"][n] / ρB
+            res = tot - ha - hd - va - df - sf + b.R[1, n]
+            @printf("  %-8s %9.2f %9.2f %9.2f %9.2f %9.2f %9.2f %9.2f %9.2f %9.2f | %9.2f\n", mlabel(n), s * tot,
+                    s * ha, s * hd, s * va, s * df, s * sf, s * dil, s * res, s * (res - dil), -s * b.R[1, n])
+        end
+        println("  residual = TOTTEND minus every other term. ADVr@sfc (vertical advection through the sea surface) is in ",
+                "the residual's\n  sum but NOT applied to the column, which has its own surface forcing. The column gets ",
+                "h-adv + h-diff\n  + ADVr through every face below the surface + DFrI at its floor, level by level.")
+    end
+
+    results = Dict{String, NTuple{4, Matrix{Float64}}}()
     for name in CLOSURES
         results[name] = run_column(name, zf, Tb[:, 1], Sb[:, 1], φc, p, edges)
     end
@@ -288,20 +507,24 @@ function do_column(col, recs, stamps, XC, YC, RF)
     ref = first(CLOSURES)
     println("\nCOLUMN BUDGET since $(Dates.format(stamps[1], "yyyy-mm-dd")) (0-$(round(Int, H)) m). heat MJ/m², salt kg/m² ",
             "(1 kg/m² = $(@sprintf("%.4f", 1000 / (ρ₀ * H))) g/kg over the column)")
-    @printf("%-11s | %8s %8s %8s %9s | %8s %8s %8s %9s\n", "window end", "B-SOSE", "forcing", "lateral",
-            "$ref-frc", "B-SOSE", "forcing", "lateral", "$ref-frc")
+    @printf("%-11s | %8s %8s %8s %8s %9s | %8s %8s %8s %8s %9s\n", "window end", "B-SOSE", "forcing", "lateral",
+            "applied", "$ref-chk", "B-SOSE", "forcing", "lateral", "applied", "$ref-chk")
+    centre(r) = secs(stamps[r] - Hour(60))
     for r in 2:nr
         (Dates.month(stamps[r]) != Dates.month(stamps[r-1]) || r == nr) || continue
         dHb, dSb = HC(Tb[:, r]) - HC(Tb[:, 1]), SC(Sb[:, r]) - SC(Sb[:, 1])
         Fh, Fs = fwd(Qtot, r) / 1e6, fwd(salt_in, r) / 1e3
+        Ah = ρ₀ * cₚ * sum(piecewise_integral(tl, LT, centre(1), centre(r)) .* Δz) / 1e6
+        As = ρ₀ * sum(piecewise_integral(tl, LS, centre(1), centre(r)) .* Δz) / 1e3
         Tm, Sm = results[ref]
         dHm = all(isfinite, Tm[:, r]) ? HC(Tm[:, r]) - HC(Tm[:, 1]) : NaN
         dSm = all(isfinite, Sm[:, r]) ? SC(Sm[:, r]) - SC(Sm[:, 1]) : NaN
-        @printf("%-11s | %8.1f %8.1f %8.1f %9.1f | %8.3f %8.3f %8.3f %9.3f\n", Dates.format(stamps[r], "yyyy-mm-dd"),
-                dHb, Fh, dHb - Fh, dHm - Fh, dSb, Fs, dSb - Fs, dSm - Fs)
+        @printf("%-11s | %8.1f %8.1f %8.1f %8.1f %9.1f | %8.3f %8.3f %8.3f %8.3f %9.3f\n",
+                Dates.format(stamps[r], "yyyy-mm-dd"), dHb, Fh, dHb - Fh, Ah, dHm - Fh - Ah, dSb, Fs, dSb - Fs, As, dSm - Fs - As)
     end
-    println("  lateral = B-SOSE's change minus its surface forcing: what a 1-D column cannot have. ",
-            "$ref-frc should be ~0 (the column conserves; salt uses the model's own top S, so not exactly).")
+    println("  lateral = B-SOSE's change minus its surface forcing (what a 1-D column lacks); applied = B-SOSE's monthly ",
+            "supply the column\n  was given (LATERAL=$LATERAL); $ref-chk = the column's change minus forcing minus applied, ",
+            "~0 (salt uses the column's own top S).")
 
     # ── end-state layer means against B-SOSE ──
     layers = ((0, 100), (100, 300), (300, H))
@@ -368,6 +591,75 @@ function do_column(col, recs, stamps, XC, YC, RF)
     mkpath(OUTDIR)
     out = joinpath(OUTDIR, "single_column_$(col.name).png")
     save(out, fig); @info "wrote $out"
+
+    bud === nothing && return
+    # ── vertical mixing flux: B-SOSE's DFrI against each scheme's ──
+    # A scheme's flux on the top face of level k (positive up), over window r, is what its tendency needs beyond
+    # the sources below that face: F(k) = F(k+1) + Δz (source - dT/dt), from F = 0 on the column floor. The top
+    # face should come out ~0 (the surface flux is a source of level 1): printed as a check.
+    frac(z) = SWR * exp(z / SWζ1) + (1 - SWR) * exp(z / SWζ2)
+    swk = [frac(RF[k]) - (k == nk ? 0.0 : frac(RF[k+1])) for k in 1:nk]
+    function scheme_flux(Xs, which, r)
+        Δt = edges[r+1] - edges[r]
+        L = piecewise_integral(tl, which === :T ? LT : LS, edges[r], edges[r+1]) ./ Δt
+        src = copy(L)
+        if which === :T
+            src .+= Qsw[r] .* swk ./ (ρ₀ * cₚ .* Δz)
+            src[1] += (Qtot[r] - Qsw[r]) / (ρ₀ * cₚ * Δz[1])
+        else
+            Stop = (Xs[1, r] + Xs[1, r+1]) / 2
+            src[1] += (SF[r] - Stop * FW[r]) / (ρ₀ * Δz[1])
+        end
+        dXdt = (Xs[:, r+1] .- Xs[:, r]) ./ Δt
+        F = zeros(nk + 1)
+        for k in nk:-1:1
+            F[k] = F[k+1] + Δz[k] * (src[k] - dXdt[k])
+        end
+        return F[1:nk]
+    end
+    inmonth(r, n) = (c = stamps[r] - Hour(60); (Dates.year(c), Dates.month(c)) == months[n])   # window centre in month n
+    shown = [n for n in 1:nm if count(r -> r >= 2 && inmonth(r, n), 1:nr) >= 3][1:min(end, 6)]
+    isempty(shown) && return
+    zface = RF[1:nk]                                                            # top faces, top down
+    Hscale, Sscale = ρ₀ * cₚ, ρ₀ * 86400                                        # → W/m², g m⁻² day⁻¹
+    println("\nVERTICAL MIXING FLUX, column mean over 0-$(round(Int, min(H, 300))) m, W/m² (heat) and g m⁻² day⁻¹ (salt), + = up")
+    @printf("  %-8s %10s", "month", "B-SOSE")
+    foreach(n -> @printf(" %10s", n), CLOSURES); @printf(" | %10s", "B-SOSE"); foreach(n -> @printf(" %10s", n), CLOSURES)
+    println("   (top-face check, W/m²)")
+    flux = Dict{Tuple{String, Symbol, Int}, Vector{Float64}}()
+    for n in shown, nme in CLOSURES, which in (:T, :S)
+        Xs = which === :T ? results[nme][3] : results[nme][4]
+        rs = [r for r in 2:nr if inmonth(r, n) && all(isfinite, Xs[:, r+1])]
+        flux[(nme, which, n)] = isempty(rs) ? fill(NaN, nk) : mean(scheme_flux(Xs, which, r) for r in rs)
+    end
+    upper = [2 <= k <= nk && -zface[k] <= 300 for k in 1:nk]
+    bsose_flux(which, n) = [k == 1 ? 0.0 : (which === :T ? bud.TH : bud.SLT).D[k, n] / bud.A[k] for k in 1:nk]
+    for n in shown
+        @printf("  %-8s %10.1f", mlabel(n), Hscale * mean(bsose_flux(:T, n)[upper]))
+        foreach(nme -> @printf(" %10.1f", Hscale * mean(flux[(nme, :T, n)][upper])), CLOSURES)
+        @printf(" | %10.2f", Sscale * mean(bsose_flux(:S, n)[upper]))
+        foreach(nme -> @printf(" %10.2f", Sscale * mean(flux[(nme, :S, n)][upper])), CLOSURES)
+        @printf("   (%s)\n", join([@sprintf("%.1f", Hscale * flux[(nme, :T, n)][1]) for nme in CLOSURES], ", "))
+    end
+
+    zlim = min(H, 600.0)
+    figf = Figure(size = (300 * length(shown) + 120, 900))
+    Label(figf[0, 1:length(shown)], "$(col.name): vertical mixing flux, B-SOSE's DFrI against each scheme " *
+                                    "(monthly mean, positive up)", fontsize = 18, font = :bold)
+    for (c, n) in enumerate(shown), (row, which, lab, sc) in ((1, :T, "heat (W/m²)", Hscale), (2, :S, "salt (g m⁻² day⁻¹)", Sscale))
+        a = Axis(figf[row, c], xlabel = lab, ylabel = c == 1 ? "depth (m)" : "", title = row == 1 ? mlabel(n) : "",
+                 limits = (nothing, (-zlim, 0)))
+        vlines!(a, 0, color = :gray70, linewidth = 1)
+        lines!(a, sc .* bsose_flux(which, n)[2:nk], zface[2:nk], color = :black, linewidth = 2.5,
+               label = "B-SOSE DFrI")
+        for nme in CLOSURES
+            F = flux[(nme, which, n)]
+            all(isfinite, F) && lines!(a, sc .* F[2:nk], zface[2:nk], color = colors[nme], linewidth = 2, label = nme)
+        end
+        row == 1 && c == 1 && axislegend(a, position = :rb, framevisible = false)
+    end
+    outf = joinpath(OUTDIR, "single_column_$(col.name)_mixing_flux.png")
+    save(outf, figf); @info "wrote $outf"
 end
 
 function main()
