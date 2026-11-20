@@ -168,12 +168,12 @@ if !isempty(byears)
     sums = Dict(q => zeros(nb, nm) for q in (:into, :atm)); cnt = zeros(Int, nm)
     for y in byears
         df, da = NCDataset(bfile("oceFWflx", y)), NCDataset(bfile("SIatmFW", y))
-        F, A = pick(df, ("oceFWflx", "OCEFWFLX")), pick(da, ("SIatmFW", "SIATMFW"))
+        Fo, Fa = pick(df, ("oceFWflx", "OCEFWFLX")), pick(da, ("SIatmFW", "SIATMFW"))
         stamps = DateTime.(df["time"][:])
         stamps == DateTime.(da["time"][:]) || error("B-SOSE oceFWflx and SIatmFW $y hold different records")
         for (n, s) in enumerate(stamps)
             k = get(kof, ym_of(s - Hour(60)), 0); k == 0 && continue
-            sums[:into][:, k] .+= bandsum(g(F[ir, jr, n])[il, jl]); sums[:atm][:, k] .+= bandsum(g(A[ir, jr, n])[il, jl])
+            sums[:into][:, k] .+= bandsum(g(Fo[ir, jr, n])[il, jl]); sums[:atm][:, k] .+= bandsum(g(Fa[ir, jr, n])[il, jl])
             cnt[k] += 1
         end
         close(df); close(da)
