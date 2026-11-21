@@ -700,6 +700,48 @@ function do_column(col, recs, stamps, XC, YC, RF)
                   join(@sprintf(" %8.2f", Sscale * mean(flux[(nme, :S, n)][upper])) for nme in CLOSURES))
     end
 
+    # ── implied vertical diffusivity BELOW the mixed layer: κ = -F / (∂X/∂z) ──
+    # F the mixing flux on a level's top face (positive up), ∂X/∂z the monthly-mean gradient across that face (z up).
+    # Faces from max(B-SOSE's monthly MLD + 50 m, 200 m) to min(600 m, floor), where the gradient is not tiny; the
+    # median over those faces. B-SOSE's from its DFrI and its own profile; each scheme's from its diagnosed flux and
+    # its own profile. Our backgrounds are κz = 1e-4 (catke, ri); catke_bare and kepsilon have none.
+    gmin = (S = 2e-4, T = 1e-3)                                  # g/kg per m, °C per m
+    function implied_kappa(F, X, hml, which)
+        ks = Float64[]
+        for k in 2:nk
+            d = -RF[k]
+            (max(hml + 50, 200.0) <= d <= min(600.0, H)) || continue
+            g = (X[k-1] - X[k]) / (zc[k-1] - zc[k])
+            abs(g) < (which === :S ? gmin.S : gmin.T) && continue
+            push!(ks, -F[k] / g)
+        end
+        return isempty(ks) ? (NaN, 0) : (median(ks), length(ks))
+    end
+    fk(x) = isfinite(x[1]) ? @sprintf("%.1f", 1e5 * x[1]) : "--"
+    println("\nIMPLIED κz BELOW THE MIXED LAYER (1e-5 m²/s; median over faces from max(MLD+50, 200) m to 600 m) " *
+            "-- from salt | from heat. Our background is 10 (1e-4).")
+    hdr = @sprintf("  %-8s %10s", "month", "B-SOSE(n)") * join(@sprintf(" %10s", n) for n in CLOSURES)
+    println(hdr, " |", hdr[11:end])
+    push!(sm, "implied κz below the mixed layer, 1e-5 m²/s (median, faces max(MLD+50,200)-600 m): salt | heat; ours = 10")
+    push!(sm, hdr * " |" * hdr[11:end])
+    for n in shown
+        rs = [r for r in 2:nr if inmonth(r, n)]
+        hml = mean(first.(hb[rs]))
+        row = @sprintf("  %-8s", mlabel(n))
+        for (which, Xb, idx) in ((:S, Sb, 2), (:T, Tb, 1))
+            kb = implied_kappa(bsose_flux(which, n), vec(mean(Xb[:, rs], dims = 2)), hml, which)
+            which === :T && (row *= " |")
+            row *= @sprintf(" %10s", fk(kb) * "($(kb[2]))")
+            for nme in CLOSURES
+                Xm = results[nme][idx]
+                ok = [r for r in rs if all(isfinite, Xm[:, r])]
+                row *= @sprintf(" %10s", isempty(ok) ? "--" :
+                                fk(implied_kappa(flux[(nme, which, n)], vec(mean(Xm[:, ok], dims = 2)), hml, which)))
+            end
+        end
+        println(row); push!(sm, row)
+    end
+
     zlim = min(H, 600.0)
     figf = Figure(size = (300 * length(shown) + 120, 900))
     Label(figf[0, 1:length(shown)], "$(col.name): vertical mixing flux, B-SOSE's DFrI against each scheme " *
