@@ -3,6 +3,7 @@
 # B-SOSE, by latitude band and 30-day window, and at what depth the difference sits.
 #
 #     BSOSE_DIR=/storage/scratch1/1/vnguyen480/SOWinWaRP/data julia --project=. tools/under_ice_heat.jl 2Y_nested_bsose_ggl_hj_pr207_mcphee
+#     SOURCE=5day BSOSE_DIR=... julia --project=. tools/under_ice_heat.jl <RUN>     # the 5-day files, as before 2026-11-22
 #
 # WHY. 2Y_nested_bsose_ggl_hj_pr207_mcphee took MITgcm's ocean-to-ice heat transfer (8.75e-4 m/s, ~46x
 # NumericalEarth's default) and its ice volume fell to ~75% of B-SOSE's at the peaks and ~25% at the
@@ -18,8 +19,10 @@
 # B-SOSE's 52 levels, so the levels match one for one (checked). Cells count where both are wet.
 #
 # WHEN. The run's <RUN>_eke.nc holds its only 3-D T and S: 30-day means, stamped at each window's end.
-# B-SOSE is the mean of its 5-day Theta, Salt and SIarea records whose centres (stamp - 2.5 days) fall
-# in the same window. The run's ℵ is the mean of its daily <RUN>_sea_ice.nc snapshots in the window.
+# B-SOSE (bsose_windows.jl, SOURCE): monthly (default) = its Theta, Salt and SIArea *_2013to2024_monthly.nc,
+# each window the overlap-weighted blend of its calendar months; 5day = the mean of its 5-day records whose
+# centres (stamp - 2.5 days) fall in the window. The run's ℵ is the mean of its daily <RUN>_sea_ice.nc
+# snapshots in the window.
 #
 # FREEZING. Each side against ITS OWN model's surface freezing point, the one its ice melts against:
 #     run     ClimaSeaIce 0.7.2 LinearLiquidus:  Tf = -0.0542 S   (its depth term left out)
@@ -41,16 +44,16 @@
 # mixing to reach the warm water below; the top-cell and deep salinities of both are printed with it.
 # B-SOSE's θ and practical S go through the same TEOS-10 formula: the ~0.16 g/kg Sᴬ - Sₚ offset is
 # common to both layers and drops out of ΔS.
-# WRITES OUTDIR/<RUN>_under_ice_heat.png: per band, the 0-HC_DEPTH heat of both; run - B-SOSE heat by
+# WRITES OUTDIR/<RUN>_under_ice_heat.png (SOURCE=5day) or <RUN>_under_ice_heat_monthly.png: per band, the 0-HC_DEPTH heat of both; run - B-SOSE heat by
 #   layer (0-SPLIT, SPLIT-HC_DEPTH, HC_DEPTH-DEEP_DEPTH, the last on the deep columns); and run - B-SOSE
 #   (T - Tf) against depth and time to PROFILE_ZMAX.
 #
-# LOGIN-NODE SAFE: NCDatasets and CairoMakie only; B-SOSE is read one record at a time, the box and the
-# top PROFILE_ZMAX metres only.
+# LOGIN-NODE SAFE: NCDatasets and CairoMakie only; B-SOSE is read one record at a time, the box's rows at
+# full width (contiguous on disk) and the top PROFILE_ZMAX metres only.
 #
-# ENV: DIR (run files, default .), OUTDIR (plots), BSOSE_DIR (required), START (default: the file's
+# ENV: DIR (run files, default .), OUTDIR (plots), BSOSE_DIR (required), SOURCE (monthly | 5day), START (default: the file's
 #      start_date), BANDS (-70,-65,-60,-55), ICE_MIN (0.15), HC_DEPTH (100), SPLIT (40),
-#      DEEP_DEPTH (default: the bottom of the deepest level within PROFILE_ZMAX), PROFILE_ZMAX (300), MIN_RECORDS (B-SOSE records per window, default 4)
+#      DEEP_DEPTH (default: the bottom of the deepest level within PROFILE_ZMAX), PROFILE_ZMAX (300), MIN_RECORDS (5-day records per window, default 4)
 # ==============================================================================================
 
 using NCDatasets, CairoMakie, Dates, Printf, Statistics
@@ -59,13 +62,14 @@ using SeawaterPolynomials.TEOS10: TEOS10EquationOfState
 
 ENV["HDF5_USE_FILE_LOCKING"] = "FALSE"   # safe on a run that is still writing
 include(joinpath(@__DIR__, "model_grid.jl"))   # file_levels, file_kbot
+include(joinpath(@__DIR__, "bsose_windows.jl")) # BSOSE_SOURCE, bsose_records, bsose_window_mean
 
 const RUN = isempty(ARGS) ? get(ENV, "RUN", "") : ARGS[1]
 isempty(RUN) && error("give the run name: julia --project=. tools/under_ice_heat.jl <RUN>")
 const DIR          = get(ENV, "DIR", ".")
 const OUTDIR       = get(ENV, "OUTDIR", "plots")
 const BSOSE_DIR    = get(ENV, "BSOSE_DIR", "")
-isempty(BSOSE_DIR) && error("set BSOSE_DIR to the directory with B-SOSE's 5-day Theta, Salt and SIarea files")
+isempty(BSOSE_DIR) && error("set BSOSE_DIR to the directory with B-SOSE's Theta, Salt and SIArea files")
 const EDGES        = parse.(Float64, split(get(ENV, "BANDS", "-70,-65,-60,-55"), ','))
 const ICE_MIN      = parse(Float64, get(ENV, "ICE_MIN", "0.15"))
 const HC_DEPTH     = parse(Float64, get(ENV, "HC_DEPTH", "100"))
@@ -88,33 +92,8 @@ end
 
 f64(A) = Float64.(coalesce.(A, NaN))
 coord(ds, name, dim) = (v = f64(ds[name][:]); ndims(v) == 1 ? v : dim == 1 ? v[:, 1] : v[1, :])
-first_var(ds, names, path) = (found = filter(n -> haskey(ds, n), names);
-                              isempty(found) ? error("none of $(names) in $path") : first(found))
 band_name(b) = @sprintf("%.0f-%.0fS", -EDGES[b], -EDGES[b+1])
 label(d) = Dates.format(d, "yyyy-mm-dd")
-
-"The file `<token>_bsoseI156_<year>_5day.nc` in BSOSE_DIR, matching the token whatever its case."
-function bsose_file(token, y)
-    want = lowercase("$(token)_bsoseI156_$(y)_5day.nc")
-    hits = filter(f -> lowercase(f) == want, readdir(BSOSE_DIR))
-    isempty(hits) && error("no $(token)_bsoseI156_$(y)_5day.nc (any case) in $BSOSE_DIR")
-    return joinpath(BSOSE_DIR, first(hits))
-end
-
-"Every 5-day record of a token over the given years: (path, variable, record, window centre)."
-function bsose_records(token, names, years)
-    recs = Tuple{String, String, Int, DateTime}[]
-    for y in years
-        path = bsose_file(token, y)
-        NCDataset(path) do ds
-            var = first_var(ds, names, path)
-            for (n, stamp) in enumerate(ds["time"][:])
-                push!(recs, (path, var, n, DateTime(stamp) - Hour(60)))
-            end
-        end
-    end
-    return recs
-end
 
 function main()
     # ── the run: grid, levels, 30-day T and S windows ─────────────────────────────────────────
@@ -165,22 +144,16 @@ function main()
         return dropdims(mean(replace(A, NaN => 0.0); dims = 3); dims = 3)
     end
 
-    # ── B-SOSE: 5-day records, nearest cell to each run cell, matching levels ────────────────
-    # A year counts only if its Theta, Salt and SIarea files all open: a truncated download (an "HDF error" on
-    # opening) drops that year's windows with a warning instead of stopping the whole comparison.
-    opens(path) = try NCDataset(_ -> true, path) catch; false end
-    years = filter(year(first(windows)[1]):year(last(windows)[2])) do y
-        bad = [t for t in ("Theta", "Salt", "SIarea") if !(try opens(bsose_file(t, y)) catch; false end)]
-        isempty(bad) || @warn "B-SOSE $y skipped: $(join(bad, ", ")) 5-day file missing or unreadable (truncated download?)"
-        isempty(bad)
-    end
-    isempty(years) && error("no year with all of B-SOSE's 5-day Theta, Salt and SIarea readable in $BSOSE_DIR")
-    Trecs = bsose_records("Theta", ("THETA", "Theta"), years)
-    Srecs = bsose_records("Salt", ("SALT", "Salt"), years)
-    Arecs = bsose_records("SIarea", ("SIarea", "SIArea", "SIAREA"), years)
-    [r[4] for r in Trecs] == [r[4] for r in Srecs] || error("B-SOSE Theta and Salt hold different 5-day records")
+    # ── B-SOSE: monthly or 5-day records, nearest cell to each run cell, matching levels ─────
+    # 5-day: a year counts only if its Theta, Salt and SIArea files all open (a truncated download drops that
+    # year's windows with a warning). Monthly: a missing or unreadable file is an error naming it.
+    years = bsose_usable_years(BSOSE_DIR, ("Theta", "Salt", "SIArea"), year(first(windows)[1]):year(last(windows)[2]))
+    Trecs = bsose_records(BSOSE_DIR, "Theta", ("THETA", "Theta"), years)
+    Srecs = bsose_records(BSOSE_DIR, "Salt", ("SALT", "Salt"), years)
+    Arecs = bsose_records(BSOSE_DIR, "SIArea", ("SIarea", "SIArea", "SIAREA"), years)
+    [(r.t0, r.t1) for r in Trecs] == [(r.t0, r.t1) for r in Srecs] || error("B-SOSE Theta and Salt hold different records")
 
-    XC, YC, RF = NCDataset(Trecs[1][1]) do ds
+    XC, YC, RF = NCDataset(Trecs[1].path) do ds
         rf = haskey(ds, "RF") ? f64(ds["RF"][:]) : [0.0; -cumsum(f64(ds[haskey(ds, "drF") ? "drF" : "DRF"][:]))]
         coord(ds, "XC", 1), coord(ds, "YC", 2), rf
     end
@@ -194,20 +167,8 @@ function main()
     @info @sprintf("%s: %dx%d, %d levels to %.0f m; B-SOSE cells %d:%d x %d:%d; %d windows %s to %s",
                    RUN, Nx, Ny, nk, depth[end], first(ir), last(ir), first(jr), last(jr), length(windows),
                    label(first(windows)[1]), label(last(windows)[2]))
-
-    function bsose_mean(recs, w0, w1, levels)
-        sel = filter(r -> w0 < r[4] <= w1, recs)
-        length(sel) < MIN_RECORDS && return nothing
-        acc = nothing
-        for (path, var, n, _) in sel
-            A = NCDataset(path) do ds
-                v = ds[var]
-                f64(levels === nothing ? (ndims(v) == 4 ? v[ir, jr, 1, n] : v[ir, jr, n]) : v[ir, jr, 1:levels, n])
-            end
-            acc = acc === nothing ? A : acc .+ A
-        end
-        return acc ./ length(sel)
-    end
+    @info "SOURCE=$BSOSE_SOURCE: $(bsose_source_note())"
+    bsose_mean(recs, w0, w1, levels) = bsose_window_mean(recs, w0, w1, ir, jr, levels; min_records = MIN_RECORDS)
 
     # ── per window ───────────────────────────────────────────────────────────────────────────
     nb, nw = length(EDGES) - 1, length(windows)
@@ -222,7 +183,7 @@ function main()
     for (w, (w0, w1)) in enumerate(windows)
         Tb = bsose_mean(Trecs, w0, w1, nk); Sb = bsose_mean(Srecs, w0, w1, nk); Ab = bsose_mean(Arecs, w0, w1, nothing)
         if Tb === nothing || Sb === nothing || Ab === nothing
-            @warn "$(label(w0)) to $(label(w1)): fewer than $MIN_RECORDS B-SOSE records, skipped"
+            @warn "$(label(w0)) to $(label(w1)): B-SOSE does not cover this window ($BSOSE_SOURCE), skipped"
             continue
         end
         Tb[Sb .== 0] .= NaN; Sb[Sb .== 0] .= NaN               # B-SOSE land is zero
@@ -302,6 +263,7 @@ function main()
     println("\n", bar)
     println("HEAT ABOVE FREEZING UNDER B-SOSE'S ICE (30-day mean SIarea >= $ICE_MIN), $RUN against B-SOSE")
     println("  T - Tf, each against its own model's freezing point; heat = ρ₀cₚ∫(T - Tf)dz over 0-$(Int(HC_DEPTH)) m, MJ/m²")
+    println("  SOURCE=$BSOSE_SOURCE: $(bsose_source_note())")
     println("  Δ = run - B-SOSE, split at $(Int(SPLIT)) m; 1 MJ/m² melts $(round(1e6 / ρᵢL * 100, digits = 2)) cm of ice")
     D0, D1 = Int(HC_DEPTH), round(Int, deep_bot)
     println("  right of ||: columns wet to $D1 m in both (deep cols), their Δ 0-$D0, the $D0-$D1 m heat of both and Δ $D0-$D1")
@@ -369,7 +331,7 @@ function main()
         hm = heatmap!(ax2, x, depth, Δprof[b, :, :]; colormap = :balance, colorrange = (-lim, lim))
     end
     Colorbar(fig[1:length(bands), 4], hm; label = "Δ(T - Tf), °C")
-    out = joinpath(OUTDIR, "$(RUN)_under_ice_heat.png")
+    out = joinpath(OUTDIR, BSOSE_SOURCE == "5day" ? "$(RUN)_under_ice_heat.png" : "$(RUN)_under_ice_heat_monthly.png")
     save(out, fig)
     @info "wrote $out"
 end

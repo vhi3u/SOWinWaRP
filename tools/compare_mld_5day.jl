@@ -1,8 +1,16 @@
 # ==============================================================================================
 # compare_mld_5day.jl -- the run's mixed layer depth against B-SOSE's, by latitude band, under
-# B-SOSE's ice and in open water, from B-SOSE's 5-DAY T and S and its own MLD diagnostic.
+# B-SOSE's ice and in open water, from B-SOSE's T and S and its own MLD diagnostic.
 #
 #     BSOSE_DIR=/storage/scratch1/1/vnguyen480/SOWinWaRP/data julia --project=. tools/compare_mld_5day.jl 2Y_nested_bsose_ggl_hj_pr207_icein
+#     SOURCE=5day BSOSE_DIR=... julia --project=. tools/compare_mld_5day.jl <RUN>     # the 5-day files, as before 2026-11-22
+#
+# SOURCE (bsose_windows.jl): monthly (default) reads B-SOSE's Theta, Salt, SIArea and MLD
+# *_2013to2024_monthly.nc, each 30-day window the overlap-weighted blend of its calendar months; 5day
+# reads the per-year 5-day files (the name of this script is historical). Both are window means of T and
+# S, and the mixed layer is taken of that mean on both sides, so they measure the same thing; the
+# monthly path reads ~2 records per window instead of ~6. Full-width row reads either way: the 5-day
+# path took ~4 h on PACE reading the 360-wide box as strided pieces.
 #
 # WHY. under_ice_heat.jl (_icein) found 70-65S keeping its deep heat down: B-SOSE moves ~140 MJ/m²
 # out of 100-290 m each winter, the run ~15, with the same top-cell salinity. That reads as a winter
@@ -12,8 +20,8 @@
 #
 # THREE NUMBERS per band, ice class and 30-day window:
 #   run         mld.jl (density threshold MLD_DT, 10 m reference) of the run's 30-day mean T, S (<RUN>_eke.nc)
-#   B-SOSE      the same function of B-SOSE's 5-day T, S averaged over the same window (like with like)
-#   B-SOSE diag B-SOSE's own MLD (5-day files), averaged over the window: its criterion, its time
+#   B-SOSE      the same function of B-SOSE's T, S averaged over the same window (like with like)
+#   B-SOSE diag B-SOSE's own MLD diagnostic, averaged over the window: its criterion, its time
 #               sampling. B-SOSE against B-SOSE diag says how far our criterion and the 30-day mean
 #               state move the number; run against B-SOSE is the fair comparison.
 # A column with no crossing above ZMAX (or its floor) counts at that depth, and the share of such
@@ -21,9 +29,10 @@
 # Cells: B-SOSE's nearest cell to each run cell (the grids coincide at 1/6°); ice = B-SOSE's window-
 # mean SIArea >= ICE_MIN. Means are cos(latitude)-weighted.
 #
-# WRITES OUTDIR/<RUN>_mld_5day.png: per band, the three MLDs under ice and in open water.
-# ENV: DIR, OUTDIR, BSOSE_DIR (required), BANDS (-70,-65,-60,-55,-50,-45), ICE_MIN (0.15),
-#      ZMAX (1500 m), MIN_RECORDS (4), MLD_DT (0.03 kg/m³, read by mld.jl)
+# WRITES OUTDIR/<RUN>_mld_<SOURCE>.png (_mld_monthly.png, or _mld_5day.png as before): per band, the
+# three MLDs under ice and in open water.
+# ENV: DIR, OUTDIR, BSOSE_DIR (required), SOURCE (monthly | 5day), BANDS (-70,-65,-60,-55,-50,-45),
+#      ICE_MIN (0.15), ZMAX (1500 m), MIN_RECORDS (5-day only, 4), MLD_DT (0.03 kg/m³, read by mld.jl)
 # ==============================================================================================
 
 using NCDatasets, CairoMakie, Dates, Printf, Statistics
@@ -31,13 +40,14 @@ using NCDatasets, CairoMakie, Dates, Printf, Statistics
 ENV["HDF5_USE_FILE_LOCKING"] = "FALSE"
 include(joinpath(@__DIR__, "model_grid.jl"))   # file_levels, file_kbot
 include(joinpath(@__DIR__, "mld.jl"))          # mld, MLD_DT
+include(joinpath(@__DIR__, "bsose_windows.jl")) # BSOSE_SOURCE, bsose_records, bsose_window_mean
 
 const RUN = isempty(ARGS) ? get(ENV, "RUN", "") : ARGS[1]
 isempty(RUN) && error("give the run name: julia --project=. tools/compare_mld_5day.jl <RUN>")
 const DIR         = get(ENV, "DIR", ".")
 const OUTDIR      = get(ENV, "OUTDIR", "plots")
 const BSOSE_DIR   = get(ENV, "BSOSE_DIR", "")
-isempty(BSOSE_DIR) && error("set BSOSE_DIR to the directory with B-SOSE's 5-day Theta, Salt, SIArea and MLD files")
+isempty(BSOSE_DIR) && error("set BSOSE_DIR to the directory with B-SOSE's Theta, Salt, SIArea and MLD files")
 const EDGES       = parse.(Float64, split(get(ENV, "BANDS", "-70,-65,-60,-55,-50,-45"), ','))
 const ICE_MIN     = parse(Float64, get(ENV, "ICE_MIN", "0.15"))
 const ZMAX        = parse(Float64, get(ENV, "ZMAX", "1500"))
@@ -47,37 +57,6 @@ f64(A) = Float64.(coalesce.(A, NaN))
 coord(ds, name, dim) = (v = f64(ds[name][:]); ndims(v) == 1 ? v : dim == 1 ? v[:, 1] : v[1, :])
 band_name(b) = @sprintf("%.0f-%.0fS", -EDGES[b], -EDGES[b+1])
 label(d) = Dates.format(d, "yyyy-mm-dd")
-
-function bsose_file(token, y)
-    want = lowercase("$(token)_bsoseI156_$(y)_5day.nc")
-    hits = filter(f -> lowercase(f) == want, readdir(BSOSE_DIR))
-    isempty(hits) ? "" : joinpath(BSOSE_DIR, first(hits))
-end
-opens(p) = !isempty(p) && (try NCDataset(_ -> true, p) catch; false end)
-
-"The data variable of a B-SOSE file: the first of `names`, else its only variable over (x, y, time) or (x, y, z, time)."
-function data_var(ds, names, path)
-    for n in names
-        haskey(ds, n) && return n
-    end
-    cands = [k for k in keys(ds) if ndims(ds[k]) >= 3]
-    length(cands) == 1 && return only(cands)
-    error("none of $names in $path, and no single data variable ($(cands))")
-end
-
-function bsose_records(token, names, years)
-    recs = Tuple{String, String, Int, DateTime}[]
-    for y in years
-        path = bsose_file(token, y)
-        NCDataset(path) do ds
-            var = data_var(ds, names, path)
-            for (n, stamp) in enumerate(ds["time"][:])
-                push!(recs, (path, var, n, DateTime(stamp) - Hour(60)))
-            end
-        end
-    end
-    return recs
-end
 
 function main()
     # ── the run ──────────────────────────────────────────────────────────────────────────────
@@ -105,17 +84,12 @@ function main()
     depth_top_down = [-zc[k] for k in Nz:-1:lo]
 
     # ── B-SOSE ──────────────────────────────────────────────────────────────────────────────
-    years = filter(year(first(windows)[1]):year(last(windows)[2])) do y
-        bad = [t for t in ("Theta", "Salt", "SIArea", "MLD") if !opens(bsose_file(t, y))]
-        isempty(bad) || @warn "B-SOSE $y skipped: $(join(bad, ", ")) 5-day file missing or unreadable"
-        isempty(bad)
-    end
-    isempty(years) && error("no year with B-SOSE's 5-day Theta, Salt, SIArea and MLD readable in $BSOSE_DIR")
-    Trecs = bsose_records("Theta", ("THETA", "Theta"), years)
-    Srecs = bsose_records("Salt", ("SALT", "Salt"), years)
-    Arecs = bsose_records("SIArea", ("SIarea", "SIArea", "SIAREA"), years)
-    Mrecs = bsose_records("MLD", ("MLD", "MXLDEPTH", "BLGMLD"), years)
-    XC, YC, RF = NCDataset(Trecs[1][1]) do ds
+    years = bsose_usable_years(BSOSE_DIR, ("Theta", "Salt", "SIArea", "MLD"), year(first(windows)[1]):year(last(windows)[2]))
+    Trecs = bsose_records(BSOSE_DIR, "Theta", ("THETA", "Theta"), years)
+    Srecs = bsose_records(BSOSE_DIR, "Salt", ("SALT", "Salt"), years)
+    Arecs = bsose_records(BSOSE_DIR, "SIArea", ("SIarea", "SIArea", "SIAREA"), years)
+    Mrecs = bsose_records(BSOSE_DIR, "MLD", ("MLD", "MXLDEPTH", "BLGMLD"), years)
+    XC, YC, RF = NCDataset(Trecs[1].path) do ds
         rf = haskey(ds, "RF") ? f64(ds["RF"][:]) : [0.0; -cumsum(f64(ds[haskey(ds, "drF") ? "drF" : "DRF"][:]))]
         coord(ds, "XC", 1), coord(ds, "YC", 2), rf
     end
@@ -126,20 +100,8 @@ function main()
     maximum(abs.(dB .- depth_top_down)) < 0.05 || error("B-SOSE's top $nk level centres differ from the run's")
     @info @sprintf("%s: %dx%d, %d levels to %.0f m; %d windows %s to %s; MLD_DT %.3f kg/m³", RUN, Nx, Ny, nk,
                    depth_top_down[end], length(windows), label(first(windows)[1]), label(last(windows)[2]), MLD_DT)
-
-    function bsose_mean(recs, w0, w1, levels)
-        sel = filter(r -> w0 < r[4] <= w1, recs)
-        length(sel) < MIN_RECORDS && return nothing
-        acc = nothing
-        for (path, var, n, _) in sel
-            A = NCDataset(path) do ds
-                v = ds[var]
-                f64(levels === nothing ? (ndims(v) == 4 ? v[ir, jr, 1, n] : v[ir, jr, n]) : v[ir, jr, 1:levels, n])
-            end
-            acc = acc === nothing ? A : acc .+ A
-        end
-        return acc ./ length(sel)
-    end
+    @info "SOURCE=$BSOSE_SOURCE: $(bsose_source_note())"
+    bsose_mean(recs, w0, w1, levels) = bsose_window_mean(recs, w0, w1, ir, jr, levels; min_records = MIN_RECORDS)
 
     # ── per window ──────────────────────────────────────────────────────────────────────────
     nb, nw = length(EDGES) - 1, length(windows)
@@ -152,7 +114,7 @@ function main()
         Tb = bsose_mean(Trecs, w0, w1, nk); Sb = bsose_mean(Srecs, w0, w1, nk)
         Ab = bsose_mean(Arecs, w0, w1, nothing); Mb = bsose_mean(Mrecs, w0, w1, nothing)
         if any(isnothing, (Tb, Sb, Ab, Mb))
-            @warn "$(label(w0)) to $(label(w1)): fewer than $MIN_RECORDS B-SOSE records, skipped"
+            @warn "$(label(w0)) to $(label(w1)): B-SOSE does not cover this window ($BSOSE_SOURCE), skipped"
             continue
         end
         Tb, Sb, Ab, Mb = Tb[il, jl, :], Sb[il, jl, :], Ab[il, jl], Mb[il, jl]
@@ -200,6 +162,7 @@ function main()
     println("\n", bar)
     println("MIXED LAYER DEPTH, $RUN against B-SOSE (m; density threshold $(MLD_DT) kg/m³ from 10 m, columns to $(Int(ZMAX)) m)")
     println("  run, B-SOSE: that criterion on each one's 30-day mean T, S; diag: B-SOSE's own MLD, averaged over the window")
+    println("  SOURCE=$BSOSE_SOURCE: $(bsose_source_note())")
     println("  no-cross %: columns with no crossing above the floor or $(Int(ZMAX)) m, counted at that depth")
     println("  ice: B-SOSE window-mean SIArea >= $ICE_MIN")
     println(bar)
@@ -232,7 +195,7 @@ function main()
         lines!(ax, x, res[(c, :diag)][b, :]; color = :darkorange, linewidth = 2, label = "B-SOSE MLD diagnostic")
         r == 1 && col == 1 && axislegend(ax; position = :lb, backgroundcolor = (:white, 0.8))
     end
-    out = joinpath(OUTDIR, "$(RUN)_mld_5day.png")
+    out = joinpath(OUTDIR, "$(RUN)_mld_$(BSOSE_SOURCE).png")
     save(out, fig)
     @info "wrote $out"
 end
