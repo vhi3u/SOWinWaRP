@@ -161,48 +161,9 @@ function main()
     end
     bmon = bsose_mlds!(fill(NaN, np), groups, g, tvar, svar)
     @info "B-SOSE monthly sampled at $(count(isfinite, bmon)) profiles"
-
-    # B: the run's span
     have_run = !isempty(RUN)
-    b5, runm = fill(NaN, np), fill(NaN, np)
-    span = (DateTime(0), DateTime(0))
-    if have_run
-        eke = NCDataset(joinpath(DIR, "$(RUN)_eke.nc"))
-        λ, φ = f64(eke["λ_caa"][:]), f64(eke["φ_aca"][:])
-        zc, zf, _ = file_levels(eke); kbot = file_kbot(eke, zc, zf)[1]; Nz = length(zc)
-        start = DateTime(string(eke.attrib["start_date"]))
-        win = haskey(eke.attrib, "averaging_window_seconds") ? Float64(eke.attrib["averaging_window_seconds"]) : 30 * 86400.0
-        tend = f64(eke["time"][:]); keepn = findall(t -> t >= 0.99win, tend)
-        wins = [(start + Millisecond(round(Int, 1000 * (tend[n] - win))), start + Millisecond(round(Int, 1000 * tend[n])), n) for n in keepn]
-        span = (wins[1][1], wins[end][2])
-        lo = findfirst(k -> -zc[k] <= ZMAX, 1:Nz); zs = zc[lo:Nz]
-        ir = [argmin(abs.(λ .- x)) for x in P.lon]; jrun = [argmin(abs.(φ .- y)) for y in P.lat]
-        for (w0, w1, n) in wins
-            ps = [p for p in 1:np if w0 < P.time[p] <= w1]; isempty(ps) && continue
-            Tr = f64(eke["T"][:, :, lo:Nz, n]); Sr = f64(eke["S"][:, :, lo:Nz, n])
-            for p in ps
-                kb = kbot[ir[p], jrun[p]]; kb === nothing && continue
-                runm[p] = mld(view(Tr, ir[p], jrun[p], :), view(Sr, ir[p], jrun[p], :), zs, max(kb - lo + 1, 1))
-            end
-        end
-        close(eke)
-        # B-SOSE 5-day record holding the profile's time
-        g5 = Dict{Tuple{String, String, Int}, Vector{NTuple{3, Int}}}()
-        for y in year(span[1]):year(span[2])
-            tp, sp = bsose_path(BSOSE_DIR, "Theta", y), bsose_path(BSOSE_DIR, "Salt", y)
-            (isempty(tp) || isempty(sp)) && (@warn "no 5-day Theta/Salt for $y"; continue)
-            st = NCDataset(ds -> DateTime.(ds["time"][:]), tp)
-            for p in 1:np
-                (span[1] < P.time[p] <= span[2] && year(P.time[p]) == y) || continue
-                n = findfirst(s -> s - Day(5) < P.time[p] <= s, st); n === nothing && continue
-                push!(get!(g5, (tp, sp, n), NTuple{3, Int}[]), (p, ic[p], jc[p]))
-            end
-        end
-        bsose_mlds!(b5, g5, g, tvar, svar)
-        @info "$RUN: run sampled at $(count(isfinite, runm)), B-SOSE 5-day at $(count(isfinite, b5)) profiles in $(Date(span[1])) to $(Date(span[2]))"
-    end
 
-    # ── report ───────────────────────────────────────────────────────────────────────────────
+    # ── report: header and part A now, before part B's slow reads ────────────────────────────
     nb = length(EDGES) - 1
     band = [findfirst(b -> EDGES[b] <= y < EDGES[b+1], 1:nb) for y in P.lat]
     md(v) = isempty(v) ? NaN : median(v)
@@ -240,6 +201,49 @@ function main()
         n, nc, c = row(sel, (bmon,))
         @printf("  %-8s month %2d | %9d %8.0f  | %s %s |   %s  %s\n", band_name(b), m, n, nc, fmt(c[1]), fmt(c[2]), fmt(c[3]), fr(c[4]))
     end
+    flush(stdout)
+
+
+    # B: the run's span
+    b5, runm = fill(NaN, np), fill(NaN, np)
+    span = (DateTime(0), DateTime(0))
+    if have_run
+        eke = NCDataset(joinpath(DIR, "$(RUN)_eke.nc"))
+        λ, φ = f64(eke["λ_caa"][:]), f64(eke["φ_aca"][:])
+        zc, zf, _ = file_levels(eke); kbot = file_kbot(eke, zc, zf)[1]; Nz = length(zc)
+        start = DateTime(string(eke.attrib["start_date"]))
+        win = haskey(eke.attrib, "averaging_window_seconds") ? Float64(eke.attrib["averaging_window_seconds"]) : 30 * 86400.0
+        tend = f64(eke["time"][:]); keepn = findall(t -> t >= 0.99win, tend)
+        wins = [(start + Millisecond(round(Int, 1000 * (tend[n] - win))), start + Millisecond(round(Int, 1000 * tend[n])), n) for n in keepn]
+        span = (wins[1][1], wins[end][2])
+        lo = findfirst(k -> -zc[k] <= ZMAX, 1:Nz); zs = zc[lo:Nz]
+        ir = [argmin(abs.(λ .- x)) for x in P.lon]; jrun = [argmin(abs.(φ .- y)) for y in P.lat]
+        for (q, (w0, w1, n)) in enumerate(wins)
+            @info "  $RUN: 30-day window $q of $(length(wins))"
+            ps = [p for p in 1:np if w0 < P.time[p] <= w1]; isempty(ps) && continue
+            Tr = f64(eke["T"][:, :, lo:Nz, n]); Sr = f64(eke["S"][:, :, lo:Nz, n])
+            for p in ps
+                kb = kbot[ir[p], jrun[p]]; kb === nothing && continue
+                runm[p] = mld(view(Tr, ir[p], jrun[p], :), view(Sr, ir[p], jrun[p], :), zs, max(kb - lo + 1, 1))
+            end
+        end
+        close(eke)
+        # B-SOSE 5-day record holding the profile's time
+        g5 = Dict{Tuple{String, String, Int}, Vector{NTuple{3, Int}}}()
+        for y in year(span[1]):year(span[2])
+            tp, sp = bsose_path(BSOSE_DIR, "Theta", y), bsose_path(BSOSE_DIR, "Salt", y)
+            (isempty(tp) || isempty(sp)) && (@warn "no 5-day Theta/Salt for $y"; continue)
+            st = NCDataset(ds -> DateTime.(ds["time"][:]), tp)
+            for p in 1:np
+                (span[1] < P.time[p] <= span[2] && year(P.time[p]) == y) || continue
+                n = findfirst(s -> s - Day(5) < P.time[p] <= s, st); n === nothing && continue
+                push!(get!(g5, (tp, sp, n), NTuple{3, Int}[]), (p, ic[p], jc[p]))
+            end
+        end
+        bsose_mlds!(b5, g5, g, tvar, svar)
+        @info "$RUN: run sampled at $(count(isfinite, runm)), B-SOSE 5-day at $(count(isfinite, b5)) profiles in $(Date(span[1])) to $(Date(span[2]))"
+    end
+
     if have_run
         println("\n  B. $(Date(span[1])) to $(Date(span[2])): B-SOSE 5-day (nearest to an instant), B-SOSE monthly, $RUN 30-day mean")
         println("  band     season |  profiles no-cross% | obs file    obs | B-SOSE 5d  ratio | B-SOSE mon  ratio |    run  ratio")
