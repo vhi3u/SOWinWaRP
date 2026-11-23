@@ -28,11 +28,13 @@
 #                                   from ERA5, as the run's coupler) averaged over each 5-day window
 #                      era5_hourly  the same stress hour by hour, linear in time between ERA5 hours
 #                      era5_6hourly ERA5's wind, T, dewpoint and pressure at 00/06/12/18 only, linear in time to every
-#                                   hour, then the stress (as EXF does with 6-hourly forcing, e.g. B-SOSE's ERA-Interim)
+#                                   hour, then the stress (as EXF does with 6-hourly forcing: the 1/3° B-SOSE iter105's
+#                                   ERA-Interim; iter139 and later start from HOURLY ERA5, Nakayama et al. 2024 Table 1)
 #                      era5_6hourly_smooth   era5_6hourly with the wind, T, dewpoint and pressure first averaged over a
 #                                   SMOOTH_DEG square (default 2.0°) on the box's centre, then the stress from that one
 #                                   wind: a stand-in for ERA-Interim (0.75° grid, effective resolution a few cells), whose
-#                                   storms are broader and weaker than ERA5's
+#                                   storms are broader and weaker than ERA5's (not what i156 used: its first-guess
+#                                   forcing is hourly ERA5, like the runs')
 #                      era5_hourly_relative  hourly ERA5 wind MINUS the column's own surface current at every step,
 #                                   τ = ρa Cd(|ΔU|) |ΔU| ΔU from the box-mean wind: what the run's coupler does
 #                                   (RelativeVelocity), against B-SOSE's absolute wind; it damps inertial currents
