@@ -70,16 +70,25 @@ function read_profiles()
         @info @sprintf("Spira: %d profiles, %d levels (%.0f-%.0f dbar); %d in 90-150E %.0f-%.0fS, %s",
                        length(lat), length(pres), pres[1], pres[end], length(sel), -BOX[4], -BOX[3], YEARS)
         T = fill(NaN, length(pres), length(sel)); S = similar(T)
-        # read in runs of nearby indices (contiguous blocks), not profile by profile
-        a = 1
+        # Read whole storage chunks along the profile axis, each once: a compressed chunk is decompressed in full
+        # for any read that touches it, so reading scattered runs re-decompressed the same chunks thousands of times.
+        storage, cs = chunking(ds[tv])
+        pdim = presfirst ? 2 : 1
+        cn = storage == :chunked ? cs[pdim] : 4096
+        cn * length(pres) > 5e7 && (@warn "chunks of $cn profiles are too big to hold; reading 8192 at a time (slow)"; cn = 8192)
+        @info "Spira $tv: $storage, chunks $(storage == :chunked ? Tuple(cs) : "-"); reading $cn profiles at a time"
+        nprof = size(ds[tv], pdim)
+        a, nblk, tlast = 1, 0, time()
         while a <= length(sel)
-            b = a
-            while b < length(sel) && sel[b+1] - sel[b] <= 64 && sel[b+1] - sel[a] < 4096; b += 1; end
-            r = sel[a]:sel[b]; keep = sel[a:b] .- sel[a] .+ 1
-            blkT = f64(presfirst ? ds[tv][:, r] : permutedims(ds[tv][r, :]))
-            blkS = f64(presfirst ? ds[sv][:, r] : permutedims(ds[sv][r, :]))
-            T[:, a:b] = blkT[:, keep]; S[:, a:b] = blkS[:, keep]
-            a = b + 1
+            c0 = (sel[a] - 1) ÷ cn * cn + 1; r = c0:min(c0 + cn - 1, nprof)
+            b = something(findlast(<=(last(r)), sel), a)
+            keep = sel[a:b] .- c0 .+ 1
+            rdv(v) = presfirst ? f64(ds[v][:, r][:, keep]) : permutedims(f64(ds[v][r, :][keep, :]))
+            T[:, a:b] = rdv(tv); S[:, a:b] = rdv(sv)
+            a = b + 1; nblk += 1
+            if time() - tlast > 60
+                @info @sprintf("  Spira read: %d/%d profiles (%d chunks)", b, length(sel), nblk); tlast = time()
+            end
         end
         own = haskey(ds, "mld") ? f64(ds["mld"][sel]) : fill(NaN, length(sel))
         return (; lon = lon[sel], lat = lat[sel], time = DateTime.(tim[sel]), pres, T, S, own, tv, sv)
@@ -113,7 +122,11 @@ once, its box rows at full width (contiguous on disk). Land (S == 0) gives NaN.
 """
 function bsose_mlds!(out, groups, g, tvar, svar)
     zs = [(g.RF[k] + g.RF[k+1]) / 2 for k in g.nk:-1:1]           # bottom-up centres, negative (RF is)
-    for ((tpath, spath, n), items) in groups
+    tlast = time()
+    for (q, ((tpath, spath, n), items)) in enumerate(groups)
+        if time() - tlast > 60
+            @info "  B-SOSE: record $q of $(length(groups)) ($(basename(tpath)))"; tlast = time()
+        end
         Tb = NCDataset(ds -> f64(ds[tvar(ds, tpath)][:, g.jr, 1:g.nk, n]), tpath)
         Sb = NCDataset(ds -> f64(ds[svar(ds, spath)][:, g.jr, 1:g.nk, n]), spath)
         for (p, i, j) in items
@@ -132,6 +145,7 @@ function main()
     np = length(P.lat)
     np == 0 && error("no Spira profiles in the box for $YEARS")
     obs = [profile_mld(P.T[:, p], P.S[:, p], P.pres) for p in 1:np]
+    @info "observed MLD at $(count(isfinite, obs)) of $np profiles"
     g = bsose_grid()
     ic = [argmin(abs.(g.XC .- x)) for x in P.lon]; jc = [argmin(abs.(g.YC .- y)) for y in P.lat]
     tvar(ds, path) = bsose_data_var(ds, ("THETA", "Theta"), path); svar(ds, path) = bsose_data_var(ds, ("SALT", "Salt"), path)
