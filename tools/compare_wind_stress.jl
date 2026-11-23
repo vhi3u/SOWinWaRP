@@ -111,7 +111,8 @@ function main()
 
     handles = Dict{Tuple{String, Int}, NCDataset}()
     era5(short, y) = get!(() -> NCDataset(era5_file(short, y)), handles, (short, y))
-    etimes = Dict(y => DateTime.(era5("u10", y)["time"][:]) for y in years)
+    timevar(ds) = haskey(ds, "valid_time") ? "valid_time" : "time"   # download_era5_ncar.jl writes CDS's valid_time
+    etimes = Dict(y => (ds = era5("u10", y); DateTime.(ds[timevar(ds)][:])) for y in years)
     for y in years
         d = dimnames(era5("u10", y)["u10"])
         length(d) == 3 && occursin("time", lowercase(d[3])) || error("ERA5 u10 for $y is $(d), expected (lon, lat, time)")
