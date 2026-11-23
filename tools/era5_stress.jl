@@ -37,16 +37,21 @@ the cells whose centres fall in the box (the nearest cell if none does), for the
 Returns (times, τx, τy, ρa, u10, v10), all box means; rho = nothing uses ERA5's air density, a number that constant.
 every = 6 keeps only the hours 00, 06, 12, 18 of the wind, temperature, dewpoint and pressure and interpolates them
 linearly to every hour BEFORE the stress is computed, as MITgcm's EXF does with 6-hourly fields.
+area = d (degrees) instead takes the cells in a d x d square on the box's centre and averages the wind, temperature,
+dewpoint and pressure over it BEFORE the stress: one smoothed wind, a stand-in for a coarser product (ERA-Interim).
 """
-function era5_box_stress(dir, lon, lat, t0, t1; rho = nothing, every = 1)
+function era5_box_stress(dir, lon, lat, t0, t1; rho = nothing, every = 1, area = nothing)
     times, τx, τy, ρs, us, vs = DateTime[], Float64[], Float64[], Float64[], Float64[], Float64[]
     for y in year(t0):year(t1)
         files = Dict(s => era5_file(dir, s, y) for s in ("u10", "v10", "t2m", "d2m", "msl"))
         NCDataset(files["u10"]) do ds
             lo = mod.(Float64.(ds[haskey(ds, "longitude") ? "longitude" : "lon"][:]), 360)
             la = Float64.(ds[haskey(ds, "latitude") ? "latitude" : "lat"][:])
-            ib = findall(x -> mod(lon[1], 360) - 1e-6 <= x <= mod(lon[2], 360) + 1e-6, lo)
-            jb = findall(x -> lat[1] - 1e-6 <= x <= lat[2] + 1e-6, la)
+            lonr, latr = area === nothing ? (lon, lat) :
+                         (((lon[1] + lon[2]) / 2 - area / 2, (lon[1] + lon[2]) / 2 + area / 2),
+                          ((lat[1] + lat[2]) / 2 - area / 2, (lat[1] + lat[2]) / 2 + area / 2))
+            ib = findall(x -> mod(lonr[1], 360) - 1e-6 <= x <= mod(lonr[2], 360) + 1e-6, lo)
+            jb = findall(x -> latr[1] - 1e-6 <= x <= latr[2] + 1e-6, la)
             isempty(ib) && (ib = [argmin(abs.(lo .- mod((lon[1] + lon[2]) / 2, 360)))])
             isempty(jb) && (jb = [argmin(abs.(la .- (lat[1] + lat[2]) / 2))])
             I, J = minimum(ib):maximum(ib), minimum(jb):maximum(jb)
@@ -54,7 +59,8 @@ function era5_box_stress(dir, lon, lat, t0, t1; rho = nothing, every = 1)
             idx = findall(s -> t0 <= s <= t1, t); isempty(idx) && return
             K = first(idx):last(idx)
             rd(s) = NCDataset(f -> Float64.(coalesce.(f[s][I, J, K], NaN)), files[s])
-            sub = every == 1 ? identity : A -> subsample_hours(A, t[K], every)
+            avg(A) = area === nothing ? A : mean(A; dims = (1, 2))           # one smoothed cell
+            sub = every == 1 ? avg : A -> subsample_hours(avg(A), t[K], every)
             u, v = sub(rd("u10")), sub(rd("v10"))
             ρ = rho === nothing ? air_density.(sub(rd("msl")), sub(rd("t2m")), sub(rd("d2m"))) : fill(Float64(rho), size(u))
             U = sqrt.(u .^ 2 .+ v .^ 2); k = ρ .* neutral_cd.(U) .* U

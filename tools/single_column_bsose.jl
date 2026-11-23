@@ -29,6 +29,10 @@
 #                      era5_hourly  the same stress hour by hour, linear in time between ERA5 hours
 #                      era5_6hourly ERA5's wind, T, dewpoint and pressure at 00/06/12/18 only, linear in time to every
 #                                   hour, then the stress (as EXF does with 6-hourly forcing, e.g. B-SOSE's ERA-Interim)
+#                      era5_6hourly_smooth   era5_6hourly with the wind, T, dewpoint and pressure first averaged over a
+#                                   SMOOTH_DEG square (default 2.0°) on the box's centre, then the stress from that one
+#                                   wind: a stand-in for ERA-Interim (0.75° grid, effective resolution a few cells), whose
+#                                   storms are broader and weaker than ERA5's
 #                      era5_hourly_relative  hourly ERA5 wind MINUS the column's own surface current at every step,
 #                                   τ = ρa Cd(|ΔU|) |ΔU| ΔU from the box-mean wind: what the run's coupler does
 #                                   (RelativeVelocity), against B-SOSE's absolute wind; it damps inertial currents
@@ -41,6 +45,7 @@
 #   schemes   CLOSURES, from
 #               catke       the run's "ggl": NumericalEarth's CATKE (Cᵇ 0.01, Cᵂϵ 1.0) + νz 1e-3, κz KAPPA_Z (1e-5)
 #               catke_bare  that CATKE alone (the _catke runs)
+#               catke_cwu<x> catke with Cᵂu★ = x instead of 3.179 (surface shear TKE flux: the wind's share of u★³)
 #               kepsilon    Oceananigans' k-ε (TKEDissipationVerticalDiffusivity), WITHOUT the backgrounds:
 #                           in 0.117.2 its TKE top boundary condition fails on a closure tuple
 #               ri          Oceananigans' RiBasedVerticalDiffusivity + the same backgrounds
@@ -96,6 +101,7 @@
 #   RHO_BSOSE  B-SOSE's reference density for its own budget check, kg/m³ (default 1035; cp 3994)
 #   STRESS     bsose | era5_5day | era5_hourly | era5_6hourly | era5_hourly_relative (default bsose); ERA5_DIR
 #              (default BSOSE_DIR/era5)
+#   SMOOTH_DEG square the era5_6hourly_smooth forcing is averaged over, degrees (default 2.0; tagged in figure names)
 #   KAPPA_Z    background κz of catke and ri, m²/s (default 1e-5 since 2026-11-22: B-SOSE i156's, and the runs' since
 #              _k1e5; every single-column result before that used 1e-4)
 #   Figures of a non-default STRESS or KAPPA_Z are named single_column_<column>_<STRESS>[_k<KAPPA_Z>]*.png
@@ -126,11 +132,12 @@ LATERAL in ("monthly", "none") || error("LATERAL must be monthly or none, got $L
 const BUDGET_URL = get(ENV, "BUDGET_URL", "https://sose.ucsd.edu/SO6/ITER156/MONTHLY/")
 const ρB       = parse(Float64, get(ENV, "RHO_BSOSE", "1035"))
 const STRESS   = get(ENV, "STRESS", "bsose")
-const STRESSES = ("bsose", "era5_5day", "era5_hourly", "era5_6hourly", "era5_hourly_relative")
+const STRESSES = ("bsose", "era5_5day", "era5_hourly", "era5_6hourly", "era5_6hourly_smooth", "era5_hourly_relative")
+const SMOOTH_DEG = parse(Float64, get(ENV, "SMOOTH_DEG", "2.0"))
 STRESS in STRESSES || error("STRESS must be one of $(join(STRESSES, ", ")), got $STRESS")
 const KAPPA_Z  = parse(Float64, get(ENV, "KAPPA_Z", "1e-5"))
 const ERA5_DIR = get(ENV, "ERA5_DIR", joinpath(get(ENV, "BSOSE_DIR", ""), "era5"))
-const TAG      = (STRESS == "bsose" ? "" : "_$STRESS") * (KAPPA_Z == 1e-5 ? "" : "_k$(KAPPA_Z)")
+const TAG      = (STRESS == "bsose" ? "" : "_$STRESS") * (STRESS == "era5_6hourly_smooth" ? "$(SMOOTH_DEG)" : "") * (KAPPA_Z == 1e-5 ? "" : "_k$(KAPPA_Z)")
 const cpB      = 3994.0
 
 struct Column
@@ -354,14 +361,17 @@ end
 
 function build_closure(name)
     background = VerticalScalarDiffusivity(VerticallyImplicitTimeDiscretization(); ν = 1e-3, κ = KAPPA_Z)
-    catke() = CATKEVerticalDiffusivity(VerticallyImplicitTimeDiscretization(), Float64;
+    catke(; Cᵂu★ = 3.179) = CATKEVerticalDiffusivity(VerticallyImplicitTimeDiscretization(), Float64;
                                        mixing_length = CATKEMixingLength(Cᵇ = 0.01),
-                                       turbulent_kinetic_energy_equation = CATKEEquation(Cᵂϵ = 1.0))
+                                       turbulent_kinetic_energy_equation = CATKEEquation(; Cᵂϵ = 1.0, Cᵂu★))
     name == "catke"      && return (catke(), background)
+    # catke_cwu<x>: the run's CATKE with the surface shear TKE flux coefficient Cᵂu★ = x (calibrated 3.179): how much
+    # of the wind's u★³ becomes turbulence. A sensitivity knob, not a calibration.
+    startswith(name, "catke_cwu") && return (catke(; Cᵂu★ = parse(Float64, name[10:end])), background)
     name == "catke_bare" && return catke()
     name == "kepsilon"   && return TKEDissipationVerticalDiffusivity()     # alone: its TKE top BC rejects a closure tuple (0.117.2)
     name == "ri"         && return (RiBasedVerticalDiffusivity(), background)
-    error("unknown closure '$name' (catke, catke_bare, kepsilon, ri)")
+    error("unknown closure '$name' (catke, catke_bare, catke_cwu<x>, kepsilon, ri)")
 end
 
 """
@@ -462,7 +472,8 @@ function do_column(col, recs, stamps, XC, YC, RF)
     th, τxh, τyh, uh, vh, ρh = Float64[], Float64[], Float64[], Float64[], Float64[], Float64[]
     if STRESS != "bsose"
         eh, ex, ey, eρ, eu, ev = era5_box_stress(ERA5_DIR, col.lon, col.lat, stamps[1] - WINDOW, stamps[end];
-                                                 every = STRESS == "era5_6hourly" ? 6 : 1)
+                                                 every = STRESS in ("era5_6hourly", "era5_6hourly_smooth") ? 6 : 1,
+                                                 area = STRESS == "era5_6hourly_smooth" ? SMOOTH_DEG : nothing)
         τb = copy(hypot.(τx, τy))
         for (r, s) in enumerate(stamps)
             sel = findall(t -> s - WINDOW < t <= s, eh)
@@ -508,7 +519,7 @@ function do_column(col, recs, stamps, XC, YC, RF)
     LS = bud === nothing ? zeros(nk, nm) : lateral_source(bud.SLT)
     dilute = LATERAL == "none" ? 1.0 : 0.0         # see the header: B-SOSE's advective terms already carry the dilution
     p = (; ts, Qtot, Qsw, SF, FW, τx, τy, zf, ρ₀, cₚ, R = SWR, ζ1 = SWζ1, ζ2 = SWζ2, tl, LT, LS, dilute,
-           hourly = STRESS in ("era5_hourly", "era5_6hourly"), relative = STRESS == "era5_hourly_relative",
+           hourly = STRESS in ("era5_hourly", "era5_6hourly", "era5_6hourly_smooth"), relative = STRESS == "era5_hourly_relative",
            th, τxh, τyh, uh, vh, ρh)
 
     mlabel(n) = @sprintf("%04d-%02d", months[n]...)
