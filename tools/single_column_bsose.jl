@@ -48,6 +48,14 @@
 #               catke       the run's "ggl": NumericalEarth's CATKE (Cᵇ 0.01, Cᵂϵ 1.0) + νz 1e-3, κz KAPPA_Z (1e-5)
 #               catke_bare  that CATKE alone (the _catke runs)
 #               catke_cwu<x> catke with Cᵂu★ = x instead of 3.179 (surface shear TKE flux: the wind's share of u★³)
+#               catke_<opts> catke with any of these, joined by "_" (e.g. catke_cap0.1_cs0.991_cwu1.59):
+#                           cwu<x>  Cᵂu★ = x
+#                           cs<x>   surface wall coefficient Cˢ = x (calibrated 1.131 = κ 0.47; 0.991 = κ 0.41)
+#                           cap<x>  rotational cap on the stable length scale, ℓ ≤ x √e / |f| (Blackadar-type; the
+#                                   Arctic NumericalEarth tests used x = 0.1). Not in Oceananigans: RotationCappedLength
+#                                   below wraps CATKEMixingLength and caps stable_length_scaleᶜᶜᶠ/ᶜᶜᶜ, so it reaches the
+#                                   momentum, tracer and TKE lengths alike; the convective lengths are untouched.
+#               catke_arctic  = catke_cap0.1_cs0.991_cwu1.59: the cap, κ 0.41 and half the TKE flux together
 #               kepsilon    Oceananigans' k-ε (TKEDissipationVerticalDiffusivity), WITHOUT the backgrounds:
 #                           in 0.117.2 its TKE top boundary condition fails on a closure tuple
 #               ri          Oceananigans' RiBasedVerticalDiffusivity + the same backgrounds
@@ -111,6 +119,8 @@
 
 using Oceananigans
 using Oceananigans.TurbulenceClosures.TKEBasedVerticalDiffusivities: CATKEMixingLength, CATKEEquation
+import Oceananigans.TurbulenceClosures.TKEBasedVerticalDiffusivities as TKEVD
+using Oceananigans.Operators: ℑzᵃᵃᶠ
 using SeawaterPolynomials.TEOS10: TEOS10EquationOfState
 using NCDatasets, CairoMakie, Dates, Printf, Statistics, Serialization
 
@@ -361,19 +371,57 @@ end
 @inline T_sources(i, j, k, grid, clock, f, p) =
     shortwave_heating(i, j, k, grid, clock, f, p) + @inbounds(p.LT[grid.Nz - k + 1, month_index(p, clock.time)])
 
-function build_closure(name)
+# ── rotational cap on CATKE's stable length scale (see the header, catke_<opts> cap<x>) ───────────────────────
+# A mixing length that is CATKEMixingLength in every field (getproperty forwards), plus Cᶠ and the column's f.
+# CATKE's mixing_length is a free type parameter, so dispatching the two stable-length functions on a closure
+# that carries this type changes nothing else. Oceananigans 0.117.2, catke_mixing_length.jl.
+struct RotationCappedLength{FT}
+    base :: CATKEMixingLength{FT}
+    Cᶠ   :: FT
+    f    :: FT
+end
+Base.getproperty(m::RotationCappedLength, s::Symbol) =
+    s in (:base, :Cᶠ, :f) ? getfield(m, s) : getproperty(getfield(m, :base), s)
+TKEVD.convert_eltype(::Type{FT}, m::RotationCappedLength{FT}) where FT = m
+const CappedCATKE = CATKEVerticalDiffusivity{<:Any, <:RotationCappedLength}
+const ANY9 = Tuple{Any, Any, Any, Any, Any, Any, Any, Any, Any}
+
+@inline function TKEVD.stable_length_scaleᶜᶜᶠ(i, j, k, grid, closure::CappedCATKE, e, velocities, tracers, buoyancy)
+    ℓ = invoke(TKEVD.stable_length_scaleᶜᶜᶠ, ANY9, i, j, k, grid, closure, e, velocities, tracers, buoyancy)
+    w★ = ℑzᵃᵃᶠ(i, j, k, grid, TKEVD.turbulent_velocityᶜᶜᶜ, closure, e)
+    return min(ℓ, closure.mixing_length.Cᶠ * w★ / abs(closure.mixing_length.f))
+end
+@inline function TKEVD.stable_length_scaleᶜᶜᶜ(i, j, k, grid, closure::CappedCATKE, e, velocities, tracers, buoyancy)
+    ℓ = invoke(TKEVD.stable_length_scaleᶜᶜᶜ, ANY9, i, j, k, grid, closure, e, velocities, tracers, buoyancy)
+    w★ = TKEVD.turbulent_velocityᶜᶜᶜ(i, j, k, grid, closure, e)
+    return min(ℓ, closure.mixing_length.Cᶠ * w★ / abs(closure.mixing_length.f))
+end
+
+function build_closure(name, f)
     background = VerticalScalarDiffusivity(VerticallyImplicitTimeDiscretization(); ν = 1e-3, κ = KAPPA_Z)
-    catke(; Cᵂu★ = 3.179) = CATKEVerticalDiffusivity(VerticallyImplicitTimeDiscretization(), Float64;
-                                       mixing_length = CATKEMixingLength(Cᵇ = 0.01),
-                                       turbulent_kinetic_energy_equation = CATKEEquation(; Cᵂϵ = 1.0, Cᵂu★))
+    function catke(; Cᵂu★ = 3.179, Cˢ = 1.131, Cᶠ = nothing)
+        ml = CATKEMixingLength(; Cᵇ = 0.01, Cˢ)
+        ml = Cᶠ === nothing ? ml : RotationCappedLength(ml, Float64(Cᶠ), Float64(f))
+        CATKEVerticalDiffusivity(VerticallyImplicitTimeDiscretization(), Float64; mixing_length = ml,
+                                 turbulent_kinetic_energy_equation = CATKEEquation(; Cᵂϵ = 1.0, Cᵂu★))
+    end
     name == "catke"      && return (catke(), background)
-    # catke_cwu<x>: the run's CATKE with the surface shear TKE flux coefficient Cᵂu★ = x (calibrated 3.179): how much
-    # of the wind's u★³ becomes turbulence. A sensitivity knob, not a calibration.
-    startswith(name, "catke_cwu") && return (catke(; Cᵂu★ = parse(Float64, name[10:end])), background)
     name == "catke_bare" && return catke()
+    name == "catke_arctic" && return build_closure("catke_cap0.1_cs0.991_cwu1.59", f)   # the Arctic thread's combination
+    # catke_<opts>: the run's CATKE with cwu<x> (Cᵂu★), cs<x> (Cˢ) and cap<x> (rotational cap) in any combination.
+    # Sensitivity knobs, not a calibration.
+    if startswith(name, "catke_")
+        kw = Dict{Symbol, Float64}()
+        for tok in split(name[7:end], '_')
+            m = match(r"^(cwu|cs|cap)([0-9.eE+-]+)$", tok)
+            m === nothing && error("unknown catke option '$tok' in '$name' (cwu<x>, cs<x>, cap<x>)")
+            kw[Dict("cwu" => :Cᵂu★, "cs" => :Cˢ, "cap" => :Cᶠ)[m[1]]] = parse(Float64, m[2])
+        end
+        return (catke(; kw...), background)
+    end
     name == "kepsilon"   && return TKEDissipationVerticalDiffusivity()     # alone: its TKE top BC rejects a closure tuple (0.117.2)
     name == "ri"         && return (RiBasedVerticalDiffusivity(), background)
-    error("unknown closure '$name' (catke, catke_bare, catke_cwu<x>, kepsilon, ri)")
+    error("unknown closure '$name' (catke, catke_bare, catke_<cwu|cs|cap><x>..., kepsilon, ri)")
 end
 
 """
@@ -389,7 +437,7 @@ function run_column(name, zf, Tinit, Sinit, φc, p, edges)
            v = FieldBoundaryConditions(top = FluxBoundaryCondition(Jᵛ; discrete_form = true, parameters = p)))
     model = HydrostaticFreeSurfaceModel(grid;
                 buoyancy = SeawaterBuoyancy(equation_of_state = TEOS10EquationOfState(reference_density = ρ₀)),
-                coriolis = FPlane(latitude = φc), closure = build_closure(name), tracers = (:T, :S),
+                coriolis = FPlane(latitude = φc), closure = build_closure(name, FPlane(latitude = φc).f), tracers = (:T, :S),
                 boundary_conditions = bcs,
                 forcing = (T = Forcing(T_sources; discrete_form = true, parameters = p),
                            S = Forcing(lateral_S; discrete_form = true, parameters = p)))
