@@ -17,6 +17,13 @@
 # SPACING is still tested. Set OFFSET= to fix it instead. The run starts from ETAN and its Flather boundary pulls
 # toward ETAN, so it shares the datum; its domain-mean drift against B-SOSE is removed month by month (printed).
 #
+# THE RUN'S η FILE. Up to now the run scripts write η as Field(Average(displacement, dims = 3)), and that divides the
+# one surface value by the whole wet column: the file holds η Δz / H (record 1 of _mitbulk: a 0.001 m drop across
+# 47-55S where B-SOSE has 0.9 m, NaN on land where H = 0). If record 1 (the initial state, copied from B-SOSE) is that
+# flat, η is rebuilt as (file × H) / Δz, with H the wet column from the run's grid and the one constant Δz FITTED by
+# regressing record 1 on B-SOSE's initial ETAN; the fit, its correlation and the top cell's own Δz are printed, and
+# a correlation below 0.95 stops the tool. Record 1 with a real gradient is used as it is.
+#
 # STRENGTH. Δη = zonal-mean η at STRENGTH_N minus at STRENGTH_S (default 47S and 55S): the surface geostrophic
 # transport across the SAF band. Independent of the datum.
 #
@@ -28,6 +35,8 @@
 # ==============================================================================================
 
 using NCDatasets, CairoMakie, Dates, Printf, Statistics
+
+include(joinpath(@__DIR__, "model_grid.jl"))     # file_levels, file_kbot
 
 const RUN        = isempty(ARGS) ? get(ENV, "RUN", "") : ARGS[1]
 isempty(RUN) && error("usage: BSOSE_DIR=... julia --project=. tools/front_position.jl RUN_NAME")
@@ -91,6 +100,7 @@ function main()
     end
     keepi = findall(x -> x - λ[1] >= SIDE_DEG && λ[end] - x >= SIDE_DEG, λ)
     rd(n) = (A = fs["η"]; f64(ndims(A) == 4 ? A[:, :, 1, n] : A[:, :, n]))
+    η1 = rd(1)
     months = unique(monthkey.(days[2:end]))                             # the t = 0 snapshot left out
     runm = Dict{Tuple{Int, Int}, Matrix{Float64}}()
     for mk in months
@@ -98,9 +108,7 @@ function main()
         length(ns) < MIN_DAYS && continue
         acc = zeros(length(λ), length(φ))
         for n in ns; acc .+= rd(n); end
-        H = acc ./ length(ns)
-        landmask === nothing ? (H[H .== 0] .= NaN) : (H[landmask] .= NaN)
-        runm[mk] = H
+        runm[mk] = acc ./ length(ns)
     end
     close(fs)
     isempty(runm) && error("no calendar month with $MIN_DAYS days of output in $path")
@@ -118,6 +126,43 @@ function main()
     jb = [argmin(abs.(YC .- y)) for y in φ]; jr = minimum(jb):maximum(jb)
     bsose_on_run(n) = (A = f64(bs["ETAN"][:, jr, n]); H = A[ib, jb .- first(jr) .+ 1];
                        H[depth[ib, jb] .<= 0] .= NaN; H)
+
+    # ── the run's η, rebuilt if the file holds η Δz / H (see the header) ─────────────────────────
+    stamps = DateTime.(bs["time"][:])
+    n0 = argmin(abs.(Dates.value.(stamps .- start)))
+    abs(stamps[n0] - start) <= Day(1) || @warn "no B-SOSE stamp within a day of the run start $start (nearest $(stamps[n0]))"
+    B0 = bsose_on_run(n0)
+    η1[.!isfinite.(η1)] .= NaN
+    landmask === nothing || (η1[landmask] .= NaN)
+    scale = ones(length(λ), length(φ)); note = "η used as written"
+    if abs(strength(η1[keepi, :], φ)) < 0.05 * abs(strength(B0[keepi, :], φ))
+        gp = ["_eke.nc", "_surface.nc"]; gfile = ""
+        for suf in gp; f = joinpath(DIR, RUN * suf); isfile(f) && (gfile = f; break); end
+        isempty(gfile) && error("η in $path is flat (η Δz / H?) and no _eke.nc or _surface.nc to read H from")
+        Hc, dztop = NCDataset(gfile) do g
+            zc, zf, _ = file_levels(g)
+            Hc = if haskey(g, "bottom_height")
+                b = f64(g["bottom_height"][:, :]); [b[i, j] < 0 ? min(-b[i, j], zf[end] - zf[1]) : NaN for i in axes(b, 1), j in axes(b, 2)]
+            else
+                kb = file_kbot(g, zc, zf)[1]; [kb[i, j] === nothing ? NaN : zf[end] - zf[kb[i, j]] for i in axes(kb, 1), j in axes(kb, 2)]
+            end
+            Hc, zf[end] - zf[end-1]
+        end
+        G = η1 .* Hc
+        ok = isfinite.(G) .& isfinite.(B0)
+        x = G[ok] .- mean(G[ok]); y = B0[ok] .- mean(B0[ok])
+        sfit = sum(x .* y) / sum(abs2, x); r = cor(x, y)
+        r < 0.95 && error(@sprintf("η in %s is flat, and rebuilding it as file × H / Δz does not match B-SOSE's initial ETAN (correlation %.3f): look at the writer", path, r))
+        scale = sfit .* Hc
+        note = @sprintf("η REBUILT as file × H / Δz: fitted Δz = %.2f m (top cell %.2f m), correlation with B-SOSE's initial ETAN %.4f, residual RMS %.3f m",
+                        1 / sfit, dztop, r, sqrt(mean(abs2, sfit .* x .- y)))
+    end
+    for (k, H) in runm
+        H = H .* scale; H[.!isfinite.(H)] .= NaN
+        landmask === nothing || (H[landmask] .= NaN)
+        runm[k] = H
+    end
+    @info note
 
     # ── CTOH: per calendar month, the median latitude over 91-149E of every weekly record in it ───
     lon_lo, lon_hi = λ[first(keepi)], λ[last(keepi)]
@@ -182,7 +227,8 @@ function main()
     @printf("  datum: ADT = ETAN %+.3f m (%s); B-SOSE's mean fronts over %d months then sit at", offset,
             haskey(ENV, "OFFSET") ? "OFFSET" : "fitted", length(common))
     for (q, f) in enumerate(FRONTS); @printf("  %s %.2f (CTOH %.2f)", f[1], bfit[q], ctoh_mean[q]); end
-    println("\n  latitude °N (negative = south); Δη = zonal-mean η at $(STRENGTH_N) minus $(STRENGTH_S), m; drift = run's domain-mean η - B-SOSE's")
+    println("\n  run: ", note)
+    println("  latitude °N (negative = south); Δη = zonal-mean η at $(STRENGTH_N) minus $(STRENGTH_S), m; drift = run's domain-mean η - B-SOSE's")
     println(bar)
     @printf("  %-8s", "month")
     for f in FRONTS; @printf(" | %-6s %7s %7s %7s", f[1], "CTOH", "B-SOSE", "run"); end
