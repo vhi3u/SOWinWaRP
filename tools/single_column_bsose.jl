@@ -27,6 +27,11 @@
 #                      era5_5day    ERA5 Large & Yeager stress (tools/era5_stress.jl: neutral, absolute wind, ρa
 #                                   from ERA5, as the run's coupler) averaged over each 5-day window
 #                      era5_hourly  the same stress hour by hour, linear in time between ERA5 hours
+#                      era5_6hourly ERA5's wind, T, dewpoint and pressure at 00/06/12/18 only, linear in time to every
+#                                   hour, then the stress (as EXF does with 6-hourly forcing, e.g. B-SOSE's ERA-Interim)
+#                      era5_hourly_relative  hourly ERA5 wind MINUS the column's own surface current at every step,
+#                                   τ = ρa Cd(|ΔU|) |ΔU| ΔU from the box-mean wind: what the run's coupler does
+#                                   (RelativeVelocity), against B-SOSE's absolute wind; it damps inertial currents
 #                      Both are OPEN-WATER stress over the box's ERA5 cells: meaningful only where B-SOSE has no ice
 #                      (a warning names windows with box SIArea > 0.15). era5_hourly against era5_5day isolates
 #                      what sub-5-day wind variability does to the mixed layer (the run is forced hourly);
@@ -34,7 +39,7 @@
 #             as the run: flux = -X / rho0 (tracers also / cp), rho0 1020, cp 3991.868, TEOS-10
 #   Coriolis  f-plane at the box's centre latitude
 #   schemes   CLOSURES, from
-#               catke       the run's "ggl": NumericalEarth's CATKE (Cᵇ 0.01, Cᵂϵ 1.0) + νz 1e-3, κz 1e-4
+#               catke       the run's "ggl": NumericalEarth's CATKE (Cᵇ 0.01, Cᵂϵ 1.0) + νz 1e-3, κz KAPPA_Z (1e-5)
 #               catke_bare  that CATKE alone (the _catke runs)
 #               kepsilon    Oceananigans' k-ε (TKEDissipationVerticalDiffusivity), WITHOUT the backgrounds:
 #                           in 0.117.2 its TKE top boundary condition fails on a closure tuple
@@ -83,14 +88,17 @@
 #              oceTAUY (required); SIArea, MLD (optional)
 #   BOXES      name:lon0:lon1:lat0:lat1,...  (default ice65S:119.4:120.4:-65.0:-64.5,open52S:119.4:120.4:-53.0:-52.5)
 #   START, END first and last 5-day record stamps used (default 2014-06-01, 2014-11-01)
-#   CLOSURES   (default catke,catke_bare,kepsilon,ri)
+#   CLOSURES   (default catke,catke_bare,kepsilon; ri still available, dropped from the default 2026-11-22)
 #   ZMAX       deepest level, m (default 1000)    DT  time step, s (default 600)
 #   OUTDIR     (default plots)                    MLD_DT (default 0.03 kg/m³, read by mld.jl)
 #   LATERAL    monthly | none                      (default monthly)
 #   BUDGET_URL (default https://sose.ucsd.edu/SO6/ITER156/MONTHLY/)
 #   RHO_BSOSE  B-SOSE's reference density for its own budget check, kg/m³ (default 1035; cp 3994)
-#   STRESS     bsose | era5_5day | era5_hourly   (default bsose); ERA5_DIR (default BSOSE_DIR/era5). Figures of a
-#              non-default STRESS are named single_column_<column>_<STRESS>*.png
+#   STRESS     bsose | era5_5day | era5_hourly | era5_6hourly | era5_hourly_relative (default bsose); ERA5_DIR
+#              (default BSOSE_DIR/era5)
+#   KAPPA_Z    background κz of catke and ri, m²/s (default 1e-5 since 2026-11-22: B-SOSE i156's, and the runs' since
+#              _k1e5; every single-column result before that used 1e-4)
+#   Figures of a non-default STRESS or KAPPA_Z are named single_column_<column>_<STRESS>[_k<KAPPA_Z>]*.png
 # ==============================================================================================
 
 using Oceananigans
@@ -109,7 +117,7 @@ const START    = DateTime(get(ENV, "START", "2014-06-01"))
 const STOP     = DateTime(get(ENV, "END", "2014-11-01"))
 const ZMAX     = parse(Float64, get(ENV, "ZMAX", "1000"))
 const DT       = parse(Float64, get(ENV, "DT", "600"))
-const CLOSURES = String.(split(get(ENV, "CLOSURES", "catke,catke_bare,kepsilon,ri"), ','))
+const CLOSURES = String.(split(get(ENV, "CLOSURES", "catke,catke_bare,kepsilon"), ','))
 const ρ₀, cₚ   = 1020.0, 3991.86795711963      # the run's (NumericalEarth's) reference density, heat capacity
 const SWR, SWζ1, SWζ2 = 0.62, 0.6, 20.0        # MITgcm swfrac, jwtype 2
 const WINDOW   = Day(5)
@@ -118,9 +126,11 @@ LATERAL in ("monthly", "none") || error("LATERAL must be monthly or none, got $L
 const BUDGET_URL = get(ENV, "BUDGET_URL", "https://sose.ucsd.edu/SO6/ITER156/MONTHLY/")
 const ρB       = parse(Float64, get(ENV, "RHO_BSOSE", "1035"))
 const STRESS   = get(ENV, "STRESS", "bsose")
-STRESS in ("bsose", "era5_5day", "era5_hourly") || error("STRESS must be bsose, era5_5day or era5_hourly, got $STRESS")
+const STRESSES = ("bsose", "era5_5day", "era5_hourly", "era5_6hourly", "era5_hourly_relative")
+STRESS in STRESSES || error("STRESS must be one of $(join(STRESSES, ", ")), got $STRESS")
+const KAPPA_Z  = parse(Float64, get(ENV, "KAPPA_Z", "1e-5"))
 const ERA5_DIR = get(ENV, "ERA5_DIR", joinpath(get(ENV, "BSOSE_DIR", ""), "era5"))
-const TAG      = STRESS == "bsose" ? "" : "_$STRESS"
+const TAG      = (STRESS == "bsose" ? "" : "_$STRESS") * (KAPPA_Z == 1e-5 ? "" : "_k$(KAPPA_Z)")
 const cpB      = 3994.0
 
 struct Column
@@ -314,9 +324,20 @@ end
     w = clamp((t - th[k]) / (th[k+1] - th[k]), 0.0, 1.0)
     return (1 - w) * τ[k] + w * τ[k+1]
 end
-@inline Jᵘ(i, j, grid, clock, f, p) = p.hourly ? -hourly(p.th, p.τxh, clock.time) / p.ρ₀ :
+# relative wind (STRESS=era5_hourly_relative): the hourly box-mean ERA5 wind minus the top cell's current
+@inline function relative_stress(i, j, grid, clock, f, p)
+    t = clock.time
+    Δu = hourly(p.th, p.uh, t) - @inbounds(f.u[i, j, grid.Nz])
+    Δv = hourly(p.th, p.vh, t) - @inbounds(f.v[i, j, grid.Nz])
+    ΔU = sqrt(Δu^2 + Δv^2)
+    k = hourly(p.th, p.ρh, t) * neutral_cd(ΔU) * ΔU
+    return k * Δu, k * Δv
+end
+@inline Jᵘ(i, j, grid, clock, f, p) = p.relative ? -relative_stress(i, j, grid, clock, f, p)[1] / p.ρ₀ :
+                                      p.hourly ? -hourly(p.th, p.τxh, clock.time) / p.ρ₀ :
                                                  (n = window_index(p, clock.time); -p.τx[n] / p.ρ₀)
-@inline Jᵛ(i, j, grid, clock, f, p) = p.hourly ? -hourly(p.th, p.τyh, clock.time) / p.ρ₀ :
+@inline Jᵛ(i, j, grid, clock, f, p) = p.relative ? -relative_stress(i, j, grid, clock, f, p)[2] / p.ρ₀ :
+                                      p.hourly ? -hourly(p.th, p.τyh, clock.time) / p.ρ₀ :
                                                  (n = window_index(p, clock.time); -p.τy[n] / p.ρ₀)
 @inline swfrac(z, p) = p.R * exp(z / p.ζ1) + (1 - p.R) * exp(z / p.ζ2)
 @inline function shortwave_heating(i, j, k, grid, clock, f, p)
@@ -332,7 +353,7 @@ end
     shortwave_heating(i, j, k, grid, clock, f, p) + @inbounds(p.LT[grid.Nz - k + 1, month_index(p, clock.time)])
 
 function build_closure(name)
-    background = VerticalScalarDiffusivity(VerticallyImplicitTimeDiscretization(); ν = 1e-3, κ = 1e-4)
+    background = VerticalScalarDiffusivity(VerticallyImplicitTimeDiscretization(); ν = 1e-3, κ = KAPPA_Z)
     catke() = CATKEVerticalDiffusivity(VerticallyImplicitTimeDiscretization(), Float64;
                                        mixing_length = CATKEMixingLength(Cᵇ = 0.01),
                                        turbulent_kinetic_energy_equation = CATKEEquation(Cᵂϵ = 1.0))
@@ -438,9 +459,10 @@ function do_column(col, recs, stamps, XC, YC, RF)
     any(!isfinite, Tb) && error("$(col.name): B-SOSE T has gaps in the column (a level with no wet cell?)")
 
     # ── STRESS=era5_*: ERA5 Large & Yeager stress over the box replaces B-SOSE's ──
-    th, τxh, τyh = Float64[], Float64[], Float64[]
+    th, τxh, τyh, uh, vh, ρh = Float64[], Float64[], Float64[], Float64[], Float64[], Float64[]
     if STRESS != "bsose"
-        eh, ex, ey, _ = era5_box_stress(ERA5_DIR, col.lon, col.lat, stamps[1] - WINDOW, stamps[end])
+        eh, ex, ey, eρ, eu, ev = era5_box_stress(ERA5_DIR, col.lon, col.lat, stamps[1] - WINDOW, stamps[end];
+                                                 every = STRESS == "era5_6hourly" ? 6 : 1)
         τb = copy(hypot.(τx, τy))
         for (r, s) in enumerate(stamps)
             sel = findall(t -> s - WINDOW < t <= s, eh)
@@ -451,9 +473,9 @@ function do_column(col, recs, stamps, XC, YC, RF)
         isempty(iced) || @warn "$(col.name): B-SOSE ice > 0.15 in $(length(iced)) windows ($(first(iced))...): ERA5 stress is open-water stress"
         @info @sprintf("%s: STRESS=%s, %d ERA5 hours; 5-day |<τ>| ERA5 / B-SOSE = %.2f (mean over windows)",
                        col.name, STRESS, length(eh), mean(hypot.(τx, τy) ./ τb))
-        if STRESS == "era5_hourly"
+        if STRESS != "era5_5day"
             th = [Dates.value(t - (stamps[1] - Hour(60))) / 1000 for t in eh]
-            τxh, τyh = ex, ey
+            τxh, τyh, uh, vh, ρh = ex, ey, eu, ev, eρ
         end
     end
 
@@ -486,7 +508,8 @@ function do_column(col, recs, stamps, XC, YC, RF)
     LS = bud === nothing ? zeros(nk, nm) : lateral_source(bud.SLT)
     dilute = LATERAL == "none" ? 1.0 : 0.0         # see the header: B-SOSE's advective terms already carry the dilution
     p = (; ts, Qtot, Qsw, SF, FW, τx, τy, zf, ρ₀, cₚ, R = SWR, ζ1 = SWζ1, ζ2 = SWζ2, tl, LT, LS, dilute,
-           hourly = STRESS == "era5_hourly", th, τxh, τyh)
+           hourly = STRESS in ("era5_hourly", "era5_6hourly"), relative = STRESS == "era5_hourly_relative",
+           th, τxh, τyh, uh, vh, ρh)
 
     mlabel(n) = @sprintf("%04d-%02d", months[n]...)
     if bud !== nothing
@@ -747,7 +770,7 @@ function do_column(col, recs, stamps, XC, YC, RF)
     # F the mixing flux on a level's top face (positive up), ∂X/∂z the monthly-mean gradient across that face (z up).
     # Faces from max(B-SOSE's monthly MLD + 50 m, 200 m) to min(600 m, floor), where the gradient is not tiny; the
     # median over those faces. B-SOSE's from its DFrI and its own profile; each scheme's from its diagnosed flux and
-    # its own profile. Our backgrounds are κz = 1e-4 (catke, ri); catke_bare and kepsilon have none.
+    # its own profile. Our backgrounds are κz = KAPPA_Z (catke, ri); catke_bare and kepsilon have none.
     gmin = (S = 2e-4, T = 1e-3)                                  # g/kg per m, °C per m
     function implied_kappa(F, X, hml, which)
         ks = Float64[]
@@ -762,10 +785,10 @@ function do_column(col, recs, stamps, XC, YC, RF)
     end
     fk(x) = isfinite(x[1]) ? @sprintf("%.1f", 1e5 * x[1]) : "--"
     println("\nIMPLIED κz BELOW THE MIXED LAYER (1e-5 m²/s; median over faces from max(MLD+50, 200) m to 600 m) " *
-            "-- from salt | from heat. Our background is 10 (1e-4).")
+            "-- from salt | from heat. Our background is $(round(KAPPA_Z / 1e-5, digits = 1)) ($(KAPPA_Z)).")
     hdr = @sprintf("  %-8s %10s", "month", "B-SOSE(n)") * join(@sprintf(" %10s", n) for n in CLOSURES)
     println(hdr, " |", hdr[11:end])
-    push!(sm, "implied κz below the mixed layer, 1e-5 m²/s (median, faces max(MLD+50,200)-600 m): salt | heat; ours = 10")
+    push!(sm, "implied κz below the mixed layer, 1e-5 m²/s (median, faces max(MLD+50,200)-600 m): salt | heat; ours = $(round(KAPPA_Z / 1e-5, digits = 1))")
     push!(sm, hdr * " |" * hdr[11:end])
     for n in shown
         rs = [r for r in 2:nr if inmonth(r, n)]
@@ -828,7 +851,7 @@ function main()
     commit = try readchomp(`git -C $(@__DIR__) rev-parse --short HEAD`) catch; "?" end
     println("\n", "#"^34, " SUMMARY: copy from here ", "#"^34)
     println("single_column_bsose $commit | ", Dates.format(stamps[1], "yyyy-mm-dd"), " to ", Dates.format(stamps[end], "yyyy-mm-dd"),
-            " | LATERAL=$LATERAL | STRESS=$STRESS | ZMAX=$ZMAX | DT=$DT | MLD_DT=$MLD_DT")
+            " | LATERAL=$LATERAL | STRESS=$STRESS | KAPPA_Z=$KAPPA_Z | ZMAX=$ZMAX | DT=$DT | MLD_DT=$MLD_DT")
     foreach(println, summary)
     println("#"^36, " END SUMMARY ", "#"^45)
 end

@@ -34,10 +34,12 @@ era5_timevar(ds) = haskey(ds, "valid_time") ? "valid_time" : "time"   # download
 """
 Hourly ERA5 stress over a lon-lat box, the mean of each ERA5 cell's stress (not the stress of the mean wind) over
 the cells whose centres fall in the box (the nearest cell if none does), for the hours in [t0, t1].
-Returns (times, τx, τy, ρa); rho = nothing uses ERA5's air density, a number uses that constant.
+Returns (times, τx, τy, ρa, u10, v10), all box means; rho = nothing uses ERA5's air density, a number that constant.
+every = 6 keeps only the hours 00, 06, 12, 18 of the wind, temperature, dewpoint and pressure and interpolates them
+linearly to every hour BEFORE the stress is computed, as MITgcm's EXF does with 6-hourly fields.
 """
-function era5_box_stress(dir, lon, lat, t0, t1; rho = nothing)
-    times, τx, τy, ρs = DateTime[], Float64[], Float64[], Float64[]
+function era5_box_stress(dir, lon, lat, t0, t1; rho = nothing, every = 1)
+    times, τx, τy, ρs, us, vs = DateTime[], Float64[], Float64[], Float64[], Float64[], Float64[]
     for y in year(t0):year(t1)
         files = Dict(s => era5_file(dir, s, y) for s in ("u10", "v10", "t2m", "d2m", "msl"))
         NCDataset(files["u10"]) do ds
@@ -52,14 +54,30 @@ function era5_box_stress(dir, lon, lat, t0, t1; rho = nothing)
             idx = findall(s -> t0 <= s <= t1, t); isempty(idx) && return
             K = first(idx):last(idx)
             rd(s) = NCDataset(f -> Float64.(coalesce.(f[s][I, J, K], NaN)), files[s])
-            u, v = rd("u10"), rd("v10")
-            ρ = rho === nothing ? air_density.(rd("msl"), rd("t2m"), rd("d2m")) : fill(Float64(rho), size(u))
+            sub = every == 1 ? identity : A -> subsample_hours(A, t[K], every)
+            u, v = sub(rd("u10")), sub(rd("v10"))
+            ρ = rho === nothing ? air_density.(sub(rd("msl")), sub(rd("t2m")), sub(rd("d2m"))) : fill(Float64(rho), size(u))
             U = sqrt.(u .^ 2 .+ v .^ 2); k = ρ .* neutral_cd.(U) .* U
             append!(times, t[K])
             append!(τx, vec(mean(k .* u; dims = (1, 2)))); append!(τy, vec(mean(k .* v; dims = (1, 2))))
             append!(ρs, vec(mean(ρ; dims = (1, 2))))
+            append!(us, vec(mean(u; dims = (1, 2)))); append!(vs, vec(mean(v; dims = (1, 2))))
         end
     end
     isempty(times) && error("no ERA5 hours between $t0 and $t1 in $dir")
-    return times, τx, τy, ρs
+    return times, τx, τy, ρs, us, vs
+end
+
+"A (x, y, hour) sampled at the hours divisible by `every` and linearly interpolated back to every hour (held at the ends)."
+function subsample_hours(A, t, every)
+    keep = findall(s -> hour(s) % every == 0, t)
+    length(keep) < 2 && error("fewer than two $(every)-hourly samples")
+    B = similar(A)
+    for n in eachindex(t)
+        m = clamp(searchsortedlast(keep, n), 1, length(keep) - 1)
+        a, b = keep[m], keep[m+1]
+        w = clamp((n - a) / (b - a), 0.0, 1.0)
+        B[:, :, n] .= (1 - w) .* view(A, :, :, a) .+ w .* view(A, :, :, b)
+    end
+    return B
 end
