@@ -27,7 +27,8 @@
 # each model at the same profiles, and the median of model/obs per profile. Then DJF by month for part A.
 # WRITES OUTDIR/spira_mld[_<RUN>].png: per band, monthly medians, obs against B-SOSE (and the run).
 # LOGIN-NODE SAFE: profiles are read in runs of nearby indices, only those in the box; B-SOSE one record at a time.
-# ENV: BSOSE_DIR (required), SPIRA (default BSOSE_DIR/spira/qc_profile_ds_2dbar.nc), DIR (run files, .), OUTDIR
+# SPIRA is fixed: /storage/scratch1/1/vnguyen480/SOWinWaRP/data/spira-hydrographic/qc_profile_ds_2dbar.nc
+# ENV: BSOSE_DIR (required), DIR (run files, .), OUTDIR
 #      (plots), BANDS (-70,-65,-60,-55,-50,-45), YEARS (2013:2021), ZMAX (1000 m, B-SOSE levels searched), MLD_DT
 # ==============================================================================================
 
@@ -41,7 +42,7 @@ include(joinpath(@__DIR__, "model_grid.jl"))    # file_levels, file_kbot
 const RUN       = isempty(ARGS) ? get(ENV, "RUN", "") : ARGS[1]
 const BSOSE_DIR = get(ENV, "BSOSE_DIR", "")
 isempty(BSOSE_DIR) && error("set BSOSE_DIR to the directory with B-SOSE's monthly and 5-day Theta and Salt")
-const SPIRA  = get(ENV, "SPIRA", joinpath(BSOSE_DIR, "spira", "qc_profile_ds_2dbar.nc"))
+const SPIRA  = "/storage/scratch1/1/vnguyen480/SOWinWaRP/data/spira-hydrographic/qc_profile_ds_2dbar.nc"
 const DIR    = get(ENV, "DIR", ".")
 const OUTDIR = get(ENV, "OUTDIR", "plots")
 const EDGES  = parse.(Float64, split(get(ENV, "BANDS", "-70,-65,-60,-55,-50,-45"), ','))
@@ -57,7 +58,7 @@ firstkey(ds, names) = (k = findfirst(n -> haskey(ds, n), names); k === nothing ?
 
 # ── the profiles in the box ──────────────────────────────────────────────────────────────────────
 function read_profiles()
-    isfile(SPIRA) || error("$SPIRA not found (zenodo 10258138, qc_profile_ds_2dbar.nc); set SPIRA")
+    isfile(SPIRA) || error("$SPIRA not found (zenodo 10258138, qc_profile_ds_2dbar.nc)")
     NCDataset(SPIRA) do ds
         tv, sv = firstkey(ds, ("temp", "ctemp", "TEMP")), firstkey(ds, ("psal", "asal", "PSAL"))
         dn = dimnames(ds[tv]); length(dn) == 2 || error("$tv has dims $dn, expected (pres, n_prof)")
