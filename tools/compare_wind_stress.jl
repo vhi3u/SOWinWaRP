@@ -36,6 +36,7 @@ using NCDatasets, CairoMakie, Dates, Printf, Statistics
 ENV["HDF5_USE_FILE_LOCKING"] = "FALSE"
 ENV["SOURCE"] = "5day"                              # B-SOSE's stress is compared record by record, on its 5-day files
 include(joinpath(@__DIR__, "bsose_windows.jl"))   # bsose_path, bsose_data_var
+include(joinpath(@__DIR__, "era5_stress.jl"))     # neutral_cd, air_density, era5_file, era5_timevar
 
 const BSOSE_DIR = get(ENV, "BSOSE_DIR", "")
 isempty(BSOSE_DIR) && error("set BSOSE_DIR to the directory with B-SOSE's 5-day oceTAUX, oceTAUY, SIArea and Theta files")
@@ -50,26 +51,6 @@ const RHO_EXF  = 1.2
 
 f64(A) = Float64.(coalesce.(A, NaN))
 band_name(b) = @sprintf("%.0f-%.0fS", -EDGES[b], -EDGES[b+1])
-
-# NumericalEarth's PolynomialNeutralDragCoefficient, defaults (768ed1d)
-neutral_cd(U) = (U = max(U, 0.5); U < 33 ? (2.7 / U + 0.142 + U / 13.09 - 3.14807e-10 * U^6) / 1000 : 2.34e-3)
-
-"Moist air density (kg/m³) from pressure (Pa), temperature and dewpoint (K)."
-function air_density(p, T, Td)
-    Tdc = Td - 273.15
-    e = 611.2 * exp(17.67 * Tdc / (Tdc + 243.5))      # vapour pressure, Pa (Bolton 1980)
-    q = 0.622 * e / (p - 0.378 * e)
-    return p / (287.04 * T * (1 + 0.608 * q))
-end
-
-"The ERA5 file for `short` (u10, v10, t2m, d2m, msl) and year y in ERA5_DIR, found by opening the candidates."
-function era5_file(short, y)
-    for f in sort(readdir(ERA5_DIR; join = true))
-        (endswith(f, ".nc") && occursin("_$(y)_", basename(f))) || continue
-        NCDataset(f) do ds; haskey(ds, short) end && return f
-    end
-    error("no ERA5 file with $short for $y in $ERA5_DIR (tools/download_era5_ncar.jl writes them)")
-end
 
 function main()
     years = year(START):year(STOP - Millisecond(1))
@@ -100,7 +81,7 @@ function main()
                     NCDataset(r.path) do ds; v = ds[r.var]; f64(ndims(v) == 4 ? v[:, jr, 1, r.n] : v[:, jr, r.n])[ir, :] end)
 
     # ── ERA5: grid and the nearest ERA5 cell for each B-SOSE cell ───────────────────────────
-    elon, elat = NCDataset(era5_file("u10", first(years))) do ds
+    elon, elat = NCDataset(era5_file(ERA5_DIR, "u10", first(years))) do ds
         lon = f64(ds[haskey(ds, "longitude") ? "longitude" : "lon"][:]); lat = f64(ds[haskey(ds, "latitude") ? "latitude" : "lat"][:])
         lon, lat
     end
@@ -110,9 +91,8 @@ function main()
         error("ERA5's grid does not cover the box: nearest cells up to $(maximum(abs.(elat[je] .- φ)))° away")
 
     handles = Dict{Tuple{String, Int}, NCDataset}()
-    era5(short, y) = get!(() -> NCDataset(era5_file(short, y)), handles, (short, y))
-    timevar(ds) = haskey(ds, "valid_time") ? "valid_time" : "time"   # download_era5_ncar.jl writes CDS's valid_time
-    etimes = Dict(y => (ds = era5("u10", y); DateTime.(ds[timevar(ds)][:])) for y in years)
+    era5(short, y) = get!(() -> NCDataset(era5_file(ERA5_DIR, short, y)), handles, (short, y))
+    etimes = Dict(y => (ds = era5("u10", y); DateTime.(ds[era5_timevar(ds)][:])) for y in years)
     for y in years
         d = dimnames(era5("u10", y)["u10"])
         length(d) == 3 && occursin("time", lowercase(d[3])) || error("ERA5 u10 for $y is $(d), expected (lon, lat, time)")

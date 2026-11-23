@@ -23,7 +23,14 @@
 #                      salinity THROUGH the advective terms (the inflow replacing water removed at the surface).
 #                      With those terms applied, adding -S*oceFWflx counts it twice (86c2b9c did: 65S too salty,
 #                      52S too fresh).
-#               stress oceTAUX, oceTAUY (under ice: B-SOSE's ice-ocean + air-ocean stress)
+#               stress oceTAUX, oceTAUY (under ice: B-SOSE's ice-ocean + air-ocean stress), or with STRESS:
+#                      era5_5day    ERA5 Large & Yeager stress (tools/era5_stress.jl: neutral, absolute wind, ρa
+#                                   from ERA5, as the run's coupler) averaged over each 5-day window
+#                      era5_hourly  the same stress hour by hour, linear in time between ERA5 hours
+#                      Both are OPEN-WATER stress over the box's ERA5 cells: meaningful only where B-SOSE has no ice
+#                      (a warning names windows with box SIArea > 0.15). era5_hourly against era5_5day isolates
+#                      what sub-5-day wind variability does to the mixed layer (the run is forced hourly);
+#                      era5_5day against bsose, the mean stress (~1.07x B-SOSE's north of 65S, compare_wind_stress).
 #             as the run: flux = -X / rho0 (tracers also / cp), rho0 1020, cp 3991.868, TEOS-10
 #   Coriolis  f-plane at the box's centre latitude
 #   schemes   CLOSURES, from
@@ -82,6 +89,8 @@
 #   LATERAL    monthly | none                      (default monthly)
 #   BUDGET_URL (default https://sose.ucsd.edu/SO6/ITER156/MONTHLY/)
 #   RHO_BSOSE  B-SOSE's reference density for its own budget check, kg/m³ (default 1035; cp 3994)
+#   STRESS     bsose | era5_5day | era5_hourly   (default bsose); ERA5_DIR (default BSOSE_DIR/era5). Figures of a
+#              non-default STRESS are named single_column_<column>_<STRESS>*.png
 # ==============================================================================================
 
 using Oceananigans
@@ -91,6 +100,7 @@ using NCDatasets, CairoMakie, Dates, Printf, Statistics, Serialization
 
 ENV["HDF5_USE_FILE_LOCKING"] = "FALSE"
 include(joinpath(@__DIR__, "mld.jl"))          # mld, MLD_DT
+include(joinpath(@__DIR__, "era5_stress.jl"))  # era5_box_stress
 
 const BSOSE_DIR = get(ENV, "BSOSE_DIR", "")
 isempty(BSOSE_DIR) && error("set BSOSE_DIR to the directory with B-SOSE's 5-day files")
@@ -107,6 +117,10 @@ const LATERAL  = get(ENV, "LATERAL", "monthly")
 LATERAL in ("monthly", "none") || error("LATERAL must be monthly or none, got $LATERAL")
 const BUDGET_URL = get(ENV, "BUDGET_URL", "https://sose.ucsd.edu/SO6/ITER156/MONTHLY/")
 const ρB       = parse(Float64, get(ENV, "RHO_BSOSE", "1035"))
+const STRESS   = get(ENV, "STRESS", "bsose")
+STRESS in ("bsose", "era5_5day", "era5_hourly") || error("STRESS must be bsose, era5_5day or era5_hourly, got $STRESS")
+const ERA5_DIR = get(ENV, "ERA5_DIR", joinpath(get(ENV, "BSOSE_DIR", ""), "era5"))
+const TAG      = STRESS == "bsose" ? "" : "_$STRESS"
 const cpB      = 3994.0
 
 struct Column
@@ -294,8 +308,16 @@ end
 @inline Jᵀ(i, j, grid, clock, f, p) = (n = window_index(p, clock.time); -(p.Qtot[n] - p.Qsw[n]) / (p.ρ₀ * p.cₚ))
 @inline Jˢ(i, j, grid, clock, f, p) = (n = window_index(p, clock.time);
                                        -(p.SF[n] - p.dilute * @inbounds(f.S[i, j, grid.Nz]) * p.FW[n]) / p.ρ₀)
-@inline Jᵘ(i, j, grid, clock, f, p) = (n = window_index(p, clock.time); -p.τx[n] / p.ρ₀)
-@inline Jᵛ(i, j, grid, clock, f, p) = (n = window_index(p, clock.time); -p.τy[n] / p.ρ₀)
+# hourly stress (STRESS=era5_hourly): linear between ERA5 hours p.th (model seconds), held at the ends
+@inline function hourly(th, τ, t)
+    k = clamp(searchsortedlast(th, t), 1, length(th) - 1)
+    w = clamp((t - th[k]) / (th[k+1] - th[k]), 0.0, 1.0)
+    return (1 - w) * τ[k] + w * τ[k+1]
+end
+@inline Jᵘ(i, j, grid, clock, f, p) = p.hourly ? -hourly(p.th, p.τxh, clock.time) / p.ρ₀ :
+                                                 (n = window_index(p, clock.time); -p.τx[n] / p.ρ₀)
+@inline Jᵛ(i, j, grid, clock, f, p) = p.hourly ? -hourly(p.th, p.τyh, clock.time) / p.ρ₀ :
+                                                 (n = window_index(p, clock.time); -p.τy[n] / p.ρ₀)
 @inline swfrac(z, p) = p.R * exp(z / p.ζ1) + (1 - p.R) * exp(z / p.ζ2)
 @inline function shortwave_heating(i, j, k, grid, clock, f, p)
     n = window_index(p, clock.time)
@@ -415,6 +437,26 @@ function do_column(col, recs, stamps, XC, YC, RF)
     end
     any(!isfinite, Tb) && error("$(col.name): B-SOSE T has gaps in the column (a level with no wet cell?)")
 
+    # ── STRESS=era5_*: ERA5 Large & Yeager stress over the box replaces B-SOSE's ──
+    th, τxh, τyh = Float64[], Float64[], Float64[]
+    if STRESS != "bsose"
+        eh, ex, ey, _ = era5_box_stress(ERA5_DIR, col.lon, col.lat, stamps[1] - WINDOW, stamps[end])
+        τb = copy(hypot.(τx, τy))
+        for (r, s) in enumerate(stamps)
+            sel = findall(t -> s - WINDOW < t <= s, eh)
+            isempty(sel) && error("$(col.name): no ERA5 hours in the window ending $s")
+            τx[r], τy[r] = mean(ex[sel]), mean(ey[sel])
+        end
+        iced = [Dates.format(stamps[r], "yyyy-mm-dd") for r in 1:nr if isfinite(ice[r]) && ice[r] > 0.15]
+        isempty(iced) || @warn "$(col.name): B-SOSE ice > 0.15 in $(length(iced)) windows ($(first(iced))...): ERA5 stress is open-water stress"
+        @info @sprintf("%s: STRESS=%s, %d ERA5 hours; 5-day |<τ>| ERA5 / B-SOSE = %.2f (mean over windows)",
+                       col.name, STRESS, length(eh), mean(hypot.(τx, τy) ./ τb))
+        if STRESS == "era5_hourly"
+            th = [Dates.value(t - (stamps[1] - Hour(60))) / 1000 for t in eh]
+            τxh, τyh = ex, ey
+        end
+    end
+
     # model time 0 = centre of record 1; window r is (stamp_r - 5 d, stamp_r]
     t0 = stamps[1] - Hour(60)                     # half of the 5-day window
     secs(d) = Dates.value(d - t0) / 1000
@@ -443,7 +485,8 @@ function do_column(col, recs, stamps, XC, YC, RF)
     LT = bud === nothing ? zeros(nk, nm) : lateral_source(bud.TH)
     LS = bud === nothing ? zeros(nk, nm) : lateral_source(bud.SLT)
     dilute = LATERAL == "none" ? 1.0 : 0.0         # see the header: B-SOSE's advective terms already carry the dilution
-    p = (; ts, Qtot, Qsw, SF, FW, τx, τy, zf, ρ₀, cₚ, R = SWR, ζ1 = SWζ1, ζ2 = SWζ2, tl, LT, LS, dilute)
+    p = (; ts, Qtot, Qsw, SF, FW, τx, τy, zf, ρ₀, cₚ, R = SWR, ζ1 = SWζ1, ζ2 = SWζ2, tl, LT, LS, dilute,
+           hourly = STRESS == "era5_hourly", th, τxh, τyh)
 
     mlabel(n) = @sprintf("%04d-%02d", months[n]...)
     if bud !== nothing
@@ -640,7 +683,7 @@ function do_column(col, recs, stamps, XC, YC, RF)
                        "colours as above. B-SOSE also changes by lateral supply; see the printed budget.",
           fontsize = 12)
     mkpath(OUTDIR)
-    out = joinpath(OUTDIR, "single_column_$(col.name).png")
+    out = joinpath(OUTDIR, "single_column_$(col.name)$(TAG).png")
     save(out, fig); @info "wrote $out"
 
     bud === nothing && return sm
@@ -758,7 +801,7 @@ function do_column(col, recs, stamps, XC, YC, RF)
         end
         row == 1 && c == 1 && axislegend(a, position = :rb, framevisible = false)
     end
-    outf = joinpath(OUTDIR, "single_column_$(col.name)_mixing_flux.png")
+    outf = joinpath(OUTDIR, "single_column_$(col.name)$(TAG)_mixing_flux.png")
     save(outf, figf); @info "wrote $outf"
     return sm
 end
@@ -785,7 +828,7 @@ function main()
     commit = try readchomp(`git -C $(@__DIR__) rev-parse --short HEAD`) catch; "?" end
     println("\n", "#"^34, " SUMMARY: copy from here ", "#"^34)
     println("single_column_bsose $commit | ", Dates.format(stamps[1], "yyyy-mm-dd"), " to ", Dates.format(stamps[end], "yyyy-mm-dd"),
-            " | LATERAL=$LATERAL | ZMAX=$ZMAX | DT=$DT | MLD_DT=$MLD_DT")
+            " | LATERAL=$LATERAL | STRESS=$STRESS | ZMAX=$ZMAX | DT=$DT | MLD_DT=$MLD_DT")
     foreach(println, summary)
     println("#"^36, " END SUMMARY ", "#"^45)
 end
