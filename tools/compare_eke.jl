@@ -31,7 +31,7 @@
 # WRITES OUTDIR/<RUN>_eke_maps.png (B-SOSE, each run, and log10 run/B-SOSE), OUTDIR/<RUN>_eke_profiles.png (zonal-mean
 # EKE by latitude; band EKE window by window). STDOUT: band means (cm²/s²), run/B-SOSE, year 1 and year 2.
 # ENV  DIR (.), OUTDIR (plots), BSOSE_DIR (required), ERA5_DIR ($BSOSE_DIR/era5), IB (1), SIDE_DEG (1.0),
-#      BANDS (-70,-65,-60,-55,-50,-45), SSH_TOKEN (SSH), MIN_DAYS (4), ICE_LOAD (1), ICE_TOKEN (SIheff), SNOW_TOKEN (SIhsnow).
+#      BANDS (-70,-65,-60,-55,-50,-45), SECTORS (90,105,120,135,150: the longitude split), SSH_TOKEN (SSH), MIN_DAYS (4), ICE_LOAD (1), ICE_TOKEN (SIheff), SNOW_TOKEN (SIhsnow).
 # ==============================================================================================
 
 using NCDatasets, CairoMakie, Dates, Printf, Statistics
@@ -52,6 +52,7 @@ const SIDE_DEG  = parse(Float64, get(ENV, "SIDE_DEG", "1.0"))
 const EDGES     = parse.(Float64, split(get(ENV, "BANDS", "-70,-65,-60,-55,-50,-45"), ','))
 const TOKEN     = get(ENV, "SSH_TOKEN", "SSH")
 const MIN_DAYS  = parse(Int, get(ENV, "MIN_DAYS", "4"))
+const SECTORS   = parse.(Float64, split(get(ENV, "SECTORS", "90,105,120,135,150"), ','))
 const ICE_LOAD  = get(ENV, "ICE_LOAD", "1") != "0"
 const ICE_TOKEN = get(ENV, "ICE_TOKEN", "SIheff")
 const SNOW_TOKEN = get(ENV, "SNOW_TOKEN", "SIhsnow")
@@ -346,6 +347,23 @@ function main()
             println()
         end
     end
+    # by longitude sector: is a difference made next to an open face (the first sector) or spread along the band?
+    sectors = [(SECTORS[s], SECTORS[s+1]) for s in 1:length(SECTORS)-1]
+    println("\n  run/B-SOSE by longitude sector (whole record; B-SOSE EKE in brackets, cm²/s²)")
+    @printf("  %-9s", "band")
+    for (a, b) in sectors; @printf(" | %16s", @sprintf("%.0f-%.0fE", a, b)); end
+    println()
+    for b in eachindex(bands), k in 1:nr
+        @printf("  %3.0f-%3.0fS%s", -bands[b][2], -bands[b][1], nr > 1 ? " $k" : "")
+        for (a, c) in sectors
+            sec = [a <= x < c for x in λ]
+            secmean(E) = (sel = isfinite.(E) .& (sec .* inband(b)'); w = (sel .* wlat')[sel]; isempty(w) ? NaN : sum(E[sel] .* w) / sum(w))
+            eb = secmean(eke[1])
+            @printf(" | %6.2f (%6.1f)", secmean(eke[k+1]) / eb, eb)
+        end
+        println()
+    end
+    nr > 1 && println("  (rows numbered by run, in the order given: ", join(["$k = $(srcs[k+1])" for k in 1:nr], ", "), ")")
     println("\n  (band EKE by window is per-window: a window's EKE uses each source's own mean over all windows)\n")
 
     # ── figures ──────────────────────────────────────────────────────────────────────────────────
