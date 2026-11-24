@@ -308,6 +308,25 @@ end
 lim_note(key) = get(ENV, key, "") == "auto" ? " (99th percentile; $key=auto)." :
                 haskey(ENV, key) ? " (set by $key)." : " (fixed default, the same for every run; $key=auto to fit this run)."
 
+# Mark a panel's extremes: a black outline around every cell beyond the colour limit (their colour is saturated, so
+# it no longer shows how large they are), and an open circle on the single largest |Δ|. Returns that cell's
+# (value, x, y), or nothing if the panel has no finite value. x, y are the cell centres of D's two dimensions.
+function mark_extremes!(ax, x, y, D, lim)
+    I = nothing; best = -Inf
+    for J in CartesianIndices(D)
+        v = D[J]
+        isfinite(v) && abs(v) > best && (best = abs(v); I = J)
+    end
+    I === nothing && return nothing
+    best > lim && contour!(ax, x, y, map(v -> isfinite(v) ? Float64(abs(v)) : 0.0, D), levels = [lim],
+                           color = :black, linewidth = 0.7)
+    scatter!(ax, [x[I[1]]], [y[I[2]]], marker = :circle, markersize = 13, color = :transparent,
+             strokecolor = :black, strokewidth = 1.6)
+    return D[I], x[I[1]], y[I[2]]
+end
+latlon(λ, φ) = @sprintf("%.1fE %.1fS", λ, -φ)
+const EXTREME_NOTE = "Circle: the panel's largest |Δ| (value under its title). Black outline: cells beyond the colour limit."
+
 !isempty(surf_months) && let
     jsouth = findall(φ -> φ < COAST_SOUTH_OF, φc)
     lim = colour_limit([ΔS_all[:, jsouth], ΔS_summer[:, jsouth]], "COAST_S_LIM")
@@ -315,12 +334,16 @@ lim_note(key) = get(ENV, key, "") == "auto" ? " (99th percentile; $key=auto)." :
     Label(fig[0, 1], "$RUN — surface S, model − B-SOSE, south of $(Int(-COAST_SOUTH_OF))S", fontsize = 18, font = :bold)
     local hm
     for (row, (name, D)) in enumerate((("whole run", ΔS_all), ("Dec-Feb", ΔS_summer)))
-        ax = Axis(fig[row, 1], title = "mean over $name; black: coastal cells (within $COAST_CELLS of land)",
+        ax = Axis(fig[row, 1], title = "mean over $name; dashed: coastal cells (within $COAST_CELLS of land)",
                   titlesize = 12, ylabel = "latitude", xlabel = row == 2 ? "longitude" : "")
         hm = heatmap!(ax, λc, φc[jsouth], D[:, jsouth], colormap = :balance, colorrange = (-lim, lim), nan_color = :gray80)
-        contour!(ax, λc, φc[jsouth], Float64.(coastal[:, jsouth]), levels = [0.5], color = :black, linewidth = 0.8)
+        contour!(ax, λc, φc[jsouth], Float64.(coastal[:, jsouth]), levels = [0.5], color = :gray30, linewidth = 0.8,
+                 linestyle = :dash)
+        ext = mark_extremes!(ax, λc, φc[jsouth], D[:, jsouth], lim)
+        ext === nothing || (ax.subtitle = @sprintf("largest |ΔS|: %+.2f g/kg at %s", ext[1], latlon(ext[2], ext[3])))
     end
     Colorbar(fig[1:2, 2], hm, label = "ΔS (g/kg); red: model too salty; limit ±$(round(lim, sigdigits = 2))")
+    Label(fig[3, 1:2], EXTREME_NOTE, fontsize = 11)
     f = joinpath(OUTDIR, "$(RUN)_coastal_salinity_bias.png"); save(f, fig); @info "wrote $f"
 end
 
@@ -337,14 +360,16 @@ xticks_for(ms) = (n = length(ms); s = max(1, cld(n, 12)); (collect(1:s:n), [labe
         local hm
         for (n, k) in enumerate(surf_months)
             r, c = fldmod1(n, ncol)
-            ax = Axis(fig[r, c], title = label(k), titlesize = 12, xticklabelsvisible = r == nrow,
+            ax = Axis(fig[r, c], title = label(k), titlesize = 12, subtitlesize = 10, xticklabelsvisible = r == nrow,
                       yticklabelsvisible = c == 1, xticklabelsize = 9, yticklabelsize = 9)
             hm = heatmap!(ax, λc, φc, D[k], colormap = :balance, colorrange = (-lim, lim), nan_color = :gray80)
+            ext = mark_extremes!(ax, λc, φc, D[k], lim)
+            ext === nothing || (ax.subtitle = @sprintf("max %+.2f at %s", ext[1], latlon(ext[2], ext[3])))
         end
         Colorbar(fig[1:nrow, ncol + 1], hm, label = "Δ$var ($unit)")
         Label(fig[nrow + 1, 1:ncol], "red: model too $hot; blue: too $cold. Grey: land in either bathymetry. " *
               "Colour limit ±$(round(lim, sigdigits = 2)) $unit" *
-              lim_note(key), fontsize = 11)
+              lim_note(key) * "\n" * EXTREME_NOTE, fontsize = 11)
         f = joinpath(OUTDIR, "$(RUN)_surface_bias_$(var).png"); save(f, fig); @info "wrote $f"
     end
 
@@ -374,17 +399,19 @@ end
         local hm
         for (n, k) in enumerate(sect_months)
             r, c = fldmod1(n, ncol)
-            ax = Axis(fig[r, c], title = label(k), titlesize = 12, xticklabelsvisible = r == nrow,
+            ax = Axis(fig[r, c], title = label(k), titlesize = 12, subtitlesize = 10, xticklabelsvisible = r == nrow,
                       yticklabelsvisible = c == 1, xticklabelsize = 9, yticklabelsize = 9,
                       xlabel = r == nrow ? "latitude" : "", ylabel = c == 1 ? "z (m)" : "")
             hm = heatmap!(ax, φc, zc, D[k], colormap = :balance, colorrange = (-lim, lim), nan_color = :gray80)
+            ext = mark_extremes!(ax, φc, zc[kdraw], D[k][:, kdraw], lim)
+            ext === nothing || (ax.subtitle = @sprintf("max %+.2f at %.1fS, %d m", ext[1], -ext[2], round(Int, -ext[3])))
             ylims!(ax, zbottom, 0)
         end
         Colorbar(fig[1:nrow, ncol + 1], hm, label = "Δ$var ($unit)")
         Label(fig[nrow + 1, 1:ncol], "red: model too $hot; blue: too $cold. Grey: land in either bathymetry. " *
               (isinf(ZMAX) ? "Full depth. " : "Upper $(round(Int, ZMAX)) m (MIDLON_ZMAX). ") *
               "Colour limit ±$(round(lim, sigdigits = 2)) $unit" *
-              lim_note(key), fontsize = 11)
+              lim_note(key) * "\n" * EXTREME_NOTE, fontsize = 11)
         f = joinpath(OUTDIR, "$(RUN)_midlon_bias_$(var).png"); save(f, fig); @info "wrote $f"
     end
 
