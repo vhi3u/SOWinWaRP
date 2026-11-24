@@ -24,6 +24,13 @@
 # regressing record 1 on B-SOSE's initial ETAN; the fit, its correlation and the top cell's own Δz are printed, and
 # a correlation below 0.95 stops the tool. Record 1 with a real gradient is used as it is.
 #
+# INVERSE BAROMETER. B-SOSE i156 was forced with atmospheric loading, so its ETAN carries the static response
+# -(p - p̄)/(ρ₀ g); the run's η does not (pressure never reaches the NestedModel child at NumericalEarth 768ed1d), and the
+# CTOH ADT has it removed (dynamic atmosphere correction). tools/ib_check.jl on _mar_iceobc2: that term is the whole of the
+# run's 15-18% larger 47-55S Δη. So by default (IB=1) B-SOSE's monthly ETAN gets + (p - p̄)/(ρ₀ g) back, from ERA5 msl
+# monthly means (ERA5_DIR, default $BSOSE_DIR/era5) with p̄ the month's mean over the wet columns, and the datum is fitted
+# over the months both CTOH and ERA5 cover. IB=0 compares the raw ETAN, as before 2026-11-24.
+#
 # STRENGTH. Δη = zonal-mean η at STRENGTH_N minus at STRENGTH_S (default 47S and 55S): the surface geostrophic
 # transport across the SAF band. Independent of the datum.
 #
@@ -31,7 +38,7 @@
 #         against longitude, and Δη. STDOUT: the monthly table and the mean offsets, whole run, year 1, year 2.
 #
 # ENV  DIR (.), OUTDIR (plots), BSOSE_DIR (required), SIDE_DEG (1.0), LAT_S (-62), LAT_N (-45.5), OFFSET (fitted),
-#      STRENGTH_S (-55), STRENGTH_N (-47), MIN_DAYS (20, days of run output for a month to count).
+#      STRENGTH_S (-55), STRENGTH_N (-47), MIN_DAYS (20, days of run output for a month to count), IB (1), ERA5_DIR.
 # ==============================================================================================
 
 using NCDatasets, CairoMakie, Dates, Printf, Statistics
@@ -50,6 +57,9 @@ const LAT_N      = parse(Float64, get(ENV, "LAT_N", "-45.5"))
 const STRENGTH_S = parse(Float64, get(ENV, "STRENGTH_S", "-55"))
 const STRENGTH_N = parse(Float64, get(ENV, "STRENGTH_N", "-47"))
 const MIN_DAYS   = parse(Int, get(ENV, "MIN_DAYS", "20"))
+const IB         = get(ENV, "IB", "1") != "0"
+const ERA5_DIR   = get(ENV, "ERA5_DIR", joinpath(BSOSE_DIR, "era5"))
+const ρ₀g        = 1027.0 * 9.81
 const FRONTS     = (("PF", -0.3, "CTOH_PolarFront_weekly_1993_2025.nc", "PF"),
                     ("SAF", -0.1, "CTOH_SubantarcticFront_weekly_1993_2025.nc", "SAF"),
                     ("NSAF", 0.0, "CTOH_NorthernSubantarcticFront_weekly_1993_2025.nc", "SAF_N"))
@@ -128,6 +138,34 @@ function main()
     bsose_on_run(n) = (A = f64(bs["ETAN"][:, jr, n]); H = A[ib, jb .- first(jr) .+ 1];
                        H[depth[ib, jb] .<= 0] .= NaN; H)
 
+    # ── ERA5 msl monthly means on the same columns, for B-SOSE's inverse-barometer part (see the header) ──
+    era5_names = isdir(ERA5_DIR) ? filter(f -> startswith(f, "mean_sea_level_pressure_") && endswith(f, ".nc"), readdir(ERA5_DIR)) : String[]
+    era5_file(y) = (f = filter(n -> startswith(n, "mean_sea_level_pressure_$(y)_"), era5_names); isempty(f) ? nothing : joinpath(ERA5_DIR, f[1]))
+    p_cache = Dict{Tuple{Int, Int}, Matrix{Float64}}()
+    function msl_on_run(mk)
+        get!(p_cache, mk) do
+            NCDataset(era5_file(mk[1])) do e
+                lon, lat = mod.(f64(e["longitude"][:]), 360), f64(e["latitude"][:])
+                t = e["valid_time"][:]
+                sel = findall(d -> monthkey(d) == mk, t)
+                isempty(sel) && error("$(era5_file(mk[1])) has no hours in $mk")
+                P = dropdims(mean(f64(e["msl"].var[:, :, first(sel):last(sel)]); dims = 3); dims = 3)
+                P[[argmin(abs.(lon .- mod(x, 360))) for x in λ], [argmin(abs.(lat .- y)) for y in φ]]
+            end
+        end
+    end
+    has_ib(mk) = !IB || era5_file(mk[1]) !== nothing
+    "B-SOSE's ETAN for record n, with its inverse-barometer part removed when IB is on."
+    function bsose_dyn(n)
+        H = bsose_on_run(n)
+        IB || return H
+        X = msl_on_run(bmk[n]) ./ ρ₀g
+        X[.!isfinite.(H)] .= NaN
+        return H .+ (X .- nanmean(X))
+    end
+    IB && isempty(era5_names) && error("IB=1 needs ERA5 msl in $ERA5_DIR (mean_sea_level_pressure_<YYYY>_*.nc); IB=0 compares the raw ETAN")
+
+
     # ── the run's η, rebuilt if the file holds η Δz / H (see the header) ─────────────────────────
     stamps = DateTime.(bs["time"][:])
     n0 = argmin(abs.(Dates.value.(stamps .- start)))
@@ -196,10 +234,10 @@ function main()
     end
 
     # ── the datum: one offset putting B-SOSE's mean fronts on CTOH's over the months both cover ──
-    common = [k for k in bmk if all(haskey(ctoh[f[1]], k) for f in FRONTS)]
+    common = [k for k in bmk if all(haskey(ctoh[f[1]], k) for f in FRONTS) && has_ib(k)]
     isempty(common) && error("B-SOSE and CTOH share no month")
     Hmean = zeros(length(λ), length(φ))
-    for k in common; Hmean .+= bsose_on_run(findfirst(==(k), bmk)); end
+    for k in common; Hmean .+= bsose_dyn(findfirst(==(k), bmk)); end
     Hmean ./= length(common)
     keepH = Hmean[keepi, :]
     ctoh_mean = [mean(ctoh[f[1]][k] for k in common) for f in FRONTS]
@@ -219,7 +257,8 @@ function main()
     rows = NamedTuple[]
     for mk in rmonths
         nb = findfirst(==(mk), bmk); nb === nothing && continue
-        Hb = bsose_on_run(nb); Hr = runm[mk]
+        has_ib(mk) || continue
+        Hb = bsose_dyn(nb); Hr = runm[mk]
         both = isfinite.(Hb) .& isfinite.(Hr)
         drift = mean(Hr[both]) - mean(Hb[both])                    # the run's domain-mean η against B-SOSE's
         Hr = Hr .- drift
@@ -241,6 +280,8 @@ function main()
             haskey(ENV, "OFFSET") ? "OFFSET" : "fitted", length(common))
     for (q, f) in enumerate(FRONTS); @printf("  %s %.2f (CTOH %.2f)", f[1], bfit[q], ctoh_mean[q]); end
     println("\n  run: ", note)
+    println(IB ? "  B-SOSE: ETAN + (p - p̄)/(ρ₀ g) from ERA5 msl, its inverse-barometer part removed (IB=0 for the raw ETAN)" :
+                 "  B-SOSE: raw ETAN, inverse-barometer part kept (IB=0)")
     println("  latitude °N (negative = south); Δη = zonal-mean η at $(STRENGTH_N) minus $(STRENGTH_S), m; drift = run's domain-mean η - B-SOSE's")
     println(bar)
     @printf("  %-8s", "month")
