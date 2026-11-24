@@ -40,12 +40,13 @@
 #     START        model time zero                     (default: the file's start_date attribute)
 #     MIN_DAYS     fewest days of output for a month               (default 20)
 #     MIDLON_ZMAX  depth drawn in the section maps, m, or "full"   (default 1000)
-#     T_LIM, S_LIM, ST_LIM, SS_LIM   colour limits for the surface / section maps (default: the
-#                  99th percentile of |Δ| over the months drawn)
+#     T_LIM, S_LIM, ST_LIM, SS_LIM   colour limits for the surface / section maps. Fixed by default so runs
+#                  compare figure to figure: surface T 2 °C, S 0.5 g/kg; section T 2 °C, S 0.3 g/kg.
+#                  "auto" = the 99th percentile of |Δ| over the months drawn (the old behaviour)
 #     CHUNK        B-SOSE months regridded at once                 (default 6)
 #     COAST_CELLS  a coastal cell is within this many cells of land (default 2)
 #     COAST_SOUTH_OF  only the coast south of this latitude        (default -60)
-#     COAST_S_LIM  colour limit of the coastal map, g/kg           (default: 99th percentile)
+#     COAST_S_LIM  colour limit of the coastal map, g/kg           (default 0.5; "auto" as above)
 # ==============================================================================
 
 using Oceananigans, Oceananigans.Units, Oceananigans.Grids
@@ -294,10 +295,22 @@ for (v, i, j) in ranked[1:min(15, end)]
 end
 println()
 
+# Colour limits are fixed by default so that figures from different runs compare directly; "auto" restores
+# the 99th percentile of |Δ| (each run then gets its own scale, and two runs' figures cannot be compared by eye).
+const DEFAULT_LIMS = Dict("T_LIM" => 2.0, "S_LIM" => 0.5, "ST_LIM" => 2.0, "SS_LIM" => 0.3, "COAST_S_LIM" => 0.5)
+function colour_limit(Ds, key)
+    spec = get(ENV, key, "")
+    isempty(spec) && return DEFAULT_LIMS[key]
+    spec != "auto" && return parse(Float64, spec)
+    v = filter(isfinite, abs.(reduce(vcat, vec.(Ds))))
+    return isempty(v) ? 1.0 : max(quantile(v, 0.99), 1e-6)
+end
+lim_note(key) = get(ENV, key, "") == "auto" ? " (99th percentile; $key=auto)." :
+                haskey(ENV, key) ? " (set by $key)." : " (fixed default, the same for every run; $key=auto to fit this run)."
+
 !isempty(surf_months) && let
     jsouth = findall(φ -> φ < COAST_SOUTH_OF, φc)
-    lim = haskey(ENV, "COAST_S_LIM") ? parse(Float64, ENV["COAST_S_LIM"]) :
-          max(quantile(filter(isfinite, abs.(vcat(vec(ΔS_all[:, jsouth]), vec(ΔS_summer[:, jsouth])))), 0.99), 1e-6)
+    lim = colour_limit([ΔS_all[:, jsouth], ΔS_summer[:, jsouth]], "COAST_S_LIM")
     fig = Figure(size = (1100, 640))
     Label(fig[0, 1], "$RUN — surface S, model − B-SOSE, south of $(Int(-COAST_SOUTH_OF))S", fontsize = 18, font = :bold)
     local hm
@@ -307,16 +320,11 @@ println()
         hm = heatmap!(ax, λc, φc[jsouth], D[:, jsouth], colormap = :balance, colorrange = (-lim, lim), nan_color = :gray80)
         contour!(ax, λc, φc[jsouth], Float64.(coastal[:, jsouth]), levels = [0.5], color = :black, linewidth = 0.8)
     end
-    Colorbar(fig[1:2, 2], hm, label = "ΔS (g/kg); red: model too salty")
+    Colorbar(fig[1:2, 2], hm, label = "ΔS (g/kg); red: model too salty; limit ±$(round(lim, sigdigits = 2))")
     f = joinpath(OUTDIR, "$(RUN)_coastal_salinity_bias.png"); save(f, fig); @info "wrote $f"
 end
 
 # ── figures ───────────────────────────────────────────────────────────────────────────────────
-function colour_limit(Ds, key)
-    haskey(ENV, key) && return parse(Float64, ENV[key])
-    v = filter(isfinite, abs.(reduce(vcat, vec.(Ds))))
-    return isempty(v) ? 1.0 : max(quantile(v, 0.99), 1e-6)
-end
 xticks_for(ms) = (n = length(ms); s = max(1, cld(n, 12)); (collect(1:s:n), [label(ms[i]) for i in 1:s:n]))
 
 # Surface maps, one per month
@@ -336,7 +344,7 @@ xticks_for(ms) = (n = length(ms); s = max(1, cld(n, 12)); (collect(1:s:n), [labe
         Colorbar(fig[1:nrow, ncol + 1], hm, label = "Δ$var ($unit)")
         Label(fig[nrow + 1, 1:ncol], "red: model too $hot; blue: too $cold. Grey: land in either bathymetry. " *
               "Colour limit ±$(round(lim, sigdigits = 2)) $unit" *
-              (haskey(ENV, key) ? " (set by $key)." : " (99th percentile of |Δ$var|; set $key to fix it)."), fontsize = 11)
+              lim_note(key), fontsize = 11)
         f = joinpath(OUTDIR, "$(RUN)_surface_bias_$(var).png"); save(f, fig); @info "wrote $f"
     end
 
@@ -376,7 +384,7 @@ end
         Label(fig[nrow + 1, 1:ncol], "red: model too $hot; blue: too $cold. Grey: land in either bathymetry. " *
               (isinf(ZMAX) ? "Full depth. " : "Upper $(round(Int, ZMAX)) m (MIDLON_ZMAX). ") *
               "Colour limit ±$(round(lim, sigdigits = 2)) $unit" *
-              (haskey(ENV, key) ? " (set by $key)." : " (99th percentile of |Δ$var| drawn; set $key to fix it)."), fontsize = 11)
+              lim_note(key), fontsize = 11)
         f = joinpath(OUTDIR, "$(RUN)_midlon_bias_$(var).png"); save(f, fig); @info "wrote $f"
     end
 
