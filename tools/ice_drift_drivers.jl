@@ -8,7 +8,7 @@
 # winters the run sent 1395 km³ of ice north across 65S, B-SOSE 139, at about the same h·ℵ: the run's
 # ice moves north at 1-4 cm/s, B-SOSE's at about 0. The ice that crosses melts in 65-60S.
 #
-# WHAT, per line (LINES, default 65S and 58S) and calendar month:
+# WHAT, per line (DRIFT_LINES, default 65S and 58S) and calendar month:
 #   VELOCITIES at the line, both components, cm/s (wind m/s):
 #     ice     run: daily snapshots of u, v (<RUN>_sea_ice.nc), mean over iced faces (h·ℵ > 0.01 m);
 #             B-SOSE: 5-day SIuice, SIvice, mean over iced faces (SIheff > 0.01 m)
@@ -33,7 +33,8 @@
 #
 # WRITES OUTDIR/<RUN>_ice_drift_drivers.png: per line, the monthly v of ice, ocean (both) and wind,
 # and B-SOSE's oceTAUY against ERA5 over open and compact faces.
-# ENV: DIR, OUTDIR, BSOSE_DIR, ERA5_DIR, LINES (-65,-58), WINTER (6,7,8,9,10)
+# ENV: DIR, OUTDIR, BSOSE_DIR, ERA5_DIR, DRIFT_LINES (-65,-58), WINTER (6,7,8,9,10)
+# (not LINES: Julia reads LINES as the terminal height, and "-63,-60" there breaks its own printing)
 # ==============================================================================================
 
 using NCDatasets, CairoMakie, Dates, Printf, Statistics
@@ -47,7 +48,7 @@ OUTDIR    = get(ENV, "OUTDIR", "plots")
 BSOSE_DIR = get(ENV, "BSOSE_DIR", "")
 isempty(BSOSE_DIR) && error("set BSOSE_DIR")
 ERA5_DIR  = get(ENV, "ERA5_DIR", joinpath(BSOSE_DIR, "era5"))
-LINES     = sort(parse.(Float64, split(get(ENV, "LINES", "-65,-58"), ',')))
+LINES     = sort(parse.(Float64, split(get(ENV, "DRIFT_LINES", "-65,-58"), ',')))
 WINTER    = parse.(Int, split(get(ENV, "WINTER", "6,7,8,9,10"), ','))
 const ρₐ = 1.225
 const ICED = 0.01
