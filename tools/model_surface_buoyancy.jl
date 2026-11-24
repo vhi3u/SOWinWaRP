@@ -83,6 +83,13 @@ const BDIR   = get(ENV, "BSOSE_DIR", "data")
 const OUTDIR = get(ENV, "OUTDIR", "plots")
 const S0     = parse(Float64, get(ENV, "S0", "34.0"))
 const BOX    = Tuple(parse.(Float64, split(get(ENV, "BOX", "130,150,-70,-65"), ",")))
+# The coastal fresh water (Hammond & Jones: ice-shelf melt, icebergs, runoff) is a separate salinity forcing in the
+# run, -S F/(ρ₀ Δz) in the top cell, not part of freshwater_flux; B-SOSE's oceFWflx holds its runoff. So it is added
+# to the model's salt flux here as S_top F/ρ₀ (constant in time), from the file the run used, with a "move" file's
+# land cells spread over the wet cells within REACH cells as src/coastal_freshwater.jl does. COASTAL="" leaves it out.
+const COASTAL = get(ENV, "COASTAL", "coastal_freshwater_hj.nc")
+const REACH   = parse(Int, get(ENV, "REACH", "6"))
+const ρ₀_COASTAL = 1026.0                                # src/coastal_freshwater.jl's COASTAL_ρ₀
 mkpath(OUTDIR)
 
 const LON   = (90.0, 150.0)
@@ -136,6 +143,37 @@ const M = let
     centres = [start + Millisecond(round(Int, 1000 * (x - win / 2))) for x in tf]
     (; lon, lat, wet = bh .< 0, tf, ts, start, win, keep, centres, sw_in)
 end
+"""The run's coastal fresh water on its grid, kg m⁻² s⁻¹ (+ into the ocean), and its total in Gt/yr."""
+function coastal_field(lon, lat, wet)
+    isempty(COASTAL) && return zeros(size(wet)), 0.0, "none (COASTAL=\"\")"
+    isfile(COASTAL) || error("$COASTAL not found; run from the repo root, set COASTAL to the file the run used, or COASTAL=\"\" for a run without one")
+    F, flon, flat, move = NCDataset(COASTAL) do d
+        f64(d["freshwater_flux"][:, :]), f64(d["lon"][:]), f64(d["lat"][:]), startswith(lowercase(get(d.attrib, "on_land", "")), "move")
+    end
+    F = replace(F, NaN => 0.0)
+    Nx, Ny = size(wet)
+    (size(F) == (Nx, Ny) && maximum(abs, flon .- lon) < 1e-6 && maximum(abs, flat .- lat) < 1e-6) ||
+        error("$COASTAL is not on the run's grid")
+    area = [cosd(lat[j]) for i in 1:Nx, j in 1:Ny]
+    G = ifelse.(wet, F, 0.0)
+    if move
+        for I in CartesianIndices(F)
+            (wet[I] || F[I] <= 0) && continue
+            i, j = Tuple(I)
+            ts = [(ii, jj) for di in -REACH:REACH, dj in -REACH:REACH for (ii, jj) in ((i + di, j + dj),)
+                  if 1 <= ii <= Nx && 1 <= jj <= Ny && wet[ii, jj] && (di * cosd(lat[j]))^2 + dj^2 <= REACH^2]
+            isempty(ts) && continue
+            ΔF = F[I] * area[I] / sum(area[t...] for t in ts)
+            for t in ts; G[t...] += ΔF; end
+        end
+    end
+    gt = sum(G .* area) * (6.371e6 * deg2rad(lon[2] - lon[1])) * (6.371e6 * deg2rad(lat[2] - lat[1])) * 365.25 * 86400 / 1e12
+    return G, gt, move ? "land cells spread within $REACH cells" : "land cells zeroed"
+end
+const COAST_F, COAST_GT, COAST_NOTE = coastal_field(M.lon, M.lat, M.wet)
+@info @sprintf("coastal fresh water %s: %.0f Gt/yr on the run's wet cells (%s); added to the model's salt flux as S_top F/ρ₀",
+               isempty(COASTAL) ? "left out" : "from $COASTAL", COAST_GT, COAST_NOTE)
+
 @info M.sw_in ? "the shortwave is IN this run's heat_flux (no penetrating shortwave): taking it out, so `heat` is non-solar" :
                 "the shortwave penetrated in this run: heat_flux is already non-solar"
 @info @sprintf("%s: %d daily flux means, %s to %s", basename(FLUXFILE), length(M.keep),
@@ -174,6 +212,7 @@ function model_window(a, b)
         k2 = searchsortedfirst(snaps, findmin(abs.(M.ts .- e))[2])
         @views Sday[:, :, d] .= 0.5 .* (Ss[:, :, k1] .+ Ss[:, :, k2])
     end
+    Jw = Jw .+ COAST_F ./ ρ₀_COASTAL                     # the run's coastal fresh water, applied apart from freshwater_flux
     Jsalt = dropdims(mean(JS .+ Sday .* Jw, dims = 3), dims = 3)   # positive out
     Tm = dropdims(mean(Ts, dims = 3), dims = 3)
     Sm = dropdims(mean(Ss, dims = 3), dims = 3)
