@@ -110,6 +110,7 @@ function main()
         for n in ns; acc .+= rd(n); end
         runm[mk] = acc ./ length(ns)
     end
+    early = [rd(n) for n in 1:min(31, length(days))]                    # the first month, day by day (see below)
     close(fs)
     isempty(runm) && error("no calendar month with $MIN_DAYS days of output in $path")
     rmonths = sort(collect(keys(runm)))
@@ -163,6 +164,18 @@ function main()
         runm[k] = H
     end
     @info note
+
+    # ── does the run's Δη start at B-SOSE's, or jump? Day by day over the first month ─────────────
+    # A ratio already off at day 0 points at the writer or the grid; one that grows over days is the run's own adjustment.
+    Δb0 = strength(B0[keepi, :], φ)
+    println(@sprintf("\n  Δη over the first month (m): B-SOSE at the start (%s) %.3f", Date(stamps[n0]), Δb0))
+    for n in [1, 2, 3, 4, 6, 8, 11, 16, 21, 31]
+        n > length(early) && break
+        H = early[n] .* scale; H[.!isfinite.(H)] .= NaN
+        landmask === nothing || (H[landmask] .= NaN)
+        Δr = strength(H[keepi, :], φ)
+        println(@sprintf("    day %2d (%s)  run %.3f  ratio %.3f", n - 1, Date(days[n]), Δr, Δr / Δb0))
+    end
 
     # ── CTOH: per calendar month, the median latitude over 91-149E of every weekly record in it ───
     lon_lo, lon_hi = λ[first(keepi)], λ[last(keepi)]
