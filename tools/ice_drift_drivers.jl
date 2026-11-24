@@ -33,7 +33,10 @@
 #
 # WRITES OUTDIR/<RUN>_ice_drift_drivers.png: per line, the monthly v of ice, ocean (both) and wind,
 # and B-SOSE's oceTAUY against ERA5 over open and compact faces.
-# ENV: DIR, OUTDIR, BSOSE_DIR, ERA5_DIR, DRIFT_LINES (-65,-58), WINTER (6,7,8,9,10)
+# ENV: DIR, OUTDIR, BSOSE_DIR, ERA5_DIR, DRIFT_LINES (-65,-58), WINTER (6,7,8,9,10), MIN_FACES (20)
+# MIN_FACES: a month's ice velocity (and B-SOSE's open/compact stress) is shown only if it averages at least that many
+# faces per record; fewer (the ice edge brushing the line in March or December) gave single-cell values like 26 cm/s.
+# The table prints the faces per record behind each ice mean, run and B-SOSE.
 # (not LINES: Julia reads LINES as the terminal height, and "-63,-60" there breaks its own printing)
 # ==============================================================================================
 
@@ -52,6 +55,7 @@ LINES     = sort(parse.(Float64, split(get(ENV, "DRIFT_LINES", "-65,-58"), ','))
 WINTER    = parse.(Int, split(get(ENV, "WINTER", "6,7,8,9,10"), ','))
 const ρₐ = 1.225
 const ICED = 0.01
+const MIN_FACES = parse(Int, get(ENV, "MIN_FACES", "20"))
 
 g(A) = Float64.(coalesce.(A, NaN))
 z(A) = replace(A, NaN => 0.0)
@@ -94,8 +98,10 @@ mk() = [Acc() for _ in 1:nl, _ in 1:nm]
 # ice: daily snapshots
 rd(name, n, js) = (v = ds[name]; g(ndims(v) == 4 ? v[:, js, 1, n] : v[:, js, n]))
 iu_r, iv_r = mk(), mk()
+nrec_r = zeros(Int, nm)                                        # run records per month
 for n in 1:Nt
     k = get(kof, ym_of(datetime(ts[n])), 0); k == 0 && continue
+    nrec_r[k] += 1
     for l in 1:nl
         j = jm[l]
         V = z(rd("h", n, j-1:j)) .* z(rd("ℵ", n, j-1:j))
@@ -221,6 +227,7 @@ end
 iu_b, iv_b, ou_b, ov_b = mk(), mk(), mk(), mk()
 sτ = Dict((c, s) => mk() for c in (:open, :compact) for s in (:bx, :by, :ex, :ey))   # B-SOSE oceTAU, ERA5 bulk
 nf = Dict(c => mk() for c in (:open, :compact))                                     # face-records counted
+nrec_b = zeros(Int, nm)                                                             # B-SOSE 5-day records per month
 for y in byears
     F = Dict(t => NCDataset(bfile(t, "$(y)_5day")) for t in fivetok)
     Uv = pick(F["SIuice"], ("SIuice", "SIUICE")); Vv = pick(F["SIvice"], ("SIvice", "SIVICE"))
@@ -236,6 +243,7 @@ for y in byears
     end
     for (n, s) in enumerate(stamps)
         c = s - Hour(60); k = get(kof, ym_of(c), 0); k == 0 && continue
+        nrec_b[k] += 1
         hrs = findall(t -> s - Day(5) < t <= s, etimes)
         for l in 1:nl
             j = jb[l]
@@ -279,22 +287,37 @@ else
     @warn "B-SOSE monthly Uvel/Vvel not readable: no B-SOSE ocean velocity"
 end
 
+# ── too few faces: blank the month ─────────────────────────────────────────────────────────────
+per(a, nrec) = nrec == 0 ? 0.0 : a.n / nrec
+fr = [per(iv_r[l, k], nrec_r[k]) for l in 1:nl, k in 1:nm]     # iced faces per record, run
+fb = [per(iv_b[l, k], nrec_b[k]) for l in 1:nl, k in 1:nm]     # and B-SOSE
+for l in 1:nl, k in 1:nm
+    fr[l, k] < MIN_FACES && (iu_r[l, k] = Acc(); iv_r[l, k] = Acc())
+    fb[l, k] < MIN_FACES && (iu_b[l, k] = Acc(); iv_b[l, k] = Acc())
+    for cls in (:open, :compact)
+        if per(nf[cls][l, k], nrec_b[k]) < MIN_FACES
+            foreach(s_ -> (sτ[(cls, s_)][l, k] = Acc()), (:bx, :by, :ex, :ey))
+        end
+    end
+end
+
 # ── tables ─────────────────────────────────────────────────────────────────────────────────────
 c(a) = 100 * val(a)                       # m/s -> cm/s
 bar = "="^150
 println("\n", bar)
 println("WHAT DRIVES THE ICE ACROSS EACH LINE, $RUN against B-SOSE")
 println("  velocities cm/s (wind m/s): ice over iced faces (h·ℵ > $ICED m), ocean = top cell over the line, wind = ERA5 10 m (the run's forcing)")
+println("  faces: iced faces per record behind each ice mean; months with fewer than $MIN_FACES (and stress classes with fewer) are left out (NaN)")
 println("  stress mN/m²: B-SOSE's oceTAU against ERA5 bulk (Large & Yeager neutral drag), same 5-day windows and faces;")
 println("  open faces (B-SOSE SIArea < 0.05): wind stress, so B-SOSE's wind against ERA5; compact (> 0.8): what B-SOSE's ice passes to the ocean")
 println(bar)
 for l in 1:nl
     @printf("\n  %s   (run face %.3f, B-SOSE face %.3f, ERA5 row %.2f)\n", lname(l), φm[l], φb[l], elat[ej[l]])
-    println("  month    |  ice u run B-SOSE |  ice v run B-SOSE | ocean u run B-SOSE | ocean v run B-SOSE | ERA5 u10  v10 || open: n  oceTAUX  ERA5  oceTAUY  ERA5 || compact: n  oceTAUX  ERA5  oceTAUY  ERA5")
+    println("  month    | faces run B-SOSE |  ice u run B-SOSE |  ice v run B-SOSE | ocean u run B-SOSE | ocean v run B-SOSE | ERA5 u10  v10 || open: n  oceTAUX  ERA5  oceTAUY  ERA5 || compact: n  oceTAUX  ERA5  oceTAUY  ERA5")
     for k in 1:nm
         o, p = :open, :compact
-        @printf("  %s  |  %6.2f  %6.2f |  %6.2f  %6.2f |   %6.2f  %6.2f  |   %6.2f  %6.2f  |  %6.2f %5.2f || %7d  %6.1f %6.1f  %6.1f %6.1f || %10d  %6.1f %6.1f  %6.1f %6.1f\n",
-                label(months[k]), c(iu_r[l, k]), c(iu_b[l, k]), c(iv_r[l, k]), c(iv_b[l, k]),
+        @printf("  %s  |  %6.0f  %6.0f  |  %6.2f  %6.2f |  %6.2f  %6.2f |   %6.2f  %6.2f  |   %6.2f  %6.2f  |  %6.2f %5.2f || %7d  %6.1f %6.1f  %6.1f %6.1f || %10d  %6.1f %6.1f  %6.1f %6.1f\n",
+                label(months[k]), fr[l, k], fb[l, k], c(iu_r[l, k]), c(iu_b[l, k]), c(iv_r[l, k]), c(iv_b[l, k]),
                 c(ou_r[l, k]), c(ou_b[l, k]), c(ov_r[l, k]), c(ov_b[l, k]), val(wu[l, k]), val(wv[l, k]),
                 nf[o][l, k].n, val(sτ[(o, :bx)][l, k]), val(sτ[(o, :ex)][l, k]), val(sτ[(o, :by)][l, k]), val(sτ[(o, :ey)][l, k]),
                 nf[p][l, k].n, val(sτ[(p, :bx)][l, k]), val(sτ[(p, :ex)][l, k]), val(sτ[(p, :by)][l, k]), val(sτ[(p, :ey)][l, k]))
@@ -313,7 +336,7 @@ println()
 mkpath(OUTDIR)
 x = 1:nm
 ticks = (x[1:3:end], label.(months)[1:3:end])
-fig = Figure(size = (1500, 320 * nl + 80), fontsize = 13)
+fig = Figure(size = (1500, 320 * nl + 140), fontsize = 13)
 Label(fig[0, 1:2], "$RUN: what drives the ice across each line"; font = :bold, fontsize = 15)
 for l in 1:nl
     ax = Axis(fig[l, 1]; title = "$(lname(l)): northward velocity", ylabel = "cm/s (wind: m/s)", xticks = ticks, xticklabelrotation = π/6)
@@ -324,7 +347,7 @@ for l in 1:nl
     lines!(ax, x, [c(ov_b[l, k]) for k in x]; color = :black, linestyle = :dash, label = "ocean, B-SOSE")
     lines!(ax, x, [val(wv[l, k]) for k in x]; color = :darkorange, label = "ERA5 v10 (m/s)")
     lines!(ax, x, [val(wu[l, k]) for k in x]; color = :darkorange, linestyle = :dot, label = "ERA5 u10 (m/s)")
-    l == 1 && axislegend(ax; position = :lt, backgroundcolor = (:white, 0.8), labelsize = 11)
+    l == nl && Legend(fig[nl+1, 1], ax; orientation = :horizontal, nbanks = 2, framevisible = false, labelsize = 11)
     ax2 = Axis(fig[l, 2]; title = "$(lname(l)): northward stress, B-SOSE oceTAUY against ERA5 bulk", ylabel = "mN/m²",
                xticks = ticks, xticklabelrotation = π/6)
     hlines!(ax2, [0]; color = :grey70)
@@ -332,6 +355,6 @@ for l in 1:nl
         lines!(ax2, x, [val(sτ[(cls, :by)][l, k]) for k in x]; color = col, linewidth = 2.5, label = "oceTAUY, $cls")
         lines!(ax2, x, [val(sτ[(cls, :ey)][l, k]) for k in x]; color = col, linestyle = :dash, label = "ERA5, $cls")
     end
-    l == 1 && axislegend(ax2; position = :lt, backgroundcolor = (:white, 0.8), labelsize = 11)
+    l == nl && Legend(fig[nl+1, 2], ax2; orientation = :horizontal, nbanks = 2, framevisible = false, labelsize = 11)
 end
 out = joinpath(OUTDIR, "$(RUN)_ice_drift_drivers.png"); save(out, fig); @info "wrote $out"
