@@ -17,13 +17,21 @@
 # not (tools/ib_check.jl); + (p - p̄)/(ρ₀ g) from ERA5 msl over the same 5 days is added back to B-SOSE. IB=0 skips it.
 # THE RUN'S η FILE. Runs before _iceobc wrote η Δz / H; as in front_position.jl, if record 1 has no gradient, η is
 # rebuilt as file × H / Δz, Δz fitted against B-SOSE's initial monthly ETAN (correlation must exceed 0.95).
+# SEA-ICE LOAD (ICE_LOAD=1, default): MITgcm's sea ice presses on the ocean, so B-SOSE's ETAN sits lower under ice by
+# its mass, (ρᵢ HEFF + ρₛ HSNOW)/ρ₀ (sIceLoad/rhoConst; ECCO's dynamic SSH adds it back). The runs' η has no such term
+# (NumericalEarth's barotropic potential is the atmosphere's pressure only). 5-day swings of coastal ice thickness then
+# read as 0.1-1 m of η: in a first pass, 65-70S EKE of 1773 cm²/s² in B-SOSE against 9 in the runs. So B-SOSE gets
+# + (910 SIheff + 330 SIhsnow)/1027 back (5-day files; snow left out if there is no SIhsnow file, with a warning), and
+# the tool prints how B-SOSE's ETAN follows -load across the windows where there is ice (slope 1 = full loading).
+# B-SOSE's rows are interpolated linearly in latitude onto the run's (its spacing is 0.06-0.12°, the run's 1/6°;
+# nearest rows gave uneven separations and striped EKE).
 # COMPARED CELLS: wet in B-SOSE and in every run, SIDE_DEG (1°) away from the west, east and north faces (the
 # relaxation band and the boundary forcing).
 #
 # WRITES OUTDIR/<RUN>_eke_maps.png (B-SOSE, each run, and log10 run/B-SOSE), OUTDIR/<RUN>_eke_profiles.png (zonal-mean
 # EKE by latitude; band EKE window by window). STDOUT: band means (cm²/s²), run/B-SOSE, year 1 and year 2.
 # ENV  DIR (.), OUTDIR (plots), BSOSE_DIR (required), ERA5_DIR ($BSOSE_DIR/era5), IB (1), SIDE_DEG (1.0),
-#      BANDS (-70,-65,-60,-55,-50,-45), SSH_TOKEN (SSH), MIN_DAYS (4).
+#      BANDS (-70,-65,-60,-55,-50,-45), SSH_TOKEN (SSH), MIN_DAYS (4), ICE_LOAD (1), ICE_TOKEN (SIheff), SNOW_TOKEN (SIhsnow).
 # ==============================================================================================
 
 using NCDatasets, CairoMakie, Dates, Printf, Statistics
@@ -44,6 +52,10 @@ const SIDE_DEG  = parse(Float64, get(ENV, "SIDE_DEG", "1.0"))
 const EDGES     = parse.(Float64, split(get(ENV, "BANDS", "-70,-65,-60,-55,-50,-45"), ','))
 const TOKEN     = get(ENV, "SSH_TOKEN", "SSH")
 const MIN_DAYS  = parse(Int, get(ENV, "MIN_DAYS", "4"))
+const ICE_LOAD  = get(ENV, "ICE_LOAD", "1") != "0"
+const ICE_TOKEN = get(ENV, "ICE_TOKEN", "SIheff")
+const SNOW_TOKEN = get(ENV, "SNOW_TOKEN", "SIhsnow")
+const ρᵢ, ρₛ, ρ₀ = 910.0, 330.0, 1027.0
 const g, Ω, R   = 9.81, 7.2921e-5, 6.371e6
 const ρ₀g       = 1027.0 * 9.81
 
@@ -137,6 +149,21 @@ function bsose_5day_records(years)
     return recs
 end
 
+"Stamp => (path, variable, record) for a B-SOSE 5-day token, over `years`; empty if no file."
+function bsose_5day_index(token, years)
+    idx = Dict{DateTime, Tuple{String, String, Int}}()
+    for y in years
+        hits = filter(f -> lowercase(f) == lowercase("$(token)_bsoseI156_$(y)_5day.nc"), readdir(BSOSE_DIR))
+        isempty(hits) && continue
+        p = joinpath(BSOSE_DIR, first(hits))
+        NCDataset(p) do d
+            v = first(k for k in keys(d) if ndims(d[k]) >= 3)
+            for (n, s) in enumerate(d["time"][:]); idx[DateTime(s)] = (p, v, n); end
+        end
+    end
+    return idx
+end
+
 function msl_window(t0, t1, λ, φ)
     y = year(t0)
     fs = filter(f -> startswith(f, "mean_sea_level_pressure_$(y)_") && endswith(f, ".nc"), readdir(ERA5_DIR))
@@ -179,15 +206,26 @@ function main()
     recs = filter(r -> r[4] >= first_day - Day(1) && r[5] <= last_day + Day(1), bsose_5day_records(year(first_day):year(last_day)))
     IB && !isdir(ERA5_DIR) && error("IB=1 needs ERA5 msl in $ERA5_DIR; IB=0 skips the inverse-barometer correction")
 
-    # B-SOSE's columns: its longitudes are the run's cell centres; nearest latitude row
+    # B-SOSE's columns: its longitudes are the run's cell centres; its rows interpolated linearly to the run's latitudes
     # (coordinates and seafloor from the monthly SSH file, the same 2160 x 588 grid as the 5-day files)
-    XC, YC, wetB = NCDataset(joinpath(BSOSE_DIR, "SSH_bsoseI156_2013to2024_monthly.nc")) do d
-        X, Y = mod.(f64(d["XC"][:]), 360), f64(d["YC"][:])
-        ib = [argmin(abs.(X .- mod(x, 360))) for x in λ]; jb = [argmin(abs.(Y .- y)) for y in φ]
-        X, Y, f64(d["Depth"][:, :])[ib, jb] .> 0
+    XC, YC, Depth = NCDataset(joinpath(BSOSE_DIR, "SSH_bsoseI156_2013to2024_monthly.nc")) do d
+        mod.(f64(d["XC"][:]), 360), f64(d["YC"][:]), f64(d["Depth"][:, :])
     end
-    ib = [argmin(abs.(XC .- mod(x, 360))) for x in λ]; jb = [argmin(abs.(YC .- y)) for y in φ]
-    jr = minimum(jb):maximum(jb)
+    ib = [argmin(abs.(XC .- mod(x, 360))) for x in λ]
+    j0 = [clamp(searchsortedlast(YC, y), 1, length(YC) - 1) for y in φ]
+    wj = [clamp((φ[k] - YC[j0[k]]) / (YC[j0[k]+1] - YC[j0[k]]), 0.0, 1.0) for k in eachindex(φ)]
+    jr = minimum(j0):maximum(j0) + 1
+    onrun(S) = (a = S[ib, j0 .- first(jr) .+ 1]; b = S[ib, j0 .- first(jr) .+ 2]; a .* (1 .- wj') .+ b .* wj')   # S: rows jr
+    wetB = (Depth[ib, j0] .> 0) .& (Depth[ib, j0 .+ 1] .> 0)
+    years = year(first_day):year(last_day)
+    ice_idx  = ICE_LOAD ? bsose_5day_index(ICE_TOKEN, years) : Dict{DateTime, Tuple{String, String, Int}}()
+    snow_idx = ICE_LOAD ? bsose_5day_index(SNOW_TOKEN, years) : Dict{DateTime, Tuple{String, String, Int}}()
+    ICE_LOAD && isempty(ice_idx) && error("ICE_LOAD=1 needs B-SOSE's 5-day $(ICE_TOKEN)_bsoseI156_<year>_5day.nc in $BSOSE_DIR (ICE_LOAD=0 skips it)")
+    ICE_LOAD && isempty(snow_idx) && @warn "no $(SNOW_TOKEN)_bsoseI156_<year>_5day.nc: the sea-ice load added back to B-SOSE leaves out snow"
+    read2d(path, var, n) = NCDataset(path) do d
+        A = d[var]; onrun(f64(ndims(A) == 4 ? A[:, jr, 1, n] : A[:, jr, n]))
+    end
+    loads = Matrix{Float64}[]; etans = Matrix{Float64}[]; nload = 0
 
     keep = [x - λ[1] >= SIDE_DEG && λ[end] - x >= SIDE_DEG for x in λ] .* [y <= φ[end] - SIDE_DEG for y in φ]'
     nr = length(runs)
@@ -198,9 +236,7 @@ function main()
     for (p, var, n, t0, t1) in recs
         rw = [run_window(r, t0, t1) for r in runs]
         any(isnothing, rw) && continue
-        B = NCDataset(p) do d
-            A = d[var]; f64(ndims(A) == 4 ? A[:, jr, 1, n] : A[:, jr, n])[ib, jb .- first(jr) .+ 1]
-        end
+        B = read2d(p, var, n)
         B[.!wetB] .= NaN
         if IB
             P = msl_window(t0, t1, λ, φ)
@@ -209,17 +245,43 @@ function main()
                 B .+= X .- nanmean(X); nib += 1
             end
         end
+        if ICE_LOAD
+            stamp = t1
+            if haskey(ice_idx, stamp)
+                L = ρᵢ .* coalesce.(read2d(ice_idx[stamp]...), 0.0)
+                haskey(snow_idx, stamp) && (L .+= ρₛ .* coalesce.(read2d(snow_idx[stamp]...), 0.0))
+                L = replace(L ./ ρ₀, NaN => 0.0)
+                push!(etans, copy(B)); push!(loads, L)
+                B .+= L; nload += 1
+            end
+        end
         push!(wins, (t0, t1)); push!(Hs[1], B)
         for k in 1:nr; push!(Hs[k+1], rw[k]); end
     end
     nw = length(wins)
     nw < 10 && error("only $nw 5-day windows in common between B-SOSE and the runs")
-    @info "$nw 5-day windows, $(wins[1][1]) to $(wins[end][2]); inverse barometer removed from B-SOSE in $nib of them$(IB ? "" : " (IB=0)")"
+    @info "$nw 5-day windows, $(wins[1][1]) to $(wins[end][2]); inverse barometer removed from B-SOSE in $nib of them$(IB ? "" : " (IB=0)"), sea-ice load added back in $nload$(ICE_LOAD ? "" : " (ICE_LOAD=0)")"
 
     # compared cells: finite in every source and every window, away from the open faces
     mask = copy(keep)
     for H in Hs, A in H; mask .&= isfinite.(A); end
     @info "$(count(mask)) compared cells"
+
+    # does B-SOSE's ETAN carry the ice load? Per cell with ice, ETAN' against -load' across the windows
+    load_fit = nothing
+    if length(loads) >= 10
+        Lm = sum(loads) ./ length(loads)
+        icy = mask .& (Lm .> 0.2 * ρᵢ / ρ₀)                            # mean ice thicker than 0.2 m
+        dm(X) = (Y = copy(X); Y[.!mask] .= NaN; Y .- nanmean(Y))
+        Ea = [dm(E) for E in etans]; La = [L .- nanmean(ifelse.(mask, L, NaN)) for L in loads]
+        Em = sum(Ea) ./ length(Ea); Lam = sum(La) ./ length(La)
+        slopes = Float64[]
+        for c in findall(icy)
+            x = [-(L[c] - Lam[c]) for L in La]; y = [E[c] - Em[c] for E in Ea]
+            sum(abs2, x) > 0 && push!(slopes, sum(x .* y) / sum(abs2, x))
+        end
+        isempty(slopes) || (load_fit = (count(icy), quantile(slopes, 0.25), median(slopes), quantile(slopes, 0.75)))
+    end
 
     # anomalies: each window's mean over the compared cells removed, then each source's time mean
     eke = Matrix{Float64}[]; series = Matrix{Float64}[]          # per source: EKE map; band × window EKE
@@ -253,7 +315,10 @@ function main()
     println("\n", bar)
     println("SURFACE GEOSTROPHIC EKE from 5-day mean SSH, cm²/s², $(round(λ[1], digits=1))-$(round(λ[end], digits=1))E, $nw windows ",
             "($(Date(wins[1][1])) to $(Date(wins[end][2]))); $(count(mask)) cells, $(SIDE_DEG)° off the open faces")
-    println("  B-SOSE: 5-day ETAN", IB ? " + (p - p̄)/(ρ₀ g) (its inverse barometer removed)" : " as is (IB=0)")
+    println("  B-SOSE: 5-day ETAN", IB ? " + (p - p̄)/(ρ₀ g) (inverse barometer removed)" : "",
+            ICE_LOAD ? " + (ρᵢ SIheff + ρₛ SIhsnow)/ρ₀ (sea-ice load added back)" : "", IB || ICE_LOAD ? "" : " as is")
+    load_fit === nothing || @printf("  ice load check: in %d cells with ice, B-SOSE's raw ETAN' against -load': median slope %.2f (quartiles %.2f to %.2f); 1 = ETAN carries the full load\n",
+                                    load_fit[1], load_fit[3], load_fit[2], load_fit[4])
     println(bar)
     @printf("  %-9s | %9s", "band", "B-SOSE")
     for r in runs; @printf(" | %-22s", first(r.name, 22)); end
