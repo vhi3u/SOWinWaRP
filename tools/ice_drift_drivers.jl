@@ -147,8 +147,8 @@ function era5_files(short)
     for (y, c) in cand
         sort!(c; rev = true)
         out[y] = c[1][2]
-        length(c) > 1 && @warn "ERA5 $short $y: $(length(c)) files; using $(basename(c[1][2])) ($(c[1][1]) h), not " *
-                               join(["$(basename(f)) ($n h)" for (n, f) in c[2:end]], ", ")
+        length(c) > 1 && @info "ERA5 $short $y: using $(basename(c[1][2])) ($(c[1][1]) h); $(length(c) - 1) shorter file(s) " *
+                               "for that year ignored (e.g. $(basename(c[end][2])), $(c[end][1]) h)"
     end
     return out
 end
