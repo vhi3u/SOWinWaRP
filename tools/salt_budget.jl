@@ -88,7 +88,11 @@ function run_budget(run)
          NCDataset(d -> fill0(d["bottom_height"][:, :]), joinpath(DIR, "$(run)_surface.nc"))
     start = DateTime(string(eke.attrib["start_date"]))
     window = haskey(eke.attrib, "averaging_window_seconds") ? Float64(eke.attrib["averaging_window_seconds"]) : 30DAY
-    hj = occursin("hammond", lowercase(string(get(eke.attrib, "coastal_freshwater", ""))))
+    # the run ADDED Hammond & Jones as a forcing (not in its flux file): _ibobc's "constant, from coastal_freshwater_hj.nc
+    # (Hammond & Jones 2016)". _bsoseflux's "none added (Hammond & Jones is inside oceFWflx)" must not count.
+    cf = lowercase(string(get(eke.attrib, "coastal_freshwater", "")))
+    hj = occursin("hammond", cf) && !startswith(cf, "none")
+    @info "$run: coastal_freshwater metadata \"$cf\" -> Hammond & Jones $(hj ? "ADDED to" : "not added to") the surface term"
     tend = f64(eke["time"][:])
     recs = findall(>(0), tend)
     times = [start + Millisecond(round(Int, 1000 * (t - window / 2))) for t in tend[recs]]
