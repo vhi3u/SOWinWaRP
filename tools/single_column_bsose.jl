@@ -61,7 +61,17 @@
 #                           enhanced diffusion 100 m²/s where N² < 0. Its own backgrounds; a single closure (no tuple).
 #               nemo_glorys the same with GLORYS12's NEMO 3.1 settings: Cᵉᵇ 3.75 (no waves), ℓ₀ᵐⁱⁿ 0.4 m, ℓᵐⁱⁿ 0.1 m,
 #                           Riᶜ 0.2, νᵇ 1e-4, κᵇ 1e-5, e₀ᵐⁱⁿ 1e-4 (the settings passed on from the Arctic thread)
-#               nemo[_glorys]_<opts> either with ebb<x> (Cᵉᵇ), nub<x> (νᵇ), kb<x> (κᵇ), joined by "_"
+#               nemo_bsose  B-SOSE i156's own GGL90 (namelist from M. Mazloff, 2026-11-24: GGL90alpha 30, GGL90TKEmin 1e-7,
+#                           GGL90TKEbottom 1e-6, mxlMaxFlag 2, mxlSurfFlag true; the rest MITgcm defaults: ck 0.1, ceps 0.7,
+#                           m2 3.75, TKEsurfMin 1e-4, mixingLengthMin 1e-8, Pr 1 below Ri 0.2 else min(5Ri, 10), visc/diff
+#                           max 100) over the runs' backgrounds νz 1e-3, κz 1e-5. NEMO's scheme is the same equations with
+#                           ck = Cᵏ, ceps = Cᴰ, m2 = Cᵉᵇ, Riᶜ 0.2 (Pr = Ri/Riᶜ), mxlMaxFlag 2 = nn_mxl 2. Two pieces are
+#                           added here: GGL90alpha, the TKE diffusivity over the viscosity (MITgcm ggl90_calc.F: KappaE =
+#                           GGL90alpha * KappaM; NEMO's is 1), by a method on the Float64 NEMO closure; and mxlSurfFlag
+#                           (ggl90_mixinglength.F: the length on the face below the top cell is the top cell's thickness),
+#                           approximated by NEMO's surface length floor ℓ₀ᵐⁱⁿ = the top cell's thickness.
+#               nemo[_glorys|_bsose]_<opts> with ebb<x> (Cᵉᵇ), nub<x> (νᵇ), kb<x> (κᵇ), alpha<x> (TKE diffusivity / viscosity),
+#                           joined by "_" (e.g. nemo_bsose_alpha1 isolates GGL90alpha)
 #                           NEMO needs Oceananigans' fjp/nemo-tke branch (0.118.2): run with --project=tools/nemo_tke
 #                           (see tools/nemo_tke/README.md). The CATKE schemes run in either environment.
 #               kepsilon    Oceananigans' k-ε (TKEDissipationVerticalDiffusivity), WITHOUT the backgrounds:
@@ -488,23 +498,49 @@ function build_closure(name, f)
     error("unknown closure '$name' (catke, catke_bare, catke_<cwu|cs|cap><x>..., nemo[_glorys][_<ebb|nub|kb><x>...], kepsilon, ri)")
 end
 
-"NEMO's TKE scheme (Oceananigans branch fjp/nemo-tke): nemo, nemo_glorys, either with _ebb<x>, _nub<x>, _kb<x>."
+# GGL90alpha for NEMO's scheme: κᵉ = α × Cᵏ ℓ √e instead of NEMO's α = 1. α is read from a Ref at run time (CPU only),
+# set by nemo_closure for the closure about to run: the columns run one scheme at a time. TOP_DZ is the column's top
+# cell, for mxlSurfFlag.
+const GGL_ALPHA = Ref(1.0)
+const TOP_DZ = Ref(NaN)
+if isdefined(TKEVD, :NEMOMixingLength)
+    @eval begin
+        const NEMO64 = CATKEVerticalDiffusivity{<:Any, <:TKEVD.NEMOMixingLength{Float64}, <:Any, <:Any, <:TKEVD.NEMOTKEEquation{Float64}}
+        @inline function TKEVD.κeᶜᶜᶠ(i, j, k, grid, closure::NEMO64, velocities, tracers, buoyancy, closure_fields)
+            K = TKEVD.nemo_eddy_diffusivityᶜᶜᶠ(i, j, k, grid, closure, tracers, closure_fields)
+            κe = max(GGL_ALPHA[] * K, closure.mixing_length.νᵇ)
+            return min(κe, closure.maximum_tke_diffusivity)
+        end
+    end
+end
+
+"NEMO's TKE scheme (Oceananigans branch fjp/nemo-tke): nemo, nemo_glorys, nemo_bsose, with _ebb<x>, _nub<x>, _kb<x>, _alpha<x>."
 function nemo_closure(name)
     isdefined(TKEVD, :NEMOTKEVerticalDiffusivity) ||
         error("'$name' needs Oceananigans' NEMO TKE (branch fjp/nemo-tke, $(pkgversion(Oceananigans)) loaded): " *
               "run with julia --project=tools/nemo_tke (tools/nemo_tke/README.md)")
-    glorys = startswith(name, "nemo_glorys")
-    rest = name[(glorys ? length("nemo_glorys") : length("nemo")) + 1:end]
-    ml = glorys ? Dict{Symbol, Float64}(:Cᴿ => 0.0, :ℓᵐⁱⁿ => 0.1, :ℓ₀ᵐⁱⁿ => 0.4, :Riᶜ => 0.2, :Prᵐᵃˣ => 10.0, :νᵇ => 1e-4, :κᵇ => 1e-5) :
-                  Dict{Symbol, Float64}()
-    eq = glorys ? Dict{Symbol, Float64}(:Cᴰ => 0.7, :Cᵉᵇ => 3.75, :e₀ᵐⁱⁿ => 1e-4) : Dict{Symbol, Float64}()
-    for tok in filter(!isempty, split(rest, '_'))
-        m = match(r"^(ebb|nub|kb)([0-9.eE+-]+)$", tok)
-        m === nothing && error("unknown nemo option '$tok' in '$name' (ebb<x>, nub<x>, kb<x>)")
-        x = parse(Float64, m[2])
-        m[1] == "ebb" ? (eq[:Cᵉᵇ] = x) : (ml[m[1] == "nub" ? :νᵇ : :κᵇ] = x)
+    flavour = startswith(name, "nemo_glorys") ? :glorys : startswith(name, "nemo_bsose") ? :bsose : :nemo
+    rest = name[length(flavour === :nemo ? "nemo" : "nemo_$(flavour)") + 1:end]
+    ml, eq, α, emin = if flavour === :glorys
+        Dict{Symbol, Float64}(:Cᴿ => 0.0, :ℓᵐⁱⁿ => 0.1, :ℓ₀ᵐⁱⁿ => 0.4, :Riᶜ => 0.2, :Prᵐᵃˣ => 10.0, :νᵇ => 1e-4, :κᵇ => 1e-5),
+        Dict{Symbol, Float64}(:Cᴰ => 0.7, :Cᵉᵇ => 3.75, :e₀ᵐⁱⁿ => 1e-4), 1.0, 0.7071e-6
+    elseif flavour === :bsose
+        isfinite(TOP_DZ[]) || error("nemo_bsose: the column's top cell thickness is not set")
+        Dict{Symbol, Float64}(:Cᵏ => 0.1, :Cᴿ => 0.0, :ℓᵐⁱⁿ => 1e-8, :ℓ₀ᵐⁱⁿ => TOP_DZ[], :Riᶜ => 0.2, :Prᵐᵃˣ => 10.0,
+                              :νᵇ => 1e-3, :κᵇ => KAPPA_Z, :κᵉᵛᵈ => 100.0),
+        Dict{Symbol, Float64}(:Cᴰ => 0.7, :Cᵉᵇ => 3.75, :e₀ᵐⁱⁿ => 1e-4), 30.0, 1e-7
+    else
+        Dict{Symbol, Float64}(), Dict{Symbol, Float64}(), 1.0, 1e-6
     end
-    emin = glorys ? 0.7071e-6 : 1e-6
+    for tok in filter(!isempty, split(rest, '_'))
+        m = match(r"^(ebb|nub|kb|alpha)([0-9.eE+-]+)$", tok)
+        m === nothing && error("unknown nemo option '$tok' in '$name' (ebb<x>, nub<x>, kb<x>, alpha<x>)")
+        x = parse(Float64, m[2])
+        m[1] == "ebb" ? (eq[:Cᵉᵇ] = x) : m[1] == "alpha" ? (α = x) : (ml[m[1] == "nub" ? :νᵇ : :κᵇ] = x)
+    end
+    GGL_ALPHA[] = α
+    @info @sprintf("%s: NEMO TKE, TKE diffusivity/viscosity α = %g, minimum TKE %g, %s", name, α, emin,
+                   join(("$k=$v" for (k, v) in merge(ml, eq)), ", "))
     return TKEVD.NEMOTKEVerticalDiffusivity(; mixing_length = TKEVD.NEMOMixingLength(; ml...),
                                             turbulent_kinetic_energy_equation = TKEVD.NEMOTKEEquation(; eq...),
                                             minimum_tke = emin)
@@ -518,6 +554,7 @@ snapshots at the run's edges (nk × nr+1: the start, then the end of each window
 function run_column(name, zf, Tinit, Sinit, φc, p, edges)
     nk, nr = length(Tinit), length(edges) - 1
     grid = RectilinearGrid(CPU(); size = nk, z = zf, topology = (Flat, Flat, Bounded))
+    TOP_DZ[] = zf[end] - zf[end-1]
     bcs = (T = FieldBoundaryConditions(top = FluxBoundaryCondition(Jᵀ; discrete_form = true, parameters = p)),
            S = FieldBoundaryConditions(top = FluxBoundaryCondition(Jˢ; discrete_form = true, parameters = p)),
            u = FieldBoundaryConditions(top = FluxBoundaryCondition(Jᵘ; discrete_form = true, parameters = p)),
