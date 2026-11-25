@@ -134,6 +134,10 @@
 #   KAPPA_Z    background κz of catke and ri, m²/s (default 1e-5 since 2026-11-22: B-SOSE i156's, and the runs' since
 #              _k1e5; every single-column result before that used 1e-4)
 #   Figures of a non-default STRESS or KAPPA_Z are named single_column_<column>_<STRESS>[_k<KAPPA_Z>]*.png
+#   RUN_HEAT   a 3-D run's <RUN>_surface_fluxes.nc: its daily non-solar heat flux and shortwave, box-mean, averaged
+#              over each 5-day window, replace B-SOSE's TFLUX and oceQsw (salt stays B-SOSE's: the run's virtual salt
+#              flux would count the dilution B-SOSE's lateral supply already carries). Is the 3-D run's deep momentum
+#              its own stronger winter cooling? Figures tagged _runheat. The budget's "forcing" is then the run's heat.
 #   FIG_TAG    appended to every figure name (e.g. _nemo, so two environments can share an OUTDIR and its budget cache)
 #   EK_DEPTH   depth of the Ekman integral, m (default 200)    EK_REF  reference layer, m (default 200,300)
 # ==============================================================================================
@@ -171,7 +175,8 @@ STRESS in STRESSES || error("STRESS must be one of $(join(STRESSES, ", ")), got 
 const KAPPA_Z  = parse(Float64, get(ENV, "KAPPA_Z", "1e-5"))
 const ERA5_DIR = get(ENV, "ERA5_DIR", joinpath(get(ENV, "BSOSE_DIR", ""), "era5"))
 const TAG      = (STRESS == "bsose" ? "" : "_$STRESS") * (STRESS == "era5_6hourly_smooth" ? "$(SMOOTH_DEG)" : "") * (KAPPA_Z == 1e-5 ? "" : "_k$(KAPPA_Z)") *
-                 get(ENV, "FIG_TAG", "")
+                 (isempty(get(ENV, "RUN_HEAT", "")) ? "" : "_runheat") * get(ENV, "FIG_TAG", "")
+const RUN_HEAT = get(ENV, "RUN_HEAT", "")
 const EK_DEPTH = parse(Float64, get(ENV, "EK_DEPTH", "200"))
 const EK_REF   = Tuple(parse.(Float64, split(get(ENV, "EK_REF", "200,300"), ',')))
 const Ω_EARTH  = 7.292115e-5
@@ -355,6 +360,39 @@ function piecewise_integral(starts, vals::AbstractMatrix, a, b)
         dt > 0 && (out .+= dt .* view(vals, :, n))
     end
     return out
+end
+
+"""
+The 3-D run's surface heat at the box, per 5-day window: (Qtot, Qsw) in W/m², + into the ocean, as TFLUX and oceQsw.
+heat_flux is kinematic (°C m/s) and + OUT; shortwave is W/m² and negative down; with shortwave_in_heat_flux = "yes"
+the shortwave is taken out of heat_flux first. The run's ρ₀cₚ is the column's (NumericalEarth's).
+"""
+function run_heat(path, col, stamps)
+    isfile(path) || error("RUN_HEAT: $path not found")
+    NCDataset(path) do ds
+        hv = ds["heat_flux"]; sv = ds["shortwave"]
+        dn = dimnames(hv)
+        λ, φ = f64(ds[dn[1]][:]), f64(ds[dn[2]][:])
+        I = findall(x -> col.lon[1] <= x <= col.lon[2], λ); J = findall(y -> col.lat[1] <= y <= col.lat[2], φ)
+        (isempty(I) || isempty(J)) && error("RUN_HEAT: no run cell in $(col.name)'s box")
+        start = DateTime(string(ds.attrib["start_date"]))
+        sw_in = haskey(ds.attrib, "shortwave_in_heat_flux") && string(ds.attrib["shortwave_in_heat_flux"]) == "yes"
+        t = f64(ds["time"][:])
+        ends = [start + Millisecond(round(Int, 1000x)) for x in t]
+        rd(v, n) = (X = f64(ndims(v) == 4 ? v[I, J, 1, n] : v[I, J, n]); X)
+        Qtot, Qsw = fill(NaN, length(stamps)), fill(NaN, length(stamps))
+        for (r, s) in enumerate(stamps)
+            n = findall(k -> t[k] > 0 && s - WINDOW < ends[k] <= s, eachindex(t))
+            isempty(n) && error("RUN_HEAT: the run has no daily flux in the window ending $s")
+            H, SW = rd(hv, n), rd(sv, n)
+            ok = isfinite.(H) .& isfinite.(SW) .& (H .!= 0)
+            any(ok) || error("RUN_HEAT: no wet run cell in $(col.name)'s box")
+            sw = -mean(SW[ok])                                   # W/m², + into the ocean
+            nonsolar = -mean(H[ok]) * ρ₀ * cₚ - (sw_in ? sw : 0.0)
+            Qsw[r], Qtot[r] = sw, nonsolar + sw
+        end
+        return Qtot, Qsw, length(I) * length(J)
+    end
 end
 
 # ── single-column model pieces ────────────────────────────────────────────────────────────────────
@@ -591,6 +629,17 @@ function do_column(col, recs, stamps, XC, YC, RF)
             th = [Dates.value(t - (stamps[1] - Hour(60))) / 1000 for t in eh]
             τxh, τyh, uh, vh, ρh = ex, ey, eu, ev, eρ
         end
+    end
+
+    # ── RUN_HEAT: the 3-D run's heat flux replaces B-SOSE's ──
+    if !isempty(RUN_HEAT)
+        Qb = copy(Qtot)
+        Qtot, Qsw, ncells = run_heat(RUN_HEAT, col, stamps)
+        @info @sprintf("%s: RUN_HEAT %s (%d cells): mean Qnet run %.1f, B-SOSE %.1f W/m²; Jun-Sep run minus B-SOSE %.1f W/m²",
+                       col.name, basename(RUN_HEAT), ncells, mean(Qtot), mean(Qb),
+                       (d = [Qtot[r] - Qb[r] for r in 1:nr if 6 <= Dates.month(stamps[r] - Hour(60)) <= 9]; isempty(d) ? NaN : mean(d)))
+        println("\nRUN_HEAT: Qnet per window, W/m² (+ into the ocean): run | B-SOSE")
+        foreach(r -> @printf("  %s  %7.1f | %7.1f\n", Dates.format(stamps[r], "yyyy-mm-dd"), Qtot[r], Qb[r]), 1:nr)
     end
 
     # model time 0 = centre of record 1; window r is (stamp_r - 5 d, stamp_r]
