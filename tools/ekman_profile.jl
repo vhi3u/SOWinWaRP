@@ -24,6 +24,10 @@
 #
 # WRITES OUTDIR/<RUN>_ekman_profile.png: mean v'(z) over the WINTER months, run against B-SOSE, per line and class;
 # and V_E month by month with V_th. STDOUT: the monthly table and the WINTER means with run/B-SOSE ratios.
+# MLD beside D: the mean mixed layer depth (tools/mld.jl, MLD_DT 0.03 kg/m³ from 10 m) over the same columns and
+#   months, the run's from the 30-day T, S of <RUN>_eke.nc in the two rows either side of the line, B-SOSE's from its
+#   monthly Theta, Salt the same way (a column with no crossing counts at its floor). Is a deep D the run's own deep
+#   mixed layer (D ≈ MLD: the 3-D state is less stratified), or momentum mixed below it (D >> MLD)?
 # SECTORS (EKMAN_SECTORS, longitude edges, e.g. 90,105,120,135,150, or 119.4,120.4 for one box): the WINTER-mean
 #   V_E, v'₀ and D per sector and line, classes all and open, run against B-SOSE. Over a short segment the run's and
 #   B-SOSE's v' also hold geostrophic shear that the whole line cancels: a sector whose V_E is far from V_th is
@@ -34,7 +38,8 @@
 
 using NCDatasets, CairoMakie, Dates, Printf, Statistics
 
-include(joinpath(@__DIR__, "model_grid.jl"))     # file_levels
+include(joinpath(@__DIR__, "model_grid.jl"))     # file_levels, file_kbot
+include(joinpath(@__DIR__, "mld.jl"))            # mld, MLD_DT
 
 ENV["HDF5_USE_FILE_LOCKING"] = "FALSE"
 
@@ -110,6 +115,11 @@ function main()
 
     # run v profiles: 30-day windows to the month of their centre (top-first levels)
     vR = [fill(NaN, Nx, K) for _ in LINES, _ in 1:nm]; cR = zeros(Int, length(LINES), nm)
+    # run MLD: per column, the two rows either side of the line, each 30-day window to its month
+    fk = file_kbot(de, zc, zf); fk === nothing && error("$eke_path carries no sea floor")
+    kbotR = fk[1]
+    colmld(T, S, kb, zs) = kb === nothing ? NaN : (h = mld(T, S, zs, kb); isfinite(h) ? h : -zs[kb])
+    hR = [zeros(Nx) for _ in LINES, _ in 1:nm]; hN = [zeros(Int, Nx) for _ in LINES, _ in 1:nm]
     te = g(de["time"][:])
     win = haskey(de.attrib, "averaging_window_seconds") ? Float64(de.attrib["averaging_window_seconds"]) : 30 * 86400.0
     for (n, t) in enumerate(te)
@@ -118,6 +128,11 @@ function main()
         for (l, j) in enumerate(jm)
             V = g(de["v"][:, j-1:j, Nz-K+1:Nz, n])                     # bottom-to-top levels
             P = reverse((V[:, 1, :] .+ V[:, 2, :]) ./ 2; dims = 2)       # (Nx, K), top first
+            T = g(de["T"][:, j-1:j, :, n]); S = g(de["S"][:, j-1:j, :, n])  # bottom-to-top, full depth
+            for i in 1:Nx, (r, jj) in enumerate((j - 1, j))
+                h = colmld(view(T, i, r, :), view(S, i, r, :), kbotR[i, jj], zc)
+                isfinite(h) && (hR[l, k][i] += h; hN[l, k][i] += 1)
+            end
             if cR[l, k] == 0
                 vR[l, k] = P
             else
@@ -127,6 +142,9 @@ function main()
         end
     end
     close(de)
+    for l in eachindex(LINES), k in 1:nm
+        hR[l, k] = [hN[l, k][i] > 0 ? hR[l, k][i] / hN[l, k][i] : NaN for i in 1:Nx]
+    end
 
     # ── B-SOSE: monthly Vvel on the YG face nearest each line; 5-day SIArea and oceTAUX to months ──
     geom = joinpath(BSOSE_DIR, "surfTflx_bsoseI156_2013to2024_monthly.nc")
@@ -147,6 +165,37 @@ function main()
                 vB[l, k] = g(Vo[minimum(Ir):maximum(Ir), j, 1:K, n])[Ir .- minimum(Ir) .+ 1, :]
             end
         end
+    end
+    hB = [fill(NaN, Nx) for _ in LINES, _ in 1:nm]
+    pT, pS = bfile("Theta", "2013to2024_monthly"), bfile("Salt", "2013to2024_monthly")
+    if isempty(pT) || isempty(pS)
+        @warn "no Theta/Salt_bsoseI156_2013to2024_monthly.nc in $BSOSE_DIR: no B-SOSE mixed layer depth"
+    else
+        NCDataset(pT) do dt; NCDataset(pS) do ds_
+            To, So = pick(dt, ("THETA", "Theta")), pick(ds_, ("SALT", "Salt"))
+            rf = haskey(dt, "RF") ? g(dt["RF"][:]) : [0.0; -cumsum(g(dt[haskey(dt, "drF") ? "drF" : "DRF"][:]))]
+            NzB = length(rf) - 1
+            zsB = reverse([(rf[k] + rf[k+1]) / 2 for k in 1:NzB])                  # bottom-to-top centres, negative
+            r = minimum(Ir):maximum(Ir); sel = Ir .- minimum(Ir) .+ 1
+            for (n, s) in enumerate(DateTime.(dt["time"][:]))
+                k = get(kof, ym_of(s - Day(15)), 0); k == 0 && continue
+                for (l, j) in enumerate(jb)
+                    T = g(To[r, j-1:j, :, n])[sel, :, :]; S = g(So[r, j-1:j, :, n])[sel, :, :]
+                    for i in 1:Nx
+                        hs = Float64[]
+                        for c in 1:2
+                            t, sa = reverse(T[i, c, :]), reverse(S[i, c, :])
+                            nw = count(x -> isfinite(x) && x != 0, sa)
+                            nw < 2 && continue
+                            kb = NzB - nw + 1
+                            h = mld(t, sa, zsB, kb)
+                            push!(hs, isfinite(h) ? h : -zsB[kb])
+                        end
+                        isempty(hs) || (hB[l, k][i] = mean(hs))
+                    end
+                end
+            end
+        end end
     end
     aB = [zeros(Nx) for _ in LINES, _ in 1:nm]; τB = [zeros(Nx) for _ in LINES, _ in 1:nm]; nB = zeros(Int, length(LINES), nm)
     for y in sort(unique(first.(months)))
@@ -192,7 +241,8 @@ function main()
         (pr === nothing || pb === nothing) && return nothing
         τ = nanmean(τB[l, k][sel])
         return (; pr = pr[1], pb = pb[1], n = min(pr[2], pb[2]), VEr = VE(pr[1]), VEb = VE(pb[1]),
-                  v0r = pr[1][1], v0b = pb[1][1], Vth = -τ / (ρ₀ * 2Ω * sind(φm[l])))
+                  v0r = pr[1][1], v0b = pb[1][1], Vth = -τ / (ρ₀ * 2Ω * sind(φm[l])),
+                  hr = nanmean(hR[l, k][sel]), hb = nanmean(hB[l, k][sel]))
     end
     for (l, L) in enumerate(LINES), k in 1:nm
         cR[l, k] == 0 && continue
@@ -211,18 +261,18 @@ function main()
     println(bar)
     for (l, L) in enumerate(LINES), cls in CLASSES
         @printf("\n  %s, %s  (run face %.3f, B-SOSE YG row %d)\n", lname(L), cls, φm[l], jb[l])
-        println("  month    |    n |  V_E run  B-SOSE    V_th |  v'₀ run  B-SOSE |   D run  B-SOSE")
+        println("  month    |    n |  V_E run  B-SOSE    V_th |  v'₀ run  B-SOSE |   D run  B-SOSE | MLD run  B-SOSE")
         for k in 1:nm
             r = get(res, (l, k, cls), nothing); r === nothing && continue
-            @printf("  %s  | %4d |  %7.3f  %6.3f  %6.3f |  %7.2f  %6.2f |  %6.0f  %6.0f\n", label(months[k]), r.n,
-                    r.VEr, r.VEb, r.Vth, 100r.v0r, 100r.v0b, r.VEr / r.v0r, r.VEb / r.v0b)
+            @printf("  %s  | %4d |  %7.3f  %6.3f  %6.3f |  %7.2f  %6.2f |  %6.0f  %6.0f |  %6.0f  %6.0f\n", label(months[k]), r.n,
+                    r.VEr, r.VEb, r.Vth, 100r.v0r, 100r.v0b, r.VEr / r.v0r, r.VEb / r.v0b, r.hr, r.hb)
         end
         wk = [k for k in 1:nm if months[k][2] in WINTER && haskey(res, (l, k, cls))]
         isempty(wk) && continue
         m(f) = mean(f(res[(l, k, cls)]) for k in wk)
-        @printf("  months %s (%d): V_E run %.3f B-SOSE %.3f V_th %.3f (run/B-SOSE %.2f) | v'₀ run %.2f B-SOSE %.2f cm/s (ratio %.2f)\n",
+        @printf("  months %s (%d): V_E run %.3f B-SOSE %.3f V_th %.3f (run/B-SOSE %.2f) | v'₀ run %.2f B-SOSE %.2f cm/s (ratio %.2f) | MLD run %.0f B-SOSE %.0f m\n",
                 join(WINTER, ','), length(wk), m(r -> r.VEr), m(r -> r.VEb), m(r -> r.Vth), m(r -> r.VEr) / m(r -> r.VEb),
-                100m(r -> r.v0r), 100m(r -> r.v0b), m(r -> r.v0r) / m(r -> r.v0b))
+                100m(r -> r.v0r), 100m(r -> r.v0b), m(r -> r.v0r) / m(r -> r.v0b), m(r -> r.hr), m(r -> r.hb))
     end
     if !isempty(SECTORS)
         println("\n", bar)
@@ -231,7 +281,7 @@ function main()
         println(bar)
         for (l, L) in enumerate(LINES), cls in (:all, :open)
             @printf("\n  %s, %s\n", lname(L), cls)
-            println("  sector         | months |   n |  V_E run  B-SOSE    V_th |  v'₀ run  B-SOSE |   D run  B-SOSE")
+            println("  sector         | months |   n |  V_E run  B-SOSE    V_th |  v'₀ run  B-SOSE |   D run  B-SOSE | MLD run  B-SOSE")
             for s in 1:length(SECTORS)-1
                 lo, hi = SECTORS[s], SECTORS[s+1]
                 rs = NamedTuple[]
@@ -242,12 +292,14 @@ function main()
                 end
                 isempty(rs) && (@printf("  %6.1f-%6.1fE |      0 |\n", lo, hi); continue)
                 q(f) = mean(f(r) for r in rs)
-                @printf("  %6.1f-%6.1fE | %6d | %3.0f |  %7.3f  %6.3f  %6.3f |  %7.2f  %6.2f |  %6.0f  %6.0f\n", lo, hi,
+                @printf("  %6.1f-%6.1fE | %6d | %3.0f |  %7.3f  %6.3f  %6.3f |  %7.2f  %6.2f |  %6.0f  %6.0f |  %6.0f  %6.0f\n", lo, hi,
                         length(rs), q(r -> r.n), q(r -> r.VEr), q(r -> r.VEb), q(r -> r.Vth), 100q(r -> r.v0r),
-                        100q(r -> r.v0b), q(r -> r.VEr) / q(r -> r.v0r), q(r -> r.VEb) / q(r -> r.v0b))
+                        100q(r -> r.v0b), q(r -> r.VEr) / q(r -> r.v0r), q(r -> r.VEb) / q(r -> r.v0b), q(r -> r.hr), q(r -> r.hb))
             end
         end
     end
+    println("\n  MLD beside D: D ≈ MLD means the flow fills the mixed layer, so a deep D is a deep mixed layer (the state);")
+    println("  D >> MLD means momentum is mixed beneath the mixed layer (numerics or 3-D dynamics).")
     println("\n  Reading it: V_E ratio ≈ 1 with v'₀ ratio << 1 -> the run spreads the same momentum deeper (mixing);")
     println("  V_E ratio << 1 -> less momentum gets in (stress, ice-ocean drag). V_th says what B-SOSE's own stress should drive.\n")
 
