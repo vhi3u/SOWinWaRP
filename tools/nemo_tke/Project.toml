@@ -1,0 +1,21 @@
+# Julia environment for tools/single_column_bsose.jl with NEMO's TKE closure: Oceananigans' fjp/nemo-tke branch
+# (0.118.2 + NEMO TKE), pinned to one commit since the branch is not yet a PR. Separate from the repository's
+# environment, so the runs' Oceananigans 0.117.2 / NumericalEarth pin is untouched. See README.md here.
+
+[deps]
+CairoMakie = "13f3f980-e62b-5c42-98c6-ff1f3baf88f0"
+Dates = "ade2ca70-3891-5945-98fb-dc099432e06a"
+NCDatasets = "85f8d34a-cbdd-5861-8df4-14fed0d494ab"
+Oceananigans = "9e8cae18-63c1-5223-a75c-80ca9d6e9a09"
+Printf = "de0858da-6303-5e67-8744-51eddeeeb8d7"
+SeawaterPolynomials = "d496a93d-167e-4197-9f49-d3af4ff8fe40"
+Serialization = "9e88b42a-f829-5b0c-bbe9-9e923198166b"
+Statistics = "10745b16-79ce-11e8-11f9-7d13ad32a3b2"
+
+[sources]
+Oceananigans = {url = "https://github.com/CliMA/Oceananigans.jl", rev = "5fde76fcf252a13fdb4a436f342be368e3801903"}
+
+[compat]
+CairoMakie = "0.15.17"
+NCDatasets = "0.14.15"
+SeawaterPolynomials = "0.3.11"

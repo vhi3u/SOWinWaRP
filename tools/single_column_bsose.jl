@@ -56,6 +56,14 @@
 #                                   below wraps CATKEMixingLength and caps stable_length_scaleᶜᶜᶠ/ᶜᶜᶜ, so it reaches the
 #                                   momentum, tracer and TKE lengths alike; the convective lengths are untouched.
 #               catke_arctic  = catke_cap0.1_cs0.991_cwu1.59: the cap, κ 0.41 and half the TKE flux together
+#               nemo        NEMO's TKE scheme (Gaspar et al. 1990, the family of B-SOSE i156's GGL90) with NEMO 4's
+#                           reference namelist: surface TKE Cᵉᵇ u★² with Cᵉᵇ = 67.83 (wave breaking), νᵇ 1.2e-4, κᵇ 1.2e-5,
+#                           enhanced diffusion 100 m²/s where N² < 0. Its own backgrounds; a single closure (no tuple).
+#               nemo_glorys the same with GLORYS12's NEMO 3.1 settings: Cᵉᵇ 3.75 (no waves), ℓ₀ᵐⁱⁿ 0.4 m, ℓᵐⁱⁿ 0.1 m,
+#                           Riᶜ 0.2, νᵇ 1e-4, κᵇ 1e-5, e₀ᵐⁱⁿ 1e-4 (the settings passed on from the Arctic thread)
+#               nemo[_glorys]_<opts> either with ebb<x> (Cᵉᵇ), nub<x> (νᵇ), kb<x> (κᵇ), joined by "_"
+#                           NEMO needs Oceananigans' fjp/nemo-tke branch (0.118.2): run with --project=tools/nemo_tke
+#                           (see tools/nemo_tke/README.md). The CATKE schemes run in either environment.
 #               kepsilon    Oceananigans' k-ε (TKEDissipationVerticalDiffusivity), WITHOUT the backgrounds:
 #                           in 0.117.2 its TKE top boundary condition fails on a closure tuple
 #               ri          Oceananigans' RiBasedVerticalDiffusivity + the same backgrounds
@@ -66,6 +74,17 @@
 # averaged over each B-SOSE window, against B-SOSE's window mean. A column with no crossing counts at its
 # floor and is marked '*'. B-SOSE's own MLD diagnostic (box mean) is printed for reference only: it is
 # shallower by its definition (compare_mld_5day).
+#
+# EKMAN. Is the wind's momentum mixed too deep? The 3-D runs carry B-SOSE's Ekman transport at 60S but spread it over
+# 60-120 m against B-SOSE's 20-35 (tools/ekman_profile.jl). Per calendar month (windows by their centre), as there:
+#   v'(z) = v(z) - mean v over EK_REF (200-300 m); V_E = ∫ v' dz over 0-EK_DEPTH (200) m; v'₀ the top cell's v';
+#   D = V_E / v'₀ (m); V_th = -<τx> / (ρ₀ f) from the stress the column was given.
+#   Each scheme from its hourly u, v averaged over the month; B-SOSE from its MONTHLY Vvel (box mean of the YG faces of
+#   the box's cells, local file or BUDGET_URL), which also holds geostrophic shear the column has not got.
+#   A column has no geostrophic flow, so its v' is all Ekman (+ inertial, averaged out). Also the vector transport
+#   |M| = |∫(u', v') dz| against |τ| / (ρ₀ |f|), a check that the column holds the whole Ekman transport.
+#   If a scheme's D in the column is as deep as the 3-D run's, the scheme does it; if it is near B-SOSE's, look at what
+#   only the 3-D run has (relative wind, resolved shear, near-inertial waves).
 #
 # THE BUDGET IS THE CAVEAT. B-SOSE's column also changes by lateral advection, eddies and its adjoint's
 # adjustments; a 1-D column cannot. Printed per month: B-SOSE's change in column heat and salt since the
@@ -115,6 +134,8 @@
 #   KAPPA_Z    background κz of catke and ri, m²/s (default 1e-5 since 2026-11-22: B-SOSE i156's, and the runs' since
 #              _k1e5; every single-column result before that used 1e-4)
 #   Figures of a non-default STRESS or KAPPA_Z are named single_column_<column>_<STRESS>[_k<KAPPA_Z>]*.png
+#   FIG_TAG    appended to every figure name (e.g. _nemo, so two environments can share an OUTDIR and its budget cache)
+#   EK_DEPTH   depth of the Ekman integral, m (default 200)    EK_REF  reference layer, m (default 200,300)
 # ==============================================================================================
 
 using Oceananigans
@@ -149,7 +170,11 @@ const SMOOTH_DEG = parse(Float64, get(ENV, "SMOOTH_DEG", "2.0"))
 STRESS in STRESSES || error("STRESS must be one of $(join(STRESSES, ", ")), got $STRESS")
 const KAPPA_Z  = parse(Float64, get(ENV, "KAPPA_Z", "1e-5"))
 const ERA5_DIR = get(ENV, "ERA5_DIR", joinpath(get(ENV, "BSOSE_DIR", ""), "era5"))
-const TAG      = (STRESS == "bsose" ? "" : "_$STRESS") * (STRESS == "era5_6hourly_smooth" ? "$(SMOOTH_DEG)" : "") * (KAPPA_Z == 1e-5 ? "" : "_k$(KAPPA_Z)")
+const TAG      = (STRESS == "bsose" ? "" : "_$STRESS") * (STRESS == "era5_6hourly_smooth" ? "$(SMOOTH_DEG)" : "") * (KAPPA_Z == 1e-5 ? "" : "_k$(KAPPA_Z)") *
+                 get(ENV, "FIG_TAG", "")
+const EK_DEPTH = parse(Float64, get(ENV, "EK_DEPTH", "200"))
+const EK_REF   = Tuple(parse.(Float64, split(get(ENV, "EK_REF", "200,300"), ',')))
+const Ω_EARTH  = 7.292115e-5
 const cpB      = 3994.0
 
 struct Column
@@ -419,14 +444,38 @@ function build_closure(name, f)
         end
         return (catke(; kw...), background)
     end
+    startswith(name, "nemo") && return nemo_closure(name)
     name == "kepsilon"   && return TKEDissipationVerticalDiffusivity()     # alone: its TKE top BC rejects a closure tuple (0.117.2)
     name == "ri"         && return (RiBasedVerticalDiffusivity(), background)
-    error("unknown closure '$name' (catke, catke_bare, catke_<cwu|cs|cap><x>..., kepsilon, ri)")
+    error("unknown closure '$name' (catke, catke_bare, catke_<cwu|cs|cap><x>..., nemo[_glorys][_<ebb|nub|kb><x>...], kepsilon, ri)")
+end
+
+"NEMO's TKE scheme (Oceananigans branch fjp/nemo-tke): nemo, nemo_glorys, either with _ebb<x>, _nub<x>, _kb<x>."
+function nemo_closure(name)
+    isdefined(TKEVD, :NEMOTKEVerticalDiffusivity) ||
+        error("'$name' needs Oceananigans' NEMO TKE (branch fjp/nemo-tke, $(pkgversion(Oceananigans)) loaded): " *
+              "run with julia --project=tools/nemo_tke (tools/nemo_tke/README.md)")
+    glorys = startswith(name, "nemo_glorys")
+    rest = name[(glorys ? length("nemo_glorys") : length("nemo")) + 1:end]
+    ml = glorys ? Dict{Symbol, Float64}(:Cᴿ => 0.0, :ℓᵐⁱⁿ => 0.1, :ℓ₀ᵐⁱⁿ => 0.4, :Riᶜ => 0.2, :Prᵐᵃˣ => 10.0, :νᵇ => 1e-4, :κᵇ => 1e-5) :
+                  Dict{Symbol, Float64}()
+    eq = glorys ? Dict{Symbol, Float64}(:Cᴰ => 0.7, :Cᵉᵇ => 3.75, :e₀ᵐⁱⁿ => 1e-4) : Dict{Symbol, Float64}()
+    for tok in filter(!isempty, split(rest, '_'))
+        m = match(r"^(ebb|nub|kb)([0-9.eE+-]+)$", tok)
+        m === nothing && error("unknown nemo option '$tok' in '$name' (ebb<x>, nub<x>, kb<x>)")
+        x = parse(Float64, m[2])
+        m[1] == "ebb" ? (eq[:Cᵉᵇ] = x) : (ml[m[1] == "nub" ? :νᵇ : :κᵇ] = x)
+    end
+    emin = glorys ? 0.7071e-6 : 1e-6
+    return TKEVD.NEMOTKEVerticalDiffusivity(; mixing_length = TKEVD.NEMOMixingLength(; ml...),
+                                            turbulent_kinetic_energy_equation = TKEVD.NEMOTKEEquation(; eq...),
+                                            minimum_tke = emin)
 end
 
 """
-Run one scheme; return its window-mean T and S (top-down, nk × nr; record 1 is the start) and its T and S
-snapshots at the run's edges (nk × nr+1: the start, then the end of each window).
+Run one scheme; return its window-mean T and S (top-down, nk × nr; record 1 is the start), its T and S
+snapshots at the run's edges (nk × nr+1: the start, then the end of each window), and its window-mean u and v
+(nk × nr, hourly samples; record 1 NaN: the run starts at its centre, from rest).
 """
 function run_column(name, zf, Tinit, Sinit, φc, p, edges)
     nk, nr = length(Tinit), length(edges) - 1
@@ -450,10 +499,13 @@ function run_column(name, zf, Tinit, Sinit, φc, p, edges)
     Ts, Ss = fill(NaN, nk, nr + 1), fill(NaN, nk, nr + 1)
     snap!(c) = (Ts[:, c] = reverse(vec(interior(model.tracers.T))); Ss[:, c] = reverse(vec(interior(model.tracers.S))))
     snap!(1)
-    accT, accS, count = zeros(nk), zeros(nk), Ref(0)
+    Um, Vm = fill(NaN, nk, nr), fill(NaN, nk, nr)
+    accT, accS, accU, accV, count = zeros(nk), zeros(nk), zeros(nk), zeros(nk), Ref(0)
     function accumulate!(sim)
         accT .+= reverse(vec(interior(sim.model.tracers.T)))
         accS .+= reverse(vec(interior(sim.model.tracers.S)))
+        accU .+= reverse(vec(interior(sim.model.velocities.u)))
+        accV .+= reverse(vec(interior(sim.model.velocities.v)))
         count[] += 1
     end
     sim = Simulation(model; Δt = DT, stop_time = edges[2])
@@ -462,7 +514,7 @@ function run_column(name, zf, Tinit, Sinit, φc, p, edges)
     run!(sim)                                   # centre of record 1 to the end of its window
     snap!(2)
     for r in 2:nr
-        accT .= 0; accS .= 0; count[] = 0
+        accT .= 0; accS .= 0; accU .= 0; accV .= 0; count[] = 0
         sim.stop_time = edges[r+1]
         run!(sim)
         if count[] == 0 || !all(isfinite, accT) || !all(isfinite, accS)
@@ -470,10 +522,11 @@ function run_column(name, zf, Tinit, Sinit, φc, p, edges)
             break
         end
         Tm[:, r], Sm[:, r] = accT ./ count[], accS ./ count[]
+        Um[:, r], Vm[:, r] = accU ./ count[], accV ./ count[]
         snap!(r + 1)
     end
     @info @sprintf("%s: %d steps, %.0f s wall", name, iteration(sim), time() - t0)
-    return Tm, Sm, Ts, Ss
+    return Tm, Sm, Ts, Ss, Um, Vm
 end
 
 # ── one column ────────────────────────────────────────────────────────────────────────────────────
@@ -605,7 +658,7 @@ function do_column(col, recs, stamps, XC, YC, RF)
                 "h-adv + h-diff\n  + ADVr through every face below the surface + DFrI at its floor, level by level.")
     end
 
-    results = Dict{String, NTuple{4, Matrix{Float64}}}()
+    results = Dict{String, NTuple{6, Matrix{Float64}}}()
     for name in CLOSURES
         results[name] = run_column(name, zf, Tb[:, 1], Sb[:, 1], φc, p, edges)
     end
@@ -769,6 +822,94 @@ function do_column(col, recs, stamps, XC, YC, RF)
     mkpath(OUTDIR)
     out = joinpath(OUTDIR, "single_column_$(col.name)$(TAG).png")
     save(out, fig); @info "wrote $out"
+
+    # ── Ekman: where the wind's momentum goes (header, EKMAN) ──
+    fcor = 2Ω_EARTH * sind(φc)
+    kR = findall(z -> EK_REF[1] <= -z <= EK_REF[2], zc)
+    kE = findall(k -> -RF[k+1] <= EK_DEPTH + 1e-6, 1:nk)
+    wmon(r) = (c = stamps[r] - Hour(60); (Dates.year(c), Dates.month(c)))
+    ekmonths = [m for m in months if count(r -> r >= 2 && wmon(r) == m, 1:nr) >= 3]
+    if isempty(kR) || isempty(kE) || isempty(ekmonths)
+        @warn "$(col.name): no level in EK_REF $(EK_REF) m, none above EK_DEPTH $(EK_DEPTH) m, or no month with 3 windows; Ekman table skipped"
+    else
+        prime(P) = P .- mean(P[kR])
+        transport(P) = sum(P[k] * Δz[k] for k in kE)
+        function measures(v)
+            p = prime(v); ve = transport(p)
+            return (; VE = ve, v0 = p[1], D = ve / p[1], p)
+        end
+        # B-SOSE: monthly Vvel, box mean over the YG faces of the box's wet cells
+        vB = Dict{Tuple{Int, Int}, Vector{Float64}}()
+        try
+            path = monthly_path("Vvel")
+            open_monthly(path) do ds
+                var = ds[data_var(ds, ("VVEL", "Vvel"), path)]
+                have = monthkey.(ds["time"][:])
+                for m in ekmonths
+                    n = findfirst(==(m), have)
+                    n === nothing && continue
+                    X = f64(var[I, J, 1:nk, n])
+                    vB[m] = [(x = filter(isfinite, view(X, :, :, k)[view(wet, :, :, k)]); isempty(x) ? NaN : mean(x)) for k in 1:nk]
+                end
+            end
+        catch e
+            @warn "$(col.name): B-SOSE monthly Vvel not read; no B-SOSE column in the Ekman table" exception = e
+        end
+        rs_of(m, X) = [r for r in 2:nr if wmon(r) == m && all(isfinite, X[:, r])]
+        sch(n, m) = (rs = rs_of(m, results[n][6]); isempty(rs) ? nothing :
+                     (; v = measures(vec(mean(results[n][6][:, rs], dims = 2))),
+                        M = hypot(transport(prime(vec(mean(results[n][5][:, rs], dims = 2)))),
+                                  transport(prime(vec(mean(results[n][6][:, rs], dims = 2)))))))
+        τm(m) = (rs = [r for r in 2:nr if wmon(r) == m]; ic = filter(isfinite, ice[rs]);
+                 (mean(τx[rs]), mean(τy[rs]), isempty(ic) ? NaN : mean(ic)))
+        trip(x) = x === nothing ? @sprintf(" %6s %6s %5s", "--", "--", "--") :
+                  @sprintf(" %6.3f %6.2f %5.0f", x.VE, 100 * x.v0, x.D)
+        hdr = @sprintf("  %-8s %5s %6s |%20s", "month", "ice", "V_th", "B-SOSE V_E  v'₀   D") *
+              join(@sprintf(" |%20s", n * " V_E v'₀ D") for n in CLOSURES) * " | " * join(@sprintf("%8s", "M/Mth") for _ in CLOSURES)
+        println("\nEKMAN (monthly): V_E = ∫v'dz 0-$(round(Int, EK_DEPTH)) m (m²/s, + north), v'₀ top cell (cm/s), D = V_E/v'₀ (m), " *
+                "v' = v - v($(round(Int, EK_REF[1]))-$(round(Int, EK_REF[2])) m);\n  V_th = -τx/(ρ₀f) from the stress applied; " *
+                "M/Mth = |∫(u',v')dz| / (|<τ>|/(ρ₀|f|)), ~1 if the column holds the whole transport. The 3-D runs at 60S: D 60-120 m, B-SOSE 20-35.")
+        println(hdr)
+        push!(sm, "Ekman, monthly (V_E m²/s, v'₀ cm/s, D m; V_th = -τx/(ρ₀f); M/Mth = column transport over the stress's):")
+        push!(sm, hdr)
+        acc = Dict{String, Vector{NTuple{2, Float64}}}(n => NTuple{2, Float64}[] for n in [CLOSURES; "B-SOSE"])
+        for m in ekmonths
+            tx, ty, ic = τm(m)
+            b = haskey(vB, m) && all(isfinite, vB[m][[1; kR; kE]]) ? measures(vB[m]) : nothing
+            b === nothing || push!(acc["B-SOSE"], (b.VE, b.v0))
+            row = @sprintf("  %04d-%02d  %5s %6.3f |", m..., isfinite(ic) ? @sprintf("%.2f", ic) : "--", -tx / (ρ₀ * fcor)) * trip(b)
+            Ms = String[]
+            for n in CLOSURES
+                x = sch(n, m)
+                x === nothing || push!(acc[n], (x.v.VE, x.v.v0))
+                row *= " |" * trip(x === nothing ? nothing : x.v)
+                push!(Ms, x === nothing ? @sprintf("%8s", "--") : @sprintf("%8.2f", x.M / (hypot(tx, ty) / (ρ₀ * abs(fcor)))))
+            end
+            row *= " | " * join(Ms)
+            println(row); push!(sm, row)
+        end
+        atrip(n) = isempty(acc[n]) ? trip(nothing) :
+                   (ve = mean(first.(acc[n])); v0 = mean(last.(acc[n])); trip((; VE = ve, v0, D = ve / v0)))
+        allrow = @sprintf("  %-8s %5s %6s |", "all", "", "") * atrip("B-SOSE") * join(" |" * atrip(n) for n in CLOSURES)
+        println(allrow); push!(sm, allrow)
+        println("  'all' = the months' mean V_E over their mean v'₀. B-SOSE's monthly Vvel holds geostrophic shear too; the column's does not.")
+
+        figE = Figure(size = (520, 620))
+        axE = Axis(figE[1, 1]; xlabel = "v' = v - v($(round(Int, EK_REF[1]))-$(round(Int, EK_REF[2])) m), cm/s (+ north)",
+                   ylabel = "depth (m)", limits = (nothing, (-min(H, 300.0), 0)),
+                   title = "$(col.name): wind-driven v', mean of $(mlabel(findfirst(==(ekmonths[1]), months)))-$(mlabel(findfirst(==(ekmonths[end]), months)))")
+        vlines!(axE, 0; color = :gray70)
+        bm = [vB[m] for m in ekmonths if haskey(vB, m)]
+        isempty(bm) || lines!(axE, 100 .* prime(mean(bm)), zc; color = :black, linewidth = 2.5, label = "B-SOSE (monthly Vvel)")
+        for n in CLOSURES
+            ps = [sch(n, m) for m in ekmonths]; ps = [x.v.p for x in ps if x !== nothing]
+            isempty(ps) || lines!(axE, 100 .* mean(ps), zc; color = colors[n], linewidth = 2, label = n)
+        end
+        hlines!(axE, [-EK_DEPTH]; color = :gray70, linestyle = :dash)
+        axislegend(axE; position = :rb, framevisible = false)
+        outE = joinpath(OUTDIR, "single_column_$(col.name)$(TAG)_ekman.png")
+        save(outE, figE); @info "wrote $outE"
+    end
 
     bud === nothing && return sm
     # ── vertical mixing flux: B-SOSE's DFrI against each scheme's ──
