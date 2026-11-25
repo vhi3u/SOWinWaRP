@@ -30,9 +30,18 @@
 # interpolated to the same month boundaries. B-SOSE's total is all we have of its budget unless its
 # SIdHb* diagnostics are on disk.
 #
+# DRIFT AS SALT (after Gülk et al. 2024 eq. 6): ice carried out of a band leaves its brine behind and
+# takes its fresh water elsewhere. Per band and ice year (March to February, whole years only) and per
+# freezing season (SEASON, default 3-10), the drift as the salinity it is worth over the band's top H
+# metres:  ΔS = -DSI · ρᵢ · drift / (A_band · H · ρ₀),  + = saltier (net export). Beside it, the same for
+# thermo: over a whole year with no net change in volume the two cancel; in a band that exports ice,
+# thermo is the brine made and drift the share whose melt water does not come back. B-SOSE's band drift
+# is not known (only its total), so compare across runs and with the run's salinity bias.
+#
 # WRITES (OUTDIR, default plots/): <RUN>_ice_growth_budget.png, one panel per band, km³/month.
 # ENV: DIR (run files, default .), OUTDIR, BSOSE_DIR, BANDS (default -70,-65,-60,-55,-50,-45),
-#      WINTER (months for the W/m² table, default 5,6,7,8,9).
+#      WINTER (months for the W/m² table, default 5,6,7,8,9), SEASON (3,4,5,6,7,8,9,10),
+#      SALT_H (m, default 50), DSI (ocean minus ice salinity, g/kg, default 30).
 # ==============================================================================================
 
 using NCDatasets, CairoMakie, Dates, Printf, Statistics
@@ -46,6 +55,9 @@ OUTDIR    = get(ENV, "OUTDIR", "plots")
 BSOSE_DIR = get(ENV, "BSOSE_DIR", "")
 EDGES     = parse.(Float64, split(get(ENV, "BANDS", "-70,-65,-60,-55,-50,-45"), ','))
 WINTER    = parse.(Int, split(get(ENV, "WINTER", "5,6,7,8,9"), ','))
+SEASON    = parse.(Int, split(get(ENV, "SEASON", "3,4,5,6,7,8,9,10"), ','))
+SALT_H    = parse(Float64, get(ENV, "SALT_H", "50"))
+DSI       = parse(Float64, get(ENV, "DSI", "30"))
 
 ice_path  = joinpath(DIR, "$(RUN)_sea_ice.nc")
 flux_path = joinpath(DIR, "$(RUN)_sea_ice_fluxes.nc")
@@ -199,6 +211,35 @@ for m in eachindex(months)
     s(k) = sum(budget[k][:, m]); sb = sum(bsose[:, m])
     println(@sprintf("  %s  | %8.1f %8.1f %8.1f | %8.1f %8.1f %8.1f | %9.1f",
                      label(months[m]), s(:total), s(:drift), s(:thermo), s(:air), s(:ocean), s(:frazil), sb))
+end
+
+# ── drift as salt ────────────────────────────────────────────────────────────────────────────
+band_area = [sum(A[bandmask[b]]) for b in 1:nb]
+to_salt(km3, b) = -DSI * ρᵢ * km3 * KM3 / (band_area[b] * SALT_H * 1026.0)
+iceyear(ym) = ym[2] >= 3 ? ym[1] : ym[1] - 1
+periods = Tuple{String, Vector{Int}}[]
+for y in unique(iceyear.(months))
+    yr = [m for m in eachindex(months) if iceyear(months[m]) == y]
+    length(yr) == 12 && push!(periods, (@sprintf("%d-03 to %d-02", y, y + 1), yr))
+    se = [m for m in eachindex(months) if months[m][1] == y && months[m][2] in SEASON]
+    length(se) == length(SEASON) && push!(periods, (@sprintf("%d months %d-%d", y, first(SEASON), last(SEASON)), se))
+end
+println("\n", "="^104)
+println("DRIFT AS SALT (Gülk et al. 2024 eq. 6) -- ΔS = -DSI ρᵢ V / (A H ρ₀), DSI = $(DSI) g/kg, H = $(SALT_H) m, + = saltier")
+println("  drift: ice carried out (-) or in (+); thermo: net freezing. Over a whole year with no net volume change they cancel.")
+println("="^104)
+if isempty(periods)
+    println("  no whole ice year or season in the record")
+else
+    println("  band     | area 1e6 km² | period              |   drift km³   ΔS g/kg |  thermo km³   ΔS g/kg")
+    for b in 1:nb
+        all(x -> abs(x) < 0.05 || isnan(x), budget[:thermo][b, :]) && continue
+        for (name, ms) in periods
+            d = sum(budget[:drift][b, ms]); t = sum(budget[:thermo][b, ms])
+            println(@sprintf("  %-8s | %12.2f | %-19s | %11.1f  %+8.3f | %11.1f  %+8.3f",
+                             band_name(b), band_area[b] / 1e12, name, d, to_salt(d, b), t, -to_salt(t, b)))
+        end
+    end
 end
 
 println("\n", "="^104)

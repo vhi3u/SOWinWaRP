@@ -44,6 +44,16 @@
 # mixing to reach the warm water below; the top-cell and deep salinities of both are printed with it.
 # B-SOSE's θ and practical S go through the same TEOS-10 formula: the ~0.16 g/kg Sᴬ - Sₚ offset is
 # common to both layers and drops out of ΔS.
+# OVERTURNING, on the same deep columns (Gülk et al. 2024 eqs. 8-9, after Martinson & Iannuzzi 1998 and
+# Campbell et al. 2019): how much it takes to mix each column down to the HC_DEPTH-DEEP_DEPTH layer.
+#   MLD  first level below MLD_REF (10 m) whose σ₀ exceeds σ₀(MLD_REF) by MLD_DSIGMA (0.03 kg/m³); the
+#        level's centre depth, DEEP_DEPTH if none (same levels in both, so comparable one for one)
+#   SD*  salt deficit, m of ice: MLD × [(S_d - S_ml) - (α/β)(θ_d - T_f)] / DSI, with the mixed layer
+#        cooled to its freezing point, d the deep-layer mean, α, β TEOS-10 at the midpoint and DSI
+#        (30 g/kg) the ocean-minus-ice salinity. The ice the column must grow to overturn; set it against
+#        the brine in tools/model_surface_buoyancy.jl and the growth in tools/ice_growth_budget.jl.
+#   CR   convective resistance, g/ρ₀ ∫₀ᴴ (σ₀(H) - σ₀(z)) dz to the bottom of the deep layer, m²/s²: the
+#        buoyancy loss to overturn to H, temperature included as it stands.
 # WRITES OUTDIR/<RUN>_under_ice_heat.png (SOURCE=5day) or <RUN>_under_ice_heat_monthly.png: per band, the 0-HC_DEPTH heat of both; run - B-SOSE heat by
 #   layer (0-SPLIT, SPLIT-HC_DEPTH, HC_DEPTH-DEEP_DEPTH, the last on the deep columns); and run - B-SOSE
 #   (T - Tf) against depth and time to PROFILE_ZMAX.
@@ -53,11 +63,13 @@
 #
 # ENV: DIR (run files, default .), OUTDIR (plots), BSOSE_DIR (required), SOURCE (monthly | 5day), START (default: the file's
 #      start_date), BANDS (-70,-65,-60,-55), ICE_MIN (0.15), HC_DEPTH (100), SPLIT (40),
-#      DEEP_DEPTH (default: the bottom of the deepest level within PROFILE_ZMAX), PROFILE_ZMAX (300), MIN_RECORDS (5-day records per window, default 4)
+#      DEEP_DEPTH (default: the bottom of the deepest level within PROFILE_ZMAX), PROFILE_ZMAX (300), MIN_RECORDS (5-day records per window, default 4),
+#      MLD_REF (10), MLD_DSIGMA (0.03), DSI (30)
 # ==============================================================================================
 
 using NCDatasets, CairoMakie, Dates, Printf, Statistics
 using SeawaterPolynomials: thermal_sensitivity, haline_sensitivity
+import SeawaterPolynomials
 using SeawaterPolynomials.TEOS10: TEOS10EquationOfState
 
 ENV["HDF5_USE_FILE_LOCKING"] = "FALSE"   # safe on a run that is still writing
@@ -76,6 +88,9 @@ const HC_DEPTH     = parse(Float64, get(ENV, "HC_DEPTH", "100"))
 const SPLIT        = parse(Float64, get(ENV, "SPLIT", "40"))
 const PROFILE_ZMAX = parse(Float64, get(ENV, "PROFILE_ZMAX", "300"))
 const MIN_RECORDS  = parse(Int, get(ENV, "MIN_RECORDS", "4"))
+const MLD_REF      = parse(Float64, get(ENV, "MLD_REF", "10"))
+const MLD_DSIGMA   = parse(Float64, get(ENV, "MLD_DSIGMA", "0.03"))
+const DSI          = parse(Float64, get(ENV, "DSI", "30"))
 mkpath(OUTDIR)
 
 const ρ₀, cₚ = 1026.0, 3991.9            # J/m³/K: ρ₀cₚ ≈ 4.1e6
@@ -88,6 +103,31 @@ const EOS = TEOS10EquationOfState()
 function density_step(T₁, S₁, d₁, T₂, S₂, d₂)
     T, S, Z = (T₁ + T₂) / 2, (S₁ + S₂) / 2, -(d₁ + d₂) / 2
     return (-thermal_sensitivity(T, S, Z, EOS) * (T₂ - T₁), haline_sensitivity(T, S, Z, EOS) * (S₂ - S₁))
+end
+
+σ₀(T, S) = SeawaterPolynomials.ρ(T, S, 0.0, EOS)
+
+"""
+Overturning measures for one column, levels top-down (T, S, depth, Δz to the deep layer's last level `ml`,
+the deep layer's levels `md`, the freezing point `Tf`): (MLD m, salt deficit SD* m of ice, CR m²/s²).
+"""
+function overturning(T, S, depth, Δz, md, kref, Tf)
+    ml = last(md)
+    σ = [σ₀(T[m], S[m]) for m in 1:ml]
+    k = findfirst(m -> m > kref && σ[m] - σ[kref] > MLD_DSIGMA, 1:ml)
+    mld = k === nothing ? depth[ml] + Δz[ml] / 2 : depth[k]
+    mix = [m for m in 1:ml if depth[m] <= mld]
+    isempty(mix) && (mix = [1])
+    Sml = sum(S[m] * Δz[m] for m in mix) / sum(Δz[m] for m in mix)
+    Td = sum(T[m] * Δz[m] for m in md) / sum(Δz[m] for m in md)
+    Sd = sum(S[m] * Δz[m] for m in md) / sum(Δz[m] for m in md)
+    dd = sum(depth[m] * Δz[m] for m in md) / sum(Δz[m] for m in md)
+    T₀ = Tf(Sml)
+    Tm, Sm, Zm = (T₀ + Td) / 2, (Sml + Sd) / 2, -dd / 2
+    α, β = thermal_sensitivity(Tm, Sm, Zm, EOS), haline_sensitivity(Tm, Sm, Zm, EOS)
+    sd = mld * ((Sd - Sml) - α / β * (Td - T₀)) / DSI
+    cr = 9.81 / ρ₀ * sum((σ[ml] - σ[m]) * Δz[m] for m in 1:ml)
+    return (mld, sd, cr)
 end
 
 f64(A) = Float64.(coalesce.(A, NaN))
@@ -127,6 +167,7 @@ function main()
         @warn @sprintf("the levels make 0-%.1f m, not 0-%.0f m (HC_DEPTH)", sum(Δz[in_hc]), HC_DEPTH)
     deep_depth = haskey(ENV, "DEEP_DEPTH") ? parse(Float64, ENV["DEEP_DEPTH"]) : -zf[ks[end]]
     in_deep = [!in_hc[m] && -zf[ks[m]] <= deep_depth + 1e-6 for m in 1:nk]
+    kref = argmin(abs.(depth .- MLD_REF))             # the MLD's reference level
     any(in_deep) || error(@sprintf("no level between HC_DEPTH %.0f m and DEEP_DEPTH %.0f m", HC_DEPTH, deep_depth))
     deep_bot = -zf[ks[findlast(in_deep)]]
     abs(deep_bot - deep_depth) > 0.5 &&
@@ -176,7 +217,8 @@ function main()
     wlat = cosd.(φ)
     keys_ = (:cells, :ℵ_run, :ℵ_bsose, :sst_run, :sst_bsose, :hc_run, :hc_bsose, :Δhc_upper, :Δhc_lower, :S_bsose,
              :deep_cells, :Δhc_sub, :dhc_run, :dhc_bsose,
-             :σ_run, :σ_bsose, :Δσ_T, :Δσ_S, :Stop_run, :Stop_bsose, :Sdeep_run, :Sdeep_bsose)
+             :σ_run, :σ_bsose, :Δσ_T, :Δσ_S, :Stop_run, :Stop_bsose, :Sdeep_run, :Sdeep_bsose,
+             :mld_run, :mld_bsose, :sd_run, :sd_bsose, :cr_run, :cr_bsose)
     res = Dict(k => fill(NaN, nb, nw) for k in keys_)
     prof_run, prof_bsose = fill(NaN, nb, nw, nk), fill(NaN, nb, nw, nk)
 
@@ -243,6 +285,14 @@ function main()
                     res[:Stop_bsose][b, w]  = bm((i, j) -> Sb[i, j, 1])
                     res[:Sdeep_run][b, w]   = bm((i, j) -> lay(Sr, i, j))
                     res[:Sdeep_bsose][b, w] = bm((i, j) -> lay(Sb, i, j))
+                    # Overturning: MLD, salt deficit, convective resistance
+                    ov(T, S, i, j, Tf) = overturning(view(T, i, j, :), view(S, i, j, :), depth, Δz, md, kref, Tf)
+                    orr = Dict((i, j) => ov(Tr, Sr, i, j, Tf_run) for (i, j) in both_deep)
+                    obb = Dict((i, j) => ov(Tb, Sb, i, j, Tf_bsose) for (i, j) in both_deep)
+                    for (q, key) in enumerate((:mld, :sd, :cr))
+                        res[Symbol(key, :_run)][b, w]   = bm((i, j) -> orr[(i, j)][q])
+                        res[Symbol(key, :_bsose)][b, w] = bm((i, j) -> obb[(i, j)][q])
+                    end
                 end
             end
             for m in 1:nk
@@ -299,6 +349,25 @@ function main()
                     label(centre(w)), res[:deep_cells][b, w], res[:σ_run][b, w], res[:σ_bsose][b, w],
                     res[:Δσ_T][b, w], res[:Δσ_S][b, w], res[:Stop_run][b, w], res[:Stop_bsose][b, w],
                     res[:Sdeep_run][b, w], res[:Sdeep_bsose][b, w])
+        end
+    end
+
+    println("\n", bar)
+    println("OVERTURNING on the deep columns, to the $D0-$D1 m layer (Gülk et al. 2024 eqs. 8-9)")
+    println("  MLD: σ₀ > σ₀($(Int(MLD_REF)) m) + $(MLD_DSIGMA) kg/m³ (level centre); SD*: ice to grow (m, ΔSᵢ = $(Int(DSI)) g/kg) for the")
+    println("  mixed layer, cooled to freezing, to match the deep layer's density; CR: g/ρ₀∫(σ₀(H) - σ₀)dz to $D1 m, m²/s²")
+    println("  run/B-SOSE > 1 in SD* = the run's column needs more ice growth than B-SOSE's to overturn")
+    println(bar)
+    for b in 1:nb
+        all(isnan, res[:sd_run][b, :]) && continue
+        @printf("\n  %s\n", band_name(b))
+        println("  window centre | deep cols |  MLD run  B-SOSE |  SD* run  B-SOSE  ratio |   CR run  B-SOSE  ratio")
+        for w in 1:nw
+            isnan(res[:sd_run][b, w]) && continue
+            @printf("  %s    | %9d |   %6.1f  %6.1f |   %5.2f   %5.2f  %5.2f |   %6.3f  %6.3f  %5.2f\n",
+                    label(centre(w)), res[:deep_cells][b, w], res[:mld_run][b, w], res[:mld_bsose][b, w],
+                    res[:sd_run][b, w], res[:sd_bsose][b, w], res[:sd_run][b, w] / res[:sd_bsose][b, w],
+                    res[:cr_run][b, w], res[:cr_bsose][b, w], res[:cr_run][b, w] / res[:cr_bsose][b, w])
         end
     end
 
