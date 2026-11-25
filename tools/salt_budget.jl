@@ -280,12 +280,14 @@ function bsose_budget(months)
         need(ds, "hFacS", "ADVy_SLT"); need(ds, "dxG", "ADVy_SLT")
         fill0(ds["hFacS"][I, JR, :]), fill0(ds["dxG"][I, JR])
     end
-    # the local monthly files must be on the same (global) grid as the remote budget files
-    for tok in ("Salt", "Uvel", "Vvel", "surfSflx", "oceFWflx")
+    # the local monthly files must be on the same (global) grid as the remote budget files. Compared by the data
+    # variable's horizontal size, not by coordinate names: UVEL sits on XG, VVEL on YG, the rest on XC, YC.
+    for (tok, names) in (("Salt", ("SALT", "Salt")), ("Uvel", ("UVEL", "Uvel")), ("Vvel", ("VVEL", "Vvel")),
+                         ("surfSflx", ("SFLUX",)), ("oceFWflx", ("oceFWflx",)))
         open_monthly(monthly_path(tok)) do ds
-            x, y = coord(ds, "XC", 1), coord(ds, "YC", 2)
-            (length(x) == length(xc) && length(y) == length(yc) && abs(x[i0] - xc[i0]) < 1e-3 && abs(y[js0] - yc[js0]) < 1e-3) ||
-                error("$(monthly_path(tok)) is not on the budget files' grid ($(length(x))x$(length(y)) against $(length(xc))x$(length(yc)))")
+            nx, ny = size(ds[data_var(ds, names)])[1:2]
+            (nx == length(xc) && ny == length(yc)) ||
+                error("$(monthly_path(tok)) is $(nx)x$(ny), the budget files $(length(xc))x$(length(yc)): not the same grid")
         end
     end
     ygf = vcat(1.5yc[1] - 0.5yc[2], (yc[1:end-1] .+ yc[2:end]) ./ 2)          # south faces (YG in grid.nc is corrupt)
