@@ -230,7 +230,9 @@ function open_monthly(f, path)
 end
 
 data_var(ds, names) = (for n in names; haskey(ds, n) && return n; end;
-                       c = [k for k in keys(ds) if ndims(ds[k]) >= 3]; length(c) == 1 ? only(c) : error("none of $names; $(c)"))
+                       c = [k for k in keys(ds) if ndims(ds[k]) >= 3]; length(c) == 1 && return only(c);
+                       m = [k for k in c if any(n -> occursin(lowercase(n), lowercase(k)), names)];
+                       length(m) == 1 ? only(m) : error("none of $names; $(c)"))
 
 "(year, month) a monthly record averages: its stamp is the END of the month and drifts by hours."
 monthkey(s) = (d = DateTime(s) - Day(14); (year(d), month(d)))
@@ -407,6 +409,72 @@ function bsose_volumes(months)
     return out
 end
 
+"""
+B-SOSE's volume through the box sides and the layer's floor from its MASS-WEIGHTED velocities (UVELMASS, VVELMASS,
+WVELMASS: hFac and the r* thickness factor already in, so the face area is dyG drF, dxG drF, rA), per month, box and
+layer (m³/s), with the mean-flow transport of (S - S_REF) done with them. UVEL x hFac misses r*'s (1 + η/H): 0.01 Sv
+on these boxes, which S_REF made 0.05-0.2 g/kg of residual. Cached on its own; the cached ADV + DF stay valid.
+"""
+function bsose_mass(months)
+    key = @sprintf("%s_L%.0f_ref%.2f_%04d%02d-%04d%02d", join(string.(Int.(EDGES)), "_"), LAYER, S_REF, months[1]..., months[end]...)
+    cache = joinpath(OUTDIR, ".salt_budget_bsose_mass_$key.jls")
+    isfile(cache) && (@info "B-SOSE mass transports from cache $cache"; return deserialize(cache))
+    t0 = time()
+    xc, yc, drF, RF = open_monthly(monthly_path("TOTTTEND")) do ds
+        dr = f64(ds["drF"][:])
+        coord(ds, "XC", 1), coord(ds, "YC", 2), dr, haskey(ds, "RF") ? f64(ds["RF"][:]) : vcat(0.0, -cumsum(dr))
+    end
+    Nz = length(drF)
+    I = findall(x -> λW < x < λE, xc); i0, i1 = first(I), last(I)
+    js0, jtop = findfirst(>(SOUTH), yc), findlast(<(EDGES[end]), yc)
+    JR = js0:jtop+1
+    sh(j) = j - js0 + 1
+    rA = open_monthly(ds -> fill0(ds["rA"][I, JR]), monthly_path("TOTTTEND"))
+    dyG = open_monthly(ds -> vcat(fill0(ds["dyG"][i0:i0, JR]), fill0(ds["dyG"][i1+1:i1+1, JR])), monthly_path("ADVx_SLT"))
+    dxG = open_monthly(ds -> fill0(ds["dxG"][I, JR]), monthly_path("ADVy_SLT"))
+    kL = findfirst(k -> -RF[k+1] >= LAYER - 1e-3, 1:Nz)
+    nb, nl, nt = length(BOXES), length(LAYERS), length(months)
+    vol = Dict(s => zeros(nt, nb, nl) for s in SIDES)
+    meanf = Dict(s => zeros(nt, nb, nl) for s in SIDES)
+    floorvol = zeros(nt, nb)
+    ksel(l) = l == 1 ? (1:Nz) : (1:kL)
+    S = read_monthly("Salt", ("SALT", "Salt"), i0-1:i1+1, JR, months)
+    Sx(i, j, k, n) = S[i - (i0 - 1) + 1, sh(j), k, n]
+    for (b, (_, lo, hi)) in enumerate(BOXES)
+        jr = findall(y -> lo < y < hi, yc) ∩ (js0:jtop)
+        jS, jN = first(jr), last(jr)
+        faces = ((:north, :y, jN + 1, -1.0), (:south, :y, jS, 1.0), (:west, :x, i0, 1.0), (:east, :x, i1 + 1, -1.0))
+        for (sd, dir, f, sgn) in faces
+            (sd == :south && b == 1) && continue
+            if dir == :y
+                Vv = read_monthly("VvelMass", ("VVELMASS", "VvelMass"), I, f:f, months)
+                area_f = dxG[:, sh(f)] .* reshape(drF, 1, Nz)
+                Sf = [(Sx(i, f - 1, k, n) + Sx(i, f, k, n)) / 2 for i in I, k in 1:Nz, n in 1:nt]
+            else
+                Vv = read_monthly("UvelMass", ("UVELMASS", "UvelMass"), f:f, jr, months)
+                area_f = dyG[f == i0 ? 1 : 2, sh.(jr)] .* reshape(drF, 1, Nz)
+                Sf = [(Sx(f - 1, j, k, n) + Sx(f, j, k, n)) / 2 for j in jr, k in 1:Nz, n in 1:nt]
+            end
+            Vv = dropdims(Vv, dims = dir == :y ? 2 : 1)
+            for l in 1:nl, n in 1:nt
+                ks = ksel(l)
+                Q = Vv[:, ks, n] .* area_f[:, ks]
+                vol[sd][n, b, l] = sgn * sum(Q)
+                meanf[sd][n, b, l] = sgn * sum(Q .* (Sf[:, ks, n] .- S_REF))
+            end
+        end
+        W = read_monthly("WvelMass", ("WVELMASS", "WvelMass"), I, jr, months; levels = kL+1:kL+1)
+        W = ndims(W) == 4 ? W[:, :, 1, :] : W
+        for n in 1:nt
+            floorvol[n, b] = sum(W[:, :, n] .* rA[:, sh.(jr)])
+        end
+        @info @sprintf("B-SOSE mass transports, box %s: read in %.0f s so far", BOXES[b][1], time() - t0)
+    end
+    out = (; vol, meanf, floorvol)
+    mkpath(OUTDIR); serialize(cache, out)
+    return out
+end
+
 # ── integrals over a period on each side's own clock ─────────────────────────────────────────────
 secs(d) = Dates.value(d - DateTime(2000)) / 1000     # seconds since 2000, a plain Float64
 
@@ -443,7 +511,11 @@ t_first = minimum(first(r.times) for r in runs); t_last = maximum(last(r.times) 
 months = let m = Tuple{Int,Int}[], d = DateTime(year(t_first), month(t_first))
     while d <= t_last; push!(m, (year(d), month(d))); d += Month(1); end; m
 end
-bs = merge(bsose_budget(months), bsose_volumes(months))
+bs = let B = bsose_budget(months), bm = bsose_mass(months), bv = bsose_volumes(months)
+    # the cached side = sgn (ADV + DF - S_REF Q_uvel), vol = sgn Q_uvel: swap Q_uvel for the mass-weighted Q
+    side = Dict(s => B.side[s] .+ S_REF .* (B.vol[s] .- bm.vol[s]) for s in SIDES)
+    merge(B, (; side, vol = bm.vol, meanf = bm.meanf, floorvol = bm.floorvol, fwvol = bv.fwvol))
+end
 @info "B-SOSE box edges used (its faces nearest yours): " * join([@sprintf("%.2fS", -e) for e in bs.edges_used], ", ") *
       @sprintf("; layer floor %.1f m", bs.layer_floor)
 
@@ -479,7 +551,8 @@ end
 
 # volume through the sides (Sv), whole span: the run's mean flow against B-SOSE's
 println("\n  VOLUME INTO each box through each side, mean over the whole span (Sv; + into the box)")
-println("  net = sides (+ B-SOSE's fresh water through the surface, full depth; + its floor, layer): ~0 if the bookkeeping closes")
+println("  net = sides (+ B-SOSE's fresh water through the surface; + its floor, layer): ~0 if the bookkeeping closes")
+println("  B-SOSE volumes from UVELMASS/VVELMASS/WVELMASS (r* included)")
 println("  (the run's full-depth net must be 0: static z, virtual salt flux; S_REF x net x span / box volume is its salt error)")
 let a = periods[end][2], z = periods[end][3]
     for (b, (bname, _, _)) in enumerate(BOXES), (l, (lname, _)) in enumerate(LAYERS)
@@ -489,7 +562,7 @@ let a = periods[end][2], z = periods[end][3]
             v = [mv(B.vol[s][:, b, l]) for s in SIDES]
             @printf(" | %s N %+6.2f S %+6.2f W %+6.2f E %+6.2f", first(B.name, 10), v...)
             if hasproperty(B, :fwvol)
-                fw = l == 1 ? mv(B.fwvol[:, b]) : 0.0
+                fw = mv(B.fwvol[:, b])                    # the top cell is in both layers
                 fl = l == 2 ? mv(B.floorvol[:, b]) : 0.0
                 @printf(" FW %+6.3f floor %+6.3f net %+6.3f", fw, fl, sum(v) + fw + fl)
             else
