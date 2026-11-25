@@ -24,8 +24,12 @@
 #
 # WRITES OUTDIR/<RUN>_ekman_profile.png: mean v'(z) over the WINTER months, run against B-SOSE, per line and class;
 # and V_E month by month with V_th. STDOUT: the monthly table and the WINTER means with run/B-SOSE ratios.
+# SECTORS (EKMAN_SECTORS, longitude edges, e.g. 90,105,120,135,150, or 119.4,120.4 for one box): the WINTER-mean
+#   V_E, v'₀ and D per sector and line, classes all and open, run against B-SOSE. Over a short segment the run's and
+#   B-SOSE's v' also hold geostrophic shear that the whole line cancels: a sector whose V_E is far from V_th is
+#   contaminated, so its D says little. tools/single_column_bsose.jl's boxes are 119.4-120.4E at -64.75, -60.25, -57.25.
 # ENV  DIR (.), OUTDIR (plots), BSOSE_DIR (required), EKMAN_LINES (-63,-60), WINTER (6,7,8,9,10), REF_TOP (200),
-#      REF_BOT (300), SIDE_DEG (1.0), RHO0 (1027)
+#      REF_BOT (300), SIDE_DEG (1.0), RHO0 (1027), EKMAN_SECTORS (none)
 # ==============================================================================================
 
 using NCDatasets, CairoMakie, Dates, Printf, Statistics
@@ -48,6 +52,8 @@ const SIDE_DEG = parse(Float64, get(ENV, "SIDE_DEG", "1.0"))
 const ρ₀       = parse(Float64, get(ENV, "RHO0", "1027"))
 const Ω        = 7.2921e-5
 const CLASSES  = (:all, :open, :ice)
+const SECTORS  = let s = strip(get(ENV, "EKMAN_SECTORS", "")); isempty(s) ? Float64[] : sort(parse.(Float64, split(s, ','))) end
+length(SECTORS) == 1 && error("EKMAN_SECTORS needs at least two longitude edges")
 
 g(A) = Float64.(coalesce.(A, NaN))
 nanmean(x) = (y = filter(isfinite, x); isempty(y) ? NaN : mean(y))
@@ -173,21 +179,26 @@ function main()
         m = vec(mean(P[ok, :]; dims = 1))
         m .- mean(m[kR]), count(ok)
     end
-    for (l, L) in enumerate(LINES), k in 1:nm
-        cR[l, k] == 0 && continue
+    function select(l, k, cls)
         wetboth = deep(jm[l]) .& [depth[Ir[i], jb[l]-1] > REF_BOT && depth[Ir[i], jb[l]] > REF_BOT for i in 1:Nx]
         base = falses(Nx); base[cols] .= true; base .&= wetboth
-        f = 2Ω * sind(φm[l])
+        cls === :all  && return base
+        cls === :open && return base .& (aR[l, k] .< 0.05) .& (aB[l, k] .< 0.05)
+        return base .& (aR[l, k] .> 0.8) .& (aB[l, k] .> 0.8)
+    end
+    VE(p) = sum(p[kE] .* Δz[kE])
+    function measure(l, k, sel)
+        pr = prof(vR[l, k], sel); pb = prof(vB[l, k], sel)
+        (pr === nothing || pb === nothing) && return nothing
+        τ = nanmean(τB[l, k][sel])
+        return (; pr = pr[1], pb = pb[1], n = min(pr[2], pb[2]), VEr = VE(pr[1]), VEb = VE(pb[1]),
+                  v0r = pr[1][1], v0b = pb[1][1], Vth = -τ / (ρ₀ * 2Ω * sind(φm[l])))
+    end
+    for (l, L) in enumerate(LINES), k in 1:nm
+        cR[l, k] == 0 && continue
         for cls in CLASSES
-            sel = cls === :all ? base :
-                  cls === :open ? base .& (aR[l, k] .< 0.05) .& (aB[l, k] .< 0.05) :
-                                  base .& (aR[l, k] .> 0.8) .& (aB[l, k] .> 0.8)
-            pr = prof(vR[l, k], sel); pb = prof(vB[l, k], sel)
-            (pr === nothing || pb === nothing) && continue
-            VE(p) = sum(p[1][kE] .* Δz[kE])
-            τ = nanmean(τB[l, k][sel])
-            res[(l, k, cls)] = (; pr = pr[1], pb = pb[1], n = min(pr[2], pb[2]),
-                                VEr = VE(pr), VEb = VE(pb), v0r = pr[1][1], v0b = pb[1][1], Vth = -τ / (ρ₀ * f))
+            r = measure(l, k, select(l, k, cls))
+            r === nothing || (res[(l, k, cls)] = r)
         end
     end
 
@@ -212,6 +223,30 @@ function main()
         @printf("  months %s (%d): V_E run %.3f B-SOSE %.3f V_th %.3f (run/B-SOSE %.2f) | v'₀ run %.2f B-SOSE %.2f cm/s (ratio %.2f)\n",
                 join(WINTER, ','), length(wk), m(r -> r.VEr), m(r -> r.VEb), m(r -> r.Vth), m(r -> r.VEr) / m(r -> r.VEb),
                 100m(r -> r.v0r), 100m(r -> r.v0b), m(r -> r.v0r) / m(r -> r.v0b))
+    end
+    if !isempty(SECTORS)
+        println("\n", bar)
+        println("BY LONGITUDE SECTOR, months $(join(WINTER, ',')) (EKMAN_SECTORS = $(join(SECTORS, ',')))")
+        println("  sums over the months, D = mean V_E / mean v'₀. V_E far from V_th = geostrophic shear in the sector: its D says little")
+        println(bar)
+        for (l, L) in enumerate(LINES), cls in (:all, :open)
+            @printf("\n  %s, %s\n", lname(L), cls)
+            println("  sector         | months |   n |  V_E run  B-SOSE    V_th |  v'₀ run  B-SOSE |   D run  B-SOSE")
+            for s in 1:length(SECTORS)-1
+                lo, hi = SECTORS[s], SECTORS[s+1]
+                rs = NamedTuple[]
+                for k in 1:nm
+                    (months[k][2] in WINTER && cR[l, k] > 0) || continue
+                    r = measure(l, k, select(l, k, cls) .& (lo .<= λ .< hi))
+                    r === nothing || push!(rs, r)
+                end
+                isempty(rs) && (@printf("  %6.1f-%6.1fE |      0 |\n", lo, hi); continue)
+                q(f) = mean(f(r) for r in rs)
+                @printf("  %6.1f-%6.1fE | %6d | %3.0f |  %7.3f  %6.3f  %6.3f |  %7.2f  %6.2f |  %6.0f  %6.0f\n", lo, hi,
+                        length(rs), q(r -> r.n), q(r -> r.VEr), q(r -> r.VEb), q(r -> r.Vth), 100q(r -> r.v0r),
+                        100q(r -> r.v0b), q(r -> r.VEr) / q(r -> r.v0r), q(r -> r.VEb) / q(r -> r.v0b))
+            end
+        end
     end
     println("\n  Reading it: V_E ratio ≈ 1 with v'₀ ratio << 1 -> the run spreads the same momentum deeper (mixing);")
     println("  V_E ratio << 1 -> less momentum gets in (stress, ice-ocean drag). V_th says what B-SOSE's own stress should drive.\n")
