@@ -23,7 +23,7 @@
 #      B-SOSE  total: ADVx/ADVy + DFxE/DFyE _SLT (monthly, read remotely from BUDGET_URL), minus S_REF x the volume
 #              through the face (monthly UVEL/VVEL). Also its mean-flow part from the monthly UVEL, VVEL, SALT, done
 #              the run's way, so B-SOSE's eddy part = total - mean flow.
-#   bottom     (0-LAYER only, B-SOSE only) ADVr + DFrI _SLT through the layer's floor, + upward = into the layer
+#   bottom     (0-LAYER only, B-SOSE only) ADVr + DFrI _SLT - S_REF WVEL rA through the layer's floor, + upward = into the layer
 #   residual   storage - surface - sides (- bottom): for the run the eddy transport + (layer) vertical exchange +
 #              errors; for B-SOSE full depth, the closure error of this bookkeeping (S_top vs S_REF, η)
 #
@@ -368,6 +368,45 @@ function bsose_budget(months)
     return out
 end
 
+"""
+B-SOSE's VOLUME fluxes the salt cache lacks, per month and box (m³/s): through the layer's floor (WVEL on the top face
+of level kL+1 times rA, + up = into the layer) and through the surface (oceFWflx/ρ₀ times rA, + into the ocean).
+The bottom salt term needs the first: sides carry (S - S_REF), so the floor must too, ADVr + DFrI - S_REF W rA.
+Without it the 0-LAYER bottom was S_REF x the layer's vertical volume flux (±22 g/kg). Cached on its own, so the
+salt cache (hours of remote reads) stays valid.
+"""
+function bsose_volumes(months)
+    key = @sprintf("%s_L%.0f_%04d%02d-%04d%02d", join(string.(Int.(EDGES)), "_"), LAYER, months[1]..., months[end]...)
+    cache = joinpath(OUTDIR, ".salt_budget_bsose_vol_$key.jls")
+    isfile(cache) && (@info "B-SOSE volumes from cache $cache"; return deserialize(cache))
+    t0 = time()
+    xc, yc, RF = open_monthly(monthly_path("TOTTTEND")) do ds
+        dr = f64(ds["drF"][:])
+        coord(ds, "XC", 1), coord(ds, "YC", 2), haskey(ds, "RF") ? f64(ds["RF"][:]) : vcat(0.0, -cumsum(dr))
+    end
+    Nz = length(RF) - 1
+    I = findall(x -> λW < x < λE, xc)
+    js0, jtop = findfirst(>(SOUTH), yc), findlast(<(EDGES[end]), yc)
+    kL = findfirst(k -> -RF[k+1] >= LAYER - 1e-3, 1:Nz)
+    rA = open_monthly(ds -> fill0(ds["rA"][I, js0:jtop]), monthly_path("TOTTTEND"))
+    W = read_monthly("Wvel", ("WVEL", "Wvel"), I, js0:jtop, months; levels = kL+1:kL+1)
+    F = read_monthly("oceFWflx", ("oceFWflx",), I, js0:jtop, months; levels = 1:1)
+    W = ndims(W) == 4 ? W[:, :, 1, :] : W; F = ndims(F) == 4 ? F[:, :, 1, :] : F
+    nb, nt = length(BOXES), length(months)
+    floorvol, fwvol = zeros(nt, nb), zeros(nt, nb)
+    for (b, (_, lo, hi)) in enumerate(BOXES)
+        r = (findall(y -> lo < y < hi, yc) ∩ (js0:jtop)) .- js0 .+ 1
+        for n in 1:nt
+            floorvol[n, b] = sum(W[:, r, n] .* rA[:, r])
+            fwvol[n, b] = sum(F[:, r, n] ./ ρ₀ .* rA[:, r])
+        end
+    end
+    @info @sprintf("B-SOSE WVEL at %.1f m and oceFWflx read in %.0f s", -RF[kL+1], time() - t0)
+    out = (; floorvol, fwvol)
+    mkpath(OUTDIR); serialize(cache, out)
+    return out
+end
+
 # ── integrals over a period on each side's own clock ─────────────────────────────────────────────
 secs(d) = Dates.value(d - DateTime(2000)) / 1000     # seconds since 2000, a plain Float64
 
@@ -392,7 +431,7 @@ function terms(B, b, l, a, z)
     st = (at(B.times, B.C[:, b, l], z) - at(B.times, B.C[:, b, l], a)) / V
     sf = tr(B.surf[:, b])                         # the top cell is in both layers
     sides = Dict(s => tr(B.side[s][:, b, l]) for s in SIDES)
-    bot = (l == 2 && B.bottom !== nothing) ? tr(B.bottom[:, b]) : NaN
+    bot = (l == 2 && B.bottom !== nothing) ? tr(B.bottom[:, b] .- S_REF .* B.floorvol[:, b]) : NaN
     resid = st - sf - sum(values(sides)) - (isnan(bot) ? 0.0 : bot)
     mf = hasproperty(B, :meanf) ? Dict(s => tr(B.meanf[s][:, b, l]) for s in SIDES) : nothing
     return (; st, sf, sides, bot, resid, mf)
@@ -404,7 +443,7 @@ t_first = minimum(first(r.times) for r in runs); t_last = maximum(last(r.times) 
 months = let m = Tuple{Int,Int}[], d = DateTime(year(t_first), month(t_first))
     while d <= t_last; push!(m, (year(d), month(d))); d += Month(1); end; m
 end
-bs = bsose_budget(months)
+bs = merge(bsose_budget(months), bsose_volumes(months))
 @info "B-SOSE box edges used (its faces nearest yours): " * join([@sprintf("%.2fS", -e) for e in bs.edges_used], ", ") *
       @sprintf("; layer floor %.1f m", bs.layer_floor)
 
@@ -440,12 +479,22 @@ end
 
 # volume through the sides (Sv), whole span: the run's mean flow against B-SOSE's
 println("\n  VOLUME INTO each box through each side, mean over the whole span (Sv; + into the box)")
+println("  net = sides (+ B-SOSE's fresh water through the surface, full depth; + its floor, layer): ~0 if the bookkeeping closes")
+println("  (the run's full-depth net must be 0: static z, virtual salt flux; S_REF x net x span / box volume is its salt error)")
 let a = periods[end][2], z = periods[end][3]
     for (b, (bname, _, _)) in enumerate(BOXES), (l, (lname, _)) in enumerate(LAYERS)
         @printf("  %-12s %-12s", bname, lname)
         for B in (runs..., bs)
-            v = [integral(B.times, B.vol[s][:, b, l], a, z) / (secs(z) - secs(a)) / 1e6 for s in SIDES]
+            mv(x) = integral(B.times, x, a, z) / (secs(z) - secs(a)) / 1e6
+            v = [mv(B.vol[s][:, b, l]) for s in SIDES]
             @printf(" | %s N %+6.2f S %+6.2f W %+6.2f E %+6.2f", first(B.name, 10), v...)
+            if hasproperty(B, :fwvol)
+                fw = l == 1 ? mv(B.fwvol[:, b]) : 0.0
+                fl = l == 2 ? mv(B.floorvol[:, b]) : 0.0
+                @printf(" FW %+6.3f floor %+6.3f net %+6.3f", fw, fl, sum(v) + fw + fl)
+            else
+                @printf(" net %+6.3f%s", sum(v), l == 1 ? "" : " (+floor)")
+            end
         end
         println()
     end
