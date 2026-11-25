@@ -50,6 +50,10 @@
 #               catke_cwu<x> catke with Cᵂu★ = x instead of 3.179 (surface shear TKE flux: the wind's share of u★³)
 #               catke_<opts> catke with any of these, joined by "_" (e.g. catke_cap0.1_cs0.991_cwu1.59):
 #                           cwu<x>  Cᵂu★ = x
+#                           hie<x>  Cʰⁱe = x, the TKE's mixing length in stable, high-Ri water (calibrated 0.548): how far
+#                                   CATKE spreads TKE into a pycnocline
+#                           ealpha<x> every TKE mixing-length coefficient (Cʰⁱe, Cˡᵒe, Cᵘⁿe, Cᶜe, Cᵉe) times x, so the TKE's
+#                                   diffusivity is x times CATKE's own: the analogue of B-SOSE/ECCO's GGL90alpha = 30 (nemo_bsose)
 #                           cs<x>   surface wall coefficient Cˢ = x (calibrated 1.131 = κ 0.47; 0.991 = κ 0.41)
 #                           cap<x>  rotational cap on the stable length scale, ℓ ≤ x √e / |f| (Blackadar-type; the
 #                                   Arctic NumericalEarth tests used x = 0.1). Not in Oceananigans: RotationCappedLength
@@ -472,8 +476,10 @@ end
 
 function build_closure(name, f)
     background = VerticalScalarDiffusivity(VerticallyImplicitTimeDiscretization(); ν = 1e-3, κ = KAPPA_Z)
-    function catke(; Cᵂu★ = 3.179, Cˢ = 1.131, Cᶠ = nothing)
-        ml = CATKEMixingLength(; Cᵇ = 0.01, Cˢ)
+    function catke(; Cᵂu★ = 3.179, Cˢ = 1.131, Cᶠ = nothing, Cʰⁱe = nothing, ealpha = 1.0)
+        d = CATKEMixingLength()                                   # the calibrated TKE lengths, whatever the version
+        ml = CATKEMixingLength(; Cᵇ = 0.01, Cˢ, Cʰⁱe = ealpha * something(Cʰⁱe, d.Cʰⁱe), Cˡᵒe = ealpha * d.Cˡᵒe,
+                                 Cᵘⁿe = ealpha * d.Cᵘⁿe, Cᶜe = ealpha * d.Cᶜe, Cᵉe = ealpha * d.Cᵉe)
         ml = Cᶠ === nothing ? ml : RotationCappedLength(ml, Float64(Cᶠ), Float64(f))
         CATKEVerticalDiffusivity(VerticallyImplicitTimeDiscretization(), Float64; mixing_length = ml,
                                  turbulent_kinetic_energy_equation = CATKEEquation(; Cᵂϵ = 1.0, Cᵂu★))
@@ -486,16 +492,16 @@ function build_closure(name, f)
     if startswith(name, "catke_")
         kw = Dict{Symbol, Float64}()
         for tok in split(name[7:end], '_')
-            m = match(r"^(cwu|cs|cap)([0-9.eE+-]+)$", tok)
-            m === nothing && error("unknown catke option '$tok' in '$name' (cwu<x>, cs<x>, cap<x>)")
-            kw[Dict("cwu" => :Cᵂu★, "cs" => :Cˢ, "cap" => :Cᶠ)[m[1]]] = parse(Float64, m[2])
+            m = match(r"^(cwu|cs|cap|hie|ealpha)([0-9.eE+-]+)$", tok)
+            m === nothing && error("unknown catke option '$tok' in '$name' (cwu<x>, cs<x>, cap<x>, hie<x>, ealpha<x>)")
+            kw[Dict("cwu" => :Cᵂu★, "cs" => :Cˢ, "cap" => :Cᶠ, "hie" => :Cʰⁱe, "ealpha" => :ealpha)[m[1]]] = parse(Float64, m[2])
         end
         return (catke(; kw...), background)
     end
     startswith(name, "nemo") && return nemo_closure(name)
     name == "kepsilon"   && return TKEDissipationVerticalDiffusivity()     # alone: its TKE top BC rejects a closure tuple (0.117.2)
     name == "ri"         && return (RiBasedVerticalDiffusivity(), background)
-    error("unknown closure '$name' (catke, catke_bare, catke_<cwu|cs|cap><x>..., nemo[_glorys][_<ebb|nub|kb><x>...], kepsilon, ri)")
+    error("unknown closure '$name' (catke, catke_bare, catke_<cwu|cs|cap|hie|ealpha><x>..., nemo[_glorys][_<ebb|nub|kb><x>...], kepsilon, ri)")
 end
 
 # GGL90alpha for NEMO's scheme: κᵉ = α × Cᵏ ℓ √e instead of NEMO's α = 1. α is read from a Ref at run time (CPU only),
