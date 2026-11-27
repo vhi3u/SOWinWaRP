@@ -427,7 +427,8 @@ let wet = zb .< 0, A = [cosd(φ₁ + (j - 0.5) / SCALING) for i in 1:Nx, j in 1:
                    length(BF.times), start_date + Millisecond(round(Int, 1000 * first(BF.times))),
                    start_date + Millisecond(round(Int, 1000 * last(BF.times))),
                    m(BF.TFLUX), m(BF.Qsw), m(BF.SFLUX), m(BF.FW) * 365.25 * 86400 / 1000, m(BF.τx))
-    length(BF.times) > 100 || error("only $(length(BF.times)) 5-day records for a two-year run: the 5-day files were not read")
+    ndays = Dates.value(end_date - start_date) / 86_400_000
+    length(BF.times) >= ndays / 5 || error("only $(length(BF.times)) 5-day records for a $(round(Int, ndays))-day run: the 5-day files were not read")
 end
 
 # The kinematic flux fields the top boundary conditions read, filled every step by update_surface_fluxes! below
