@@ -18,8 +18,10 @@
 #   north, south, west, east   transport INTO the box through that side, of (S - S_REF): the freshwater-carrying part.
 #              Taking S_REF out makes the run (no net volume through the box: virtual salt flux) and B-SOSE (real
 #              fresh water, which leaves sideways as volume) comparable; S_REF (default 34.5) is close to the box S.
-#      run     MEAN FLOW ONLY: the 30-day means of u, v, S in <RUN>_eke.nc, at cell centres, averaged onto each face.
-#              The run does not save uS, vS, so its eddy transport is not here; it lands in the residual.
+#      run     EXACT if the run wrote <RUN>_faces.nc (FACE_FLUXES): the model's own advective salt flux and volume
+#              transport through each face, eddies in, and (0-LAYER) the floor term Fz + Dz - S_REF Qz.
+#              Otherwise MEAN FLOW ONLY: the 30-day means of u, v, S in <RUN>_eke.nc, at cell centres, averaged onto
+#              each face; the eddy transport and the rebuild error land in the residual.
 #      B-SOSE  total: ADVx/ADVy + DFxE/DFyE _SLT (monthly, read remotely from BUDGET_URL), minus S_REF x the volume
 #              through the face (monthly UVEL/VVEL). Also its mean-flow part from the monthly UVEL, VVEL, SALT, done
 #              the run's way, so B-SOSE's eddy part = total - mean flow.
@@ -177,8 +179,53 @@ function run_budget(run)
     end
     V = [sum(area[:, rows(b)] .* dropdims(sum(dz[:, rows(b), :] .* reshape(inlayer(L), 1, 1, Nz), dims = 3), dims = 3))
          for b in eachindex(BOXES), (_, L) in LAYERS]
+
+    # EXACT sides and floor from <RUN>_faces.nc when the run wrote it (FACE_FLUXES): the model's own advective salt flux
+    # (Fx, Fy, Fz, psu m³/s, eddies in) and volume transport (Qx, Qy, Qz) through every face, and its vertical diffusive
+    # flux Dz, 30-day means on the same windows as _eke.nc. They replace the mean-flow rebuild above.
+    faces_path = joinpath(DIR, "$(run)_faces.nc")
+    exact = isfile(faces_path)
+    bottom = floorvol = fwvol = nothing
+    if exact
+        fc = NCDataset(faces_path)
+        tfc = f64(fc["time"][:])
+        size(fc["Fx"], 1) == Nx + 1 && size(fc["Fy"], 2) == Ny + 1 && size(fc["Fz"], 3) == Nz + 1 ||
+            error("$faces_path: Fx/Fy/Fz are $(size(fc["Fx"]))/$(size(fc["Fy"]))/$(size(fc["Fz"])), not on the faces of $(Nx)x$(Ny)x$(Nz)")
+        bottom, floorvol, fwvol = zeros(nt, nb), zeros(nt, nb), zeros(nt, nb)   # static z: no fresh water as volume
+        for (q, n) in enumerate(recs)
+            m = argmin(abs.(tfc .- tend[n]))
+            abs(tfc[m] - tend[n]) < 3600 || error("$faces_path has no window ending at $(tend[n]) s (nearest $(tfc[m]))")
+            Fx, Qx = fill0(fc["Fx"][:, :, :, m]), fill0(fc["Qx"][:, :, :, m])
+            Fy, Qy = fill0(fc["Fy"][:, :, :, m]), fill0(fc["Qy"][:, :, :, m])
+            for b in eachindex(BOXES), (l, (_, L)) in enumerate(LAYERS)
+                jr, ks = rows(b), findall(inlayer(L))
+                jS, jN = first(jr), last(jr)
+                Ssum(F, Q) = sum(F) - S_REF * sum(Q)
+                side[:north][q, b, l] = -Ssum(Fy[:, jN+1, ks], Qy[:, jN+1, ks]); vol[:north][q, b, l] = -sum(Qy[:, jN+1, ks])
+                side[:south][q, b, l] =  Ssum(Fy[:, jS, ks], Qy[:, jS, ks]);     vol[:south][q, b, l] =  sum(Qy[:, jS, ks])
+                side[:west][q, b, l]  =  Ssum(Fx[1, jr, ks], Qx[1, jr, ks]);     vol[:west][q, b, l]  =  sum(Qx[1, jr, ks])
+                side[:east][q, b, l]  = -Ssum(Fx[Nx+1, jr, ks], Qx[Nx+1, jr, ks]); vol[:east][q, b, l] = -sum(Qx[Nx+1, jr, ks])
+            end
+            # the 0-LAYER floor: the face under the layer's lowest level, + up = into the layer; Dz only where wet on
+            # both sides (it is ∂S/∂z across the floor elsewhere)
+            k0 = findfirst(inlayer(LAYER))
+            Fz, Qz, Dz = fill0(fc["Fz"][:, :, k0, m]), fill0(fc["Qz"][:, :, k0, m]), fill0(fc["Dz"][:, :, k0, m])
+            k0 > 1 || error("the layer reaches the bottom of the grid")
+            wetboth = (dz[:, :, k0] .> 0) .& (dz[:, :, k0-1] .> 0)
+            for b in eachindex(BOXES)
+                jr = rows(b)
+                bottom[q, b] = sum(Fz[:, jr] .+ Dz[:, jr] .* wetboth[:, jr])
+                floorvol[q, b] = sum(Qz[:, jr])
+            end
+        end
+        close(fc)
+        @info @sprintf("%s: EXACT side and floor fluxes from %s (layer floor at %.1f m)", run, faces_path, -zf[findfirst(inlayer(LAYER))])
+    else
+        @info "$run: no $(run)_faces.nc; sides are the mean flow rebuilt from _eke.nc (eddies and errors in the residual)"
+    end
     close(eke)
-    return (; name = run, times, C, side, vol, surf, V, mean_flow_only = true, bottom = nothing)
+    out = (; name = run, times, C, side, vol, surf, V, mean_flow_only = !exact, bottom)
+    return exact ? merge(out, (; floorvol, fwvol)) : out
 end
 
 """The run's coastal fresh water on its grid (kg m⁻² s⁻¹, + in), land cells spread over wet ones within REACH, as
@@ -527,7 +574,11 @@ end
 
 println("\n", "="^118)
 println("SALT BUDGET of the bands south of $(-EDGES[end])S, 90-150E: each term as the change it makes to the BOX-MEAN salinity (g/kg)")
-@printf("  sides: transport INTO the box of (S - %.2f); run = mean flow of its 30-day means only (eddies in its residual)\n", S_REF)
+@printf("  sides: transport INTO the box of (S - %.2f)\n", S_REF)
+for r in runs
+    println("  ", r.name, r.mean_flow_only ? ": MEAN FLOW of its 30-day means only (eddies and rebuild errors in its residual)" :
+                                             ": EXACT, the model's own face fluxes (_faces.nc); residual = closure error")
+end
 println("  B-SOSE sides = ADV + DF (total); 'B-SOSE mean' = its monthly-mean flow, done the run's way; eddy = total - mean")
 println("  residual = storage - surface - sides (- bottom): run = eddies + vertical (layer) + errors; B-SOSE = vertical (layer)/closure")
 println("="^118)
