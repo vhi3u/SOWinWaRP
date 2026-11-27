@@ -51,13 +51,23 @@ using Oceananigans.TurbulenceClosures.TKEBasedVerticalDiffusivities: CATKEVertic
 using Oceananigans.TimeSteppers: VerticallyImplicitTimeDiscretization
 using NCDatasets                    # loads Oceananigans' NetCDFWriter
 using Dates, Printf
+using Oceananigans.Advection: _advective_tracer_flux_x, _advective_tracer_flux_y, _advective_tracer_flux_z
+using Oceananigans.Operators: Ax_qᶠᶜᶜ, Ay_qᶜᶠᶜ, Az_qᶜᶜᶠ, Az_∂zᶜᶜᶠ
+
+"Vertical diffusive salt flux through a z face (psu m³/s, + up), for the _faces.nc writer."
+@inline vertical_salt_diffusion(i, j, k, grid, κc, κb, S) = - (@inbounds κc[i, j, k] + κb) * Az_∂zᶜᶜᶠ(i, j, k, grid, S)
 
 include(joinpath(@__DIR__, "..", "src", "setup_bsose.jl"))          # BSOSEMonthly, resolve_bsose_filename, load_coord
 
 # ## Run settings
 
 const SMOKE    = false      # true: 2 days, 6-hourly output
-const RUN_NAME = SMOKE ? "bsose_bsoseflux_smoke" : "bsose_ggl_hj_pr207_bsoseflux"
+# FACE_FLUXES = true adds <RUN_NAME>_faces.nc: the model's OWN salt fluxes and volume transports through every face,
+# 30-day means, so tools/salt_budget.jl closes the run's budget as it does B-SOSE's (the _eke.nc rebuild from cell-centred
+# u, v does not close: -2.9 Sv on the coast 0-210 m box). It renames the run, so _bsoseflux's files stay as they are.
+const FACE_FLUXES = true
+const RUN_NAME = SMOKE ? (FACE_FLUXES ? "bsose_bsoseflux_faces_smoke" : "bsose_bsoseflux_smoke") :
+                         (FACE_FLUXES ? "bsose_ggl_hj_pr207_bsoseflux_faces" : "bsose_ggl_hj_pr207_bsoseflux")
 const BDIR     = "/storage/scratch1/1/vnguyen480/SOWinWaRP/data"   # B-SOSE, its grid.nc, the 5-day files, era5/
 const ARCH     = GPU()
 
@@ -501,6 +511,39 @@ ocean.output_writers[:eke] = NetCDFWriter(child, (; u = u_cc, v = v_cc, T, S, uu
                                               "eke_recipe" => "EKE = 0.5*((uu - u^2) + (vv - v^2)); MKE = 0.5*(u^2 + v^2)")),
                                           overwrite_files = true)
 
+# THE FACE FLUXES (FACE_FLUXES): what the model itself puts through each face, 30-day means (SMOKE: per output_interval).
+#   Fx, Fy, Fz  advective salt flux, psu m³/s: Oceananigans' own kernels, i.e. the WENO face value of S times the
+#               TRANSPORT velocities (split-explicit corrected, what advects the tracers) times the face area (partial
+#               cells in). The eddy part is in: the product is averaged, not the factors.
+#   Qx, Qy, Qz  volume transport through the same faces, m³/s
+#   Dz          vertical diffusive salt flux, psu m³/s, + up: -(CATKE κc + background κz) ∂S/∂z Az, from the state at the
+#               end of each step (the implicit solver's own flux is not exposed). Meaningless on faces touching the floor.
+#   Not written: horizontal Laplacian diffusion (10 m²/s; ~0.002 g/kg over 2 years on the coastal box) and the salt the
+#   static-z top carries with ∂η/∂t (η S / H; from _free_surface.nc).
+if FACE_FLUXES
+    ũ, ṽ, w̃ = child.transport_velocities
+    S_adv = child.advection.S
+    κc = child.closure_fields[1].κc                 # closure[1] is catke
+    κb = BACKGROUND ? 1e-5 : 0.0
+    face_fields = (; Fx = KernelFunctionOperation{Face, Center, Center}(_advective_tracer_flux_x, child.grid, S_adv, ũ, S),
+                     Fy = KernelFunctionOperation{Center, Face, Center}(_advective_tracer_flux_y, child.grid, S_adv, ṽ, S),
+                     Fz = KernelFunctionOperation{Center, Center, Face}(_advective_tracer_flux_z, child.grid, S_adv, w̃, S),
+                     Qx = KernelFunctionOperation{Face, Center, Center}(Ax_qᶠᶜᶜ, child.grid, ũ),
+                     Qy = KernelFunctionOperation{Center, Face, Center}(Ay_qᶜᶠᶜ, child.grid, ṽ),
+                     Qz = KernelFunctionOperation{Center, Center, Face}(Az_qᶜᶜᶠ, child.grid, w̃),
+                     Dz = KernelFunctionOperation{Center, Center, Face}(vertical_salt_diffusion, child.grid, κc, κb, S))
+    face_window = SMOKE ? output_interval : 30days
+    ocean.output_writers[:faces] = NetCDFWriter(child, face_fields;
+                                                filename = "$(RUN_NAME)_faces.nc",
+                                                schedule = AveragedTimeInterval(face_window, window = face_window, stride = 1),
+                                                indices = (:, :, :),
+                                                global_attributes = merge(output_metadata, Dict(
+                                                    "averaging_window_seconds" => Float64(face_window),
+                                                    "units" => "Fx Fy Fz Dz psu m3/s; Qx Qy Qz m3/s; x, y + east, north; z + up",
+                                                    "face_fluxes" => "Oceananigans _advective_tracer_flux_{x,y,z} on transport_velocities with the S advection scheme; Dz = -(catke kappa_c + background) dS/dz Az")),
+                                                overwrite_files = true)
+end
+
 z_centres = [(z[k] + z[k+1]) / 2 for k in 1:Nz]
 for (name, depth) in ((:z105, 105.0), (:z200, 200.0))
     k = argmin(abs.(z_centres .+ depth))
@@ -518,5 +561,5 @@ end
 
 # ## Run (no checkpoints)
 
-@info "output: $(RUN_NAME)_{surface,midlon,free_surface,surface_fluxes,eke,z105,z200}.nc in $(pwd())"
+@info "output: $(RUN_NAME)_{surface,midlon,free_surface,surface_fluxes,eke,z105,z200$(FACE_FLUXES ? ",faces" : "")}.nc in $(pwd())"
 run!(ocean)
