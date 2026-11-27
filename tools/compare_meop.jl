@@ -21,6 +21,10 @@
 #   A  YEARS: B-SOSE's MONTHLY MEAN of the profile's calendar month
 #   B  the runs' common span: B-SOSE's 5-DAY record holding the profile's time, B-SOSE monthly, and each run's
 #      30-day mean (_eke.nc) holding it, interpolated to B-SOSE's levels (the nested runs use them, so exact)
+#   C  every profile of YEARS at its CALENDAR date: each run's windows holding that date (one per run year, averaged),
+#      B-SOSE's monthly mean of its own month (Bmon) and B-SOSE's mean of that calendar month over the runs' years
+#      (Bclim). Fills the sectors the runs' own years barely sample (2014-16: mostly 90-100E); Bclim - Bmon shows what
+#      mixing years costs. Writes OUTDIR/meop_profiles_clim_<RUN>....png
 # A profile is an instant and the models are means: read A's and B's means, not single profiles. In each table
 # every column uses the SAME levels of the same profiles (where the obs and every model are finite).
 # REGION by B-SOSE's depth at the profile's cell: shelf < ISOBATHS[1], slope < ISOBATHS[2], deep beyond.
@@ -256,10 +260,20 @@ function sample_bsose!(MT, MS, groups, g)
 end
 
 # ── a run ───────────────────────────────────────────────────────────────────────────────────────
-"A run's 30-day means at the profiles' cells, on B-SOSE's levels; and the run's span."
-function sample_run(run, P, g)
+"The profile's time moved to year Y (Feb 29 -> Feb 28)."
+in_year(t, Y) = DateTime(Y, month(t), min(day(t), daysinmonth(Y, month(t)))) + (t - floor(t, Day))
+
+"Does the profile's calendar date and time of day fall in (w0, w1] in any of the window's years?"
+in_window_doy(t, w0, w1) = any(Y -> w0 < in_year(t, Y) <= w1, year(w0):year(w1))
+
+"""
+A run's 30-day means at the profiles' cells, on B-SOSE's levels; and the run's span. clim = true: every profile, any
+year, takes the mean of the run's windows that hold its CALENDAR date (one per run year).
+"""
+function sample_run(run, P, g; clim = false)
     np = length(P.time)
     MT, MS = fill(NaN, g.nk, np), fill(NaN, g.nk, np)
+    sT, sS, nT, nS = zeros(g.nk, np), zeros(g.nk, np), zeros(Int, g.nk, np), zeros(Int, g.nk, np)
     path = joinpath(DIR, "$(run)_eke.nc")
     isfile(path) || error("$path not found (set DIR)")
     eke = NCDataset(path)
@@ -276,21 +290,32 @@ function sample_run(run, P, g)
     cells = [nearest_wet(λ, φ, P.lon[p], P.lat[p], (i, j) -> kbot[i, j] !== nothing) for p in 1:np]
     nw = 0
     for (w0, w1, n) in wins
-        ps = [p for p in 1:np if w0 < P.time[p] <= w1 && cells[p] !== nothing]
+        ps = clim ? [p for p in 1:np if cells[p] !== nothing && in_window_doy(P.time[p], w0, w1)] :
+                    [p for p in 1:np if w0 < P.time[p] <= w1 && cells[p] !== nothing]
         isempty(ps) && continue
         nw += 1
         Tr = f64(eke["T"][:, :, :, n]); Sr = f64(eke["S"][:, :, :, n])
         for p in ps
             i, j = cells[p]; ks = Nz:-1:kbot[i, j]
             dsrc = -zc[ks]
-            MT[:, p] = interp_to(dsrc, Tr[i, j, ks], g.d, Inf)
-            MS[:, p] = interp_to(dsrc, Sr[i, j, ks], g.d, Inf)
+            t = interp_to(dsrc, Tr[i, j, ks], g.d, Inf); s = interp_to(dsrc, Sr[i, j, ks], g.d, Inf)
+            if clim
+                for k in 1:g.nk
+                    isfinite(t[k]) && (sT[k, p] += t[k]; nT[k, p] += 1)
+                    isfinite(s[k]) && (sS[k, p] += s[k]; nS[k, p] += 1)
+                end
+            else
+                MT[:, p] = t; MS[:, p] = s
+            end
         end
     end
     close(eke)
+    if clim
+        MT = ifelse.(nT .> 0, sT ./ max.(nT, 1), NaN); MS = ifelse.(nS .> 0, sS ./ max.(nS, 1), NaN)
+    end
     span = (wins[1][1], wins[end][2])
-    @info @sprintf("%s: %d windows %s to %s, %d with profiles; sampled at %d profiles, %d with no wet cell nearby",
-                   run, length(wins), Date(span[1]), Date(span[2]), nw, count(p -> any(isfinite, view(MT, :, p)), 1:np),
+    @info @sprintf("%s%s: %d windows %s to %s, %d with profiles; sampled at %d profiles, %d with no wet cell nearby",
+                   run, clim ? " (calendar-date climatology)" : "", length(wins), Date(span[1]), Date(span[2]), nw, count(p -> any(isfinite, view(MT, :, p)), 1:np),
                    count(isnothing, cells))
     return MT, MS, span
 end
@@ -526,6 +551,47 @@ function main()
     println()
     map_figure(P, g, sel_b)
     profile_figure(models, sel_b, P, g, join(RUNS, "_"))
+
+    # C: every profile of YEARS against the runs' calendar-date climatology (the mean of their windows holding the
+    # profile's date, one per run year), and B-SOSE's monthly climatology over the runs' months (Bclim: the mean of the
+    # profile's calendar month in each run year). Bclim - Bmon is what mixing years costs B-SOSE: read the runs' Δ
+    # against Bclim's, not Bmon's.
+    rc = [sample_run(r, P, g; clim = true) for r in RUNS]
+    spanm = Set{Tuple{Int,Int}}()
+    let d = DateTime(year(span[1]), month(span[1]))
+        while d <= span[2]
+            # a month counts if the runs cover at least half of it
+            a, b = max(d, span[1]), min(d + Month(1), span[2])
+            2 * Dates.value(b - a) >= Dates.value(d + Month(1) - d) && push!(spanm, (year(d), month(d)))
+            d += Month(1)
+        end
+    end
+    slots = Dict{Int, Vector{Int}}()                     # calendar month => the monthly records of it in the runs' span
+    for (n, k) in enumerate(mkey)
+        k in spanm && push!(get!(slots, k[2], Int[]), n)
+    end
+    nslot = maximum(length, values(slots))
+    sTc, sSc, cT, cS = zeros(g.nk, np), zeros(g.nk, np), zeros(Int, g.nk, np), zeros(Int, g.nk, np)
+    for q in 1:nslot
+        gq = Dict{Tuple{String, String, Int}, Vector{NTuple{3, Int}}}()
+        for p in 1:np
+            ns = get(slots, month(P.time[p]), Int[]); q <= length(ns) || continue
+            push!(get!(gq, (mT, mS, ns[q]), NTuple{3, Int}[]), (p, P.ib[p], P.jb[p]))
+        end
+        QT, QS = sample_bsose!(fill(NaN, g.nk, np), fill(NaN, g.nk, np), gq, g)
+        f = isfinite.(QT); sTc[f] .+= QT[f]; cT .+= f
+        f = isfinite.(QS); sSc[f] .+= QS[f]; cS .+= f
+    end
+    BcT = ifelse.(cT .> 0, sTc ./ max.(cT, 1), NaN); BcS = ifelse.(cS .> 0, sSc ./ max.(cS, 1), NaN)
+    modelsC = Tuple{String, Matrix{Float64}, Matrix{Float64}}[("Bmon", BmT, BmS), ("Bclim", BcT, BcS)]
+    for (i, r) in enumerate(RUNS)
+        push!(modelsC, ("run$i", rc[i][1], rc[i][2]))
+    end
+    report("C. $(first(YEARS))-$(last(YEARS)), every profile at its CALENDAR date: B-SOSE monthly of its own month (Bmon), " *
+           "B-SOSE's monthly climatology over the runs' months (Bclim), the runs' calendar-date climatology",
+           modelsC, 1:np, P, g)
+    println("  (Bclim - Bmon = the cost of mixing years, for B-SOSE; a run's Δ minus Bclim's Δ = the run against B-SOSE, same years)")
+    profile_figure(modelsC, 1:np, P, g, "clim_" * join(RUNS, "_"))
 end
 
 main()
