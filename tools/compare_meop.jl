@@ -9,7 +9,7 @@
 # own fluxes), and B-SOSE's shelf is the least constrained part of it (no cavities, Nakayama 2024). Seals sample the
 # shelf in autumn and winter, when ships do not.
 #
-# DATA. MEOP_DIR/list_profiles.csv picks the tags with profiles in the box; each tag's <COUNTRY>/DATA/<tag>_all_prof.nc
+# DATA. MEOP/list_profiles.csv (found under data/meop) picks the tags with profiles in the box; each tag's <COUNTRY>/DATA/<tag>_all_prof.nc
 # is read: PRES/TEMP/PSAL_ADJUSTED, levels kept where the pressure and the variable both have QC flag 1 or 2,
 # profiles dropped with POSITION_QC 3, 4 or 9. JULD is read raw (days since 1950-01-01, checked against the file's
 # REFERENCE_DATE_TIME and the CSV). Pressure becomes depth by Saunders (1981). Each profile is put on B-SOSE's level
@@ -30,7 +30,7 @@
 # SECTOR_LAYER) by season.
 # WRITES OUTDIR/meop_map.png (profiles, B-SOSE isobaths) and OUTDIR/meop_profiles[_<RUN>...].png (mean profiles by
 # region and season, part B with runs, else part A).
-# ENV: BSOSE_DIR (required), MEOP_DIR, DIR (run files, .), OUTDIR (plots), LONS (90,150), LATS (-70,-60),
+# ENV: BSOSE_DIR (required), DIR (run files, .), OUTDIR (plots), LONS (90,150), LATS (-70,-60),
 #      YEARS (2013:2023), ZMAX (1000), ISOBATHS (1000,3000), LAYERS (0,50,200,500,1000), SECTOR_LAYER (0,200),
 #      TOPGAP (20), SEARCH (2)
 # ==============================================================================================
@@ -44,7 +44,16 @@ include(joinpath(@__DIR__, "model_grid.jl"))    # file_levels, file_kbot
 const RUNS      = copy(ARGS)
 const BSOSE_DIR = get(ENV, "BSOSE_DIR", "")
 isempty(BSOSE_DIR) && error("set BSOSE_DIR to the directory with B-SOSE's monthly and 5-day Theta and Salt")
-const MEOP   = get(ENV, "MEOP_DIR", "/storage/scratch1/1/vnguyen480/SOWinWaRP/data/meop/MEOP-CTD_2024-03-08")
+# Fixed: wherever list_profiles.csv sits under data/meop (the zip unpacks to media/disk2/roquet/MEOP_public/...)
+const MEOP_ROOT = "/storage/scratch1/1/vnguyen480/SOWinWaRP/data/meop"
+const MEOP = let hit = nothing
+    isdir(MEOP_ROOT) || error("$MEOP_ROOT not found")
+    for (d, _, fs) in walkdir(MEOP_ROOT)
+        "list_profiles.csv" in fs && (hit = d; break)
+    end
+    hit === nothing && error("no list_profiles.csv anywhere under $MEOP_ROOT")
+    hit
+end
 const DIR    = get(ENV, "DIR", ".")
 const OUTDIR = get(ENV, "OUTDIR", "plots")
 envlist(k, d) = parse.(Float64, split(get(ENV, k, d), ','))
@@ -98,7 +107,7 @@ end
 "Every profile in the box from list_profiles.csv (all years): tag, deployment, cycle, time, position, has-S."
 function read_list()
     path = joinpath(MEOP, "list_profiles.csv")
-    isfile(path) || error("$path not found (set MEOP_DIR to the unpacked MEOP-CTD_2024-03-08)")
+    isfile(path) || error("$path not found")
     lines = readlines(path)
     hdr = split(lines[1], ',')
     col(n) = something(findfirst(==(n), hdr), 0)
