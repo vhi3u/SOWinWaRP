@@ -1,5 +1,5 @@
 # SOWinWaRP (90-150E, 70-45S, 1/6°) nested in B-SOSE, OCEAN ONLY, FORCED BY B-SOSE's OWN SURFACE FLUXES,
-# WITH B-SOSE's SEA-ICE LOAD TAKEN OUT OF THE PARENT η (run name bsose_ggl_hj_pr207_bsoseflux_iceload, Mar-May 2014).
+# WITH B-SOSE's SEA-ICE LOAD TAKEN OUT OF THE PARENT η (run name bsose_ggl_hj_pr207_bsoseflux_iceload, Mar 2014 - Feb 2016).
 #
 # THE ICE-LOAD ARM (2026-11-27). _bsoseflux exactly, except the parent η the nest samples gets + (ρᵢ SIheff + ρₛ SIhsnow)/ρ₀
 # on top of _ibobc's inverse barometer. WHY: B-SOSE's ETAN carries the sea-ice load (-(910 SIheff)/1027, slope 1.12);
@@ -8,6 +8,9 @@
 # (west face coast-65S slope 0.53, east face 0.66-0.70; B-SOSE has ~1 m of load at the 150E coast in every month).
 # That error sends the coastal band EAST out of 150E where B-SOSE brings ~7 Sv WEST in, removes the westward slope
 # current from 120E on and puts warm water on the eastern shelf (MEOP: +1.2-1.6 °C at 130-150E).
+# RESULT of the Mar-May 2014 test (2026-11-27): coast E -7.8/-6.4/-10.5 Sv vs B-SOSE -7.4/-3.1/-10.1 (was +5..+11), slope@145E
+# 1.7-3.4 vs 1.1-3.2 (was 13-18), total E 207-211 vs 205-209 (was 223-234), 65S flow northward again. Now 2 years with
+# the _faces.nc writer (FACE_FLUXES), for the exact salt budget of the corrected circulation.
 # CHECK: tools/transport_timeseries.jl and tools/ice_load_flather.jl on this run against _bsoseflux: coast E should go
 # from +5..+13 Sv to near B-SOSE's -7, slope@145E westward; what is left at 65-45S is not the ice.
 #
@@ -76,7 +79,7 @@ const SMOKE    = false      # true: 2 days, 6-hourly output
 # FACE_FLUXES = true adds <RUN_NAME>_faces.nc: the model's OWN salt fluxes and volume transports through every face,
 # 30-day means, so tools/salt_budget.jl closes the run's budget as it does B-SOSE's (the _eke.nc rebuild from cell-centred
 # u, v does not close: -2.9 Sv on the coast 0-210 m box). It renames the run, so _bsoseflux's files stay as they are.
-const FACE_FLUXES = false
+const FACE_FLUXES = true
 const RUN_NAME = SMOKE ? "bsose_bsoseflux_iceload_smoke" : "bsose_ggl_hj_pr207_bsoseflux_iceload"
 const BDIR     = "/storage/scratch1/1/vnguyen480/SOWinWaRP/data"   # B-SOSE, its grid.nc, the 5-day files, era5/
 const ARCH     = GPU()
@@ -88,7 +91,7 @@ const E_ALPHA    = 1.0
 const BACKGROUND = true
 
 start_date = DateTime(2014, 3, 2, 6)       # a native B-SOSE stamp (see the _ibobc script)
-end_date   = SMOKE ? DateTime(2014, 3, 4, 6) : DateTime(2014, 6, 1, 6)    # 91 days: the east error is full size in window 1
+end_date   = SMOKE ? DateTime(2014, 3, 4, 6) : DateTime(2016, 3, 1, 6)    # 730 days
 const Δt_max = 30minutes
 const CFL    = 0.8
 output_interval = SMOKE ? 6hours : 1days
